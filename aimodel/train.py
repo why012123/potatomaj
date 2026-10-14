@@ -413,14 +413,27 @@ def cmd_bc(args) -> Net:
         max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
     )
     print(f"  留出集：{len(holdout['X'])} 条决策（种子不同，用来判断有没有过拟合）")
-    hist = train_bc(
+    hist, best_net, bc_info = train_bc(
         net, data, epochs=args.epochs, batch_size=args.batch, seed=args.seed,
-        holdout=holdout,
+        holdout=holdout, patience=args.patience,
     )
-    net.save(args.out)
-    print(f"  已保存 -> {args.out}（{net.n_params()} 参数）")
-    save_log(args, {"bc": {"hist": hist, "samples": int(len(data["X"]))}})
-    return net
+    # 存**留出最优**那一轮，不是最后一轮。老代码无条件 net.save()，
+    # 存下来的是过拟合最重的那份（实测训练 87.6%->93.4% 时留出 75.9%->74.9%）。
+    saved_net = best_net
+    saved_net.lr = getattr(args, "lr", saved_net.lr)
+    saved_net.save(args.out)
+    print(
+        f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
+        f"  [最优留出 {bc_info['best_holdout']:.1%} @ 第 {bc_info['best_epoch']} 轮"
+        f" / 共 {bc_info['last_epoch']} 轮]"
+    )
+    save_log(args, {"bc": {
+        "hist": hist, "samples": int(len(data["X"])),
+        "best_epoch": bc_info["best_epoch"],
+        "best_holdout": bc_info["best_holdout"],
+        "last_epoch": bc_info["last_epoch"],
+    }})
+    return saved_net
 
 
 def cmd_rl(args) -> Net:
