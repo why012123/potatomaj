@@ -13,25 +13,50 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS = [
-    "test_sanma.py",        # 三麻役种 / 符 / 点数（含雀魂官方点数表逐格核对）
-    "test_yaku.py",         # 逐个役种对照表（34 个役 + 易混组合，防「混一色判成清一色」那种错）
-    "test_4p.py",           # 四麻：136 张 / 吃 / 北家自风 / 三色同顺 / 点数
-    "test_teacher_4p.py",   # 四麻教师不能对第 4 家失明（P0-1 回归）
-    "test_chi_4p.py",       # 四麻的「吃」必须真的被学到（P0-2 回归）
-    "test_bc_holdout.py",   # BC 存「留出最优」而非「最后一轮」（P0-5 回归）
-    "test_weight_guard.py", # 裸跑不许覆盖已训好的权重（P0-6 回归）
-    "test_eval_resolution.py",  # 同牌山注入 / 置信区间 / 还要多少场（P1-4 回归）
-    "test_exploration.py",  # 逐头熵 / 分头自适应 / 软标签 / tie-break（P1-1 回归）
-    "test_kl_anchor.py",    # KL 锚定 + 最优权重回滚进内存（P1-2 回归）
-    "test_models.py",       # 八个模型 + 四种得分条件
-    "test_fastshanten.py",  # 快速向听，与既有实现交叉验证
-    "test_engine.py",       # 对局引擎：守恒、规则、状态机
-    "test_encode.py",       # 特征编码：全局特征 / 动作特征 / 掩码
-    "test_net.py",          # 神经网络：数值梯度、掩码、存档、PPO 截断
-    "test_logs.py",         # 牌谱管线：MJAI 读写 / 重放对拍 / 数据抽取
-    "test_danger_model.py", # 危险度模型接入：布局一致性 / 人数维度守卫 / 退回手写路径
-]
+#: 登记表只用来写「这个测试是干什么的」，**不再决定跑哪些** ✗
+#:
+#: 之前这里是硬编码列表，只有列进来的才会跑 ✓ 后果：新增一个 test_*.py
+#: **不会报错、也不会被跳过提示，而是静默不跑** ✗
+#: 实测踩过：磁盘上已有 18 个 `test_*.py`，run_all 还一直报 16 个 ✓
+#: （远端的 `test_danger_model.py` 和我加的 `test_repo_hygiene.py` 都被漏掉过 ✓）
+DOCS = {
+    "test_sanma.py":        "三麻役种 / 符 / 点数（含雀魂官方点数表逐格核对）",
+    "test_yaku.py":         "逐个役种对照表（34 个役 + 易混组合，防「混一色判成清一色」那种错）",
+    "test_4p.py":           "四麻：136 张 / 吃 / 北家自风 / 三色同顺 / 点数",
+    "test_teacher_4p.py":   "四麻教师不能对第 4 家失明（P0-1 回归）",
+    "test_chi_4p.py":       "四麻的「吃」必须真的被学到（P0-2 回归）",
+    "test_bc_holdout.py":   "BC 存「留出最优」而非「最后一轮」（P0-5 回归）",
+    "test_weight_guard.py": "裸跑不许覆盖已训好的权重（P0-6 回归）",
+    "test_eval_resolution.py": "同牌山注入 / 置信区间 / 还要多少场（P1-4 回归）",
+    "test_exploration.py":  "逐头熵 / 分头自适应 / 软标签 / tie-break（P1-1 回归）",
+    "test_kl_anchor.py":    "KL 锚定 + 最优权重回滚进内存（P1-2 回归）",
+    "test_models.py":       "八个模型 + 四种得分条件",
+    "test_fastshanten.py":  "快速向听，与既有实现交叉验证",
+    "test_engine.py":       "对局引擎：守恒、规则、状态机",
+    "test_encode.py":       "特征编码：全局特征 / 动作特征 / 掩码",
+    "test_net.py":          "神经网络：数值梯度、掩码、存档、PPO 截断",
+    "test_logs.py":         "牌谱管线：MJAI 读写 / 重放对拍 / 数据抽取",
+    "test_danger_model.py": "危险度模型接入：布局一致性 / 人数维度守卫 / 退回手写路径",
+    "test_repo_hygiene.py": "仓库卫生：天鳳牌谱的保护规则必须一直生效",
+}
+
+#: 明确不跑的（目前没有）。放这里而不是「不写进列表」✗ —— 那样会变成静默跳过 ✓
+SKIP: set[str] = set()
+
+
+def discover() -> list[str]:
+    """**自动发现**所有 `test_*.py` —— 新增测试不会再被静默漏掉 ✓"""
+    found = sorted(p.name for p in HERE.glob("test_*.py") if p.name not in SKIP)
+    unknown = [n for n in found if n not in DOCS]
+    if unknown:
+        print("⚠️ 这些测试还没有说明（不影响运行，但请补进 DOCS）：")
+        for n in unknown:
+            print(f"   · {n}")
+        print()
+    return found
+
+
+TESTS = discover()
 
 
 def main() -> int:
@@ -39,7 +64,7 @@ def main() -> int:
     for name in TESTS:
         path = HERE / name
         print("=" * 68)
-        print(f"▶ {name}")
+        print(f"▶ {name}" + (f"  —— {DOCS[name]}" if name in DOCS else ""))
         print("=" * 68)
         r = subprocess.run([sys.executable, str(path)])
         if r.returncode != 0:
