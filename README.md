@@ -145,8 +145,6 @@ potatomaj/                牌效与危险度（aimodel 依赖它）
 └── danger.py             危险度
 
 tests/                    牌效 / 危险度 / AI 接口的测试
-samples/                  识图评估用的样例截图
-tools/evaluate.py         识图准确率报告
 ```
 
 ---
@@ -174,7 +172,7 @@ for t in tests/*.py; do .venv/bin/python "$t"; done
 numpy>=1.24        # AI 部分只要这个
 ```
 
-（牌面图用的是雀魂官方 WebGL 客户端的公开资源，仅供识别测试使用。）
+牌面图用的是公开的麻将牌素材，仅用于本项目的对战界面。
 
 ---
 
