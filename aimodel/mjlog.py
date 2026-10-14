@@ -39,17 +39,22 @@ own index is ``tenhou // 4`` (0-8 = 1m-9m, 9-17 = 1p-9p, 18-26 = 1s-9s,
 
 Call encoding
 -------------
-``m = type * 36 + from_who * 3 + payload`` where
+``m`` is a bit field (official mjlog layout -- see :func:`_decode_call`):
 
-* ``type``: 0 = chi, 1 = pon, 2 = kan (daiminkan), 3 = shouminkan (added kan),
-  4 = ankan (concealed kan);
-* ``from_who``: seat offset 1..3 relative to the caller (0 for ankan);
-* ``payload``: 0..2 selects which of the three same-type copies is meant -- it
-  disambiguates the red five. The actual meld is rebuilt from game state, so
-  this only matters for red-five bookkeeping.
+* bits 0-1: which seat the tile came from, counted FORWARD from the caller
+  (1 = 下家 ``(seat + 1) % 4``, 2 = 対面, 3 = 上家, 0 = nobody, i.e. ankan);
+* bit 2: 1 => chi;
+* bit 3: 1 => pon; bit 4: 1 => kakan (added kan);
+* bits 2-5 all 0: ``m & 3 == 0`` => ankan, otherwise daiminkan;
+* chi: bits 3-4 / 5-6 / 7-8 are the copy subscripts of the run's low / middle /
+  high tile and bits 10-15 are ``(suit * 7 + run) * 3 + called_pos``;
+* pon / kakan: bits 5-6 are the copy that is NOT in the meld and bits 9-15 are
+  ``tile * 3 + called_pos`` (pon only);
+* ankan / daiminkan: bits 8-15 are ``tile * 4 + copy``.
 
-This was verified against the data: ``m=52239`` decodes to
-``52239 = 1451*36 + 1*3 + 0``, i.e. a chi by seat 2 of the 1-2-3 run.
+Nothing here needs guessing: every call in ``GL1.xlsm`` decodes to a meld that
+is consistent with the caller's hand, with the immediately preceding discard,
+and with Tenhou's own ``AGARI m=`` ground truth (40,000 rows, 0 mismatches).
 """
 
 from __future__ import annotations
@@ -91,18 +96,6 @@ KNOWN_TAGS = set("TUVWDEFG") | {"N", "REACH", "DORA", "AGARI", "BYE", "UN"} | se
 
 class ParseError(Exception):
     """A row could not be turned into an event stream."""
-
-
-# ---------------------------------------------------------------------------
-# TEMPORARY debug instrumentation (opt-in; removed before the final commit)
-# Set ``DEBUG = {}`` and call :func:`parse_row`; the dict is filled with a
-# per-event trace of the replay state so the first divergence is visible.
-# ---------------------------------------------------------------------------
-DEBUG: dict | None = None
-
-
-def _dbg_sizes(hand_of) -> list[int]:
-    return [len(h) for h in hand_of]
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +182,7 @@ def parse_row(row: str) -> list[dict]:
     oya = int(oya_m.group(1))
 
     hands: list[list[int]] = []
+    raw_hands: list[list[int]] = []
     for seat in range(4):
         hm = re.search(rf"hai{seat}=([\d,]+)", s)
         if not hm:
@@ -196,6 +190,7 @@ def parse_row(row: str) -> list[dict]:
         ids = _ints(hm.group(1))
         if len(ids) != 13:
             raise ParseError(f"hai{seat} has {len(ids)} tiles, need 13")
+        raw_hands.append(list(ids))
         hands.append([t2p(x) for x in ids])
 
     # Everything from the first event tag onwards is the event stream.
@@ -220,9 +215,21 @@ def parse_row(row: str) -> list[dict]:
         "dice": [seed[3] + 1, seed[4] + 1],
         "scores": list(ten),
         "oya": oya,
-        "dora_markers": [_tile_name(t2p(seed[5]))] if len(seed) > 5 else [],
-        "tehais": [[_tile_name(t) for t in h] for h in hands],
+        "dora_markers": [_name_of_raw(seed[5])] if len(seed) > 5 else [],
+        "tehais": [[_name_of_raw(x) for x in raw] for raw in raw_hands],
     })
+    # The INITIAL dora indicator must also be emitted as a ``dora`` event.
+    # Reason: ``mjai.export`` writes start_kyoku and then one ``dora`` event per
+    # indicator coming out of ``start_hand`` (engine.py: ``dora=[self._indicator(k)
+    # ...]``) -- and logcheck.kyoku_to_wall reconstructs the dead wall ONLY from
+    # ``{"type": "dora"}`` events (``kyoku_to_wall`` line: ``indicators = [... if
+    # e.get("type") == "dora"]``). Emitting the seed[5] indicator only inside
+    # start_kyoku therefore left ``dead[0]`` as filler in every hand without a
+    # kan: measured on batch kyoku #1 the engine scored dora=0 for a hand whose
+    # real indicator (29 -> 8m) made the 9m in hand a dora. Kan indicators
+    # (``<DORA>`` tags) then land in dead[2], dead[4]... in the right order.
+    if len(seed) > 5:
+        events.append({"type": "dora", "dora_marker": _name_of_raw(seed[5])})
 
     # replay state
     hand_of: list[list[int]] = [list(h) for h in hands]
@@ -230,46 +237,49 @@ def parse_row(row: str) -> list[dict]:
     called_from: dict[int, int] = {}
     pond: list[list[int]] = [[] for _ in range(4)]
     last_tsumo: list[int | None] = [None] * 4
+    last_tsumo_raw: list[int | None] = [None] * 4
     last_dahai: tuple[int, int] | None = None
     reach_declared = [False] * 4
     dora_count = 0
 
-    dbg: list | None = None
-    if DEBUG is not None:
-        DEBUG.clear()
-        dbg = DEBUG.setdefault("log", [])
-        DEBUG["sizes0"] = _dbg_sizes(hand_of)
-        dbg.append(("init", None, None, _dbg_sizes(hand_of)))
+    #: seats whose riichi declaration was actually accepted (they have a
+    #: ``<REACH ... step="2">`` tag). A step="1" without a step="2" means the
+    #: player was ronned on the declaring discard: Tenhou charges no stick, so the
+    #: ``reach`` event must not be emitted (see the REACH branch below).
+    accepted_reach = {
+        int(b2.get("who", -1))
+        for t2, blob2 in _TAG_RE.findall(body)
+        if t2 == "REACH"
+        for b2 in [_attrs(blob2)]
+        if b2.get("step", "1") == "2"
+    }
 
     for tag, blob in _TAG_RE.findall(body):
         a = _attrs(blob)
 
         if tag in SEAT_OF_TAG:  # draw
             seat = SEAT_OF_TAG[tag]
-            tile = _bare_tile(blob, tag, s)
+            raw = _bare_raw(blob, tag, s)
+            tile = t2p(raw)
             last_tsumo[seat] = tile
+            last_tsumo_raw[seat] = raw
             # the drawn tile joins the hand; the next discard removes it again
             hand_of[seat].append(tile)
-            if dbg is not None:
-                dbg.append(("draw", seat, _tile_name(tile), _dbg_sizes(hand_of)))
-            events.append({"type": "tsumo", "actor": seat, "pai": _tile_name(tile)})
+            events.append({"type": "tsumo", "actor": seat, "pai": _name_of_raw(raw)})
             continue
 
         if tag in DAHAI_SEAT:  # discard
             seat = DAHAI_SEAT[tag]
-            tile = _bare_tile(blob, tag, s)
-            tsumogiri = last_tsumo[seat] == tile
-            if dbg is not None:
-                n_before = hand_of[seat].count(tile)
-                dbg.append(("discard", seat, _tile_name(tile),
-                            {"copies": n_before, "sizes": _dbg_sizes(hand_of),
-                             "MISSING": n_before == 0,
-                             "hand": sorted(hand_of[seat])}))
+            raw = _bare_raw(blob, tag, s)
+            tile = t2p(raw)
+            # tsumogiri must compare RAW ids: two different 5p exist (52 = red),
+            # so index equality would call a tedashi of the other 5p a tsumogiri.
+            tsumogiri = last_tsumo_raw[seat] == raw
             # the tile leaves the hand; red-five identity comes from the raw id
             _remove_tile(hand_of[seat], tile)
             pond[seat].append(tile)
             last_dahai = (seat, tile)
-            ev = {"type": "dahai", "actor": seat, "pai": _tile_name(tile),
+            ev = {"type": "dahai", "actor": seat, "pai": _name_of_raw(raw),
                   "tsumogiri": tsumogiri}
             if seat in called_from:
                 ev["_after_call"] = called_from.pop(seat)
@@ -281,17 +291,8 @@ def parse_row(row: str) -> list[dict]:
             mv = int(a.get("m", -1))
             if seat < 0 or mv < 0:
                 raise ParseError(f"bad N tag: {blob!r}")
-            ev, consumed = _decode_call(mv, seat, last_dahai, hand_of, melds_of,
-                                        discards_of=pond)
+            ev, consumed = _decode_call(mv, seat, last_dahai, hand_of)
             events.append(ev)
-            if dbg is not None:
-                dbg.append(("call", seat, f"m={mv} {ev['type']} {ev.get('pai')}",
-                            {"consumed": [_tile_name(t) for t in consumed],
-                             "missing_consumed": [_tile_name(t) for t in consumed
-                                                  if t not in hand_of[seat]],
-                             "sizes": _dbg_sizes(hand_of),
-                             "hand": sorted(hand_of[seat]),
-                             "last_dahai": last_dahai}))
             # ``consumed`` = every tile this call takes OUT OF THE CALLER'S HAND
             # (for ankan that is all four; the taken discard is not included).
             for t in consumed:
@@ -316,6 +317,16 @@ def parse_row(row: str) -> list[dict]:
             step = a.get("step", "1")
             if step == "1":
                 reach_declared[seat] = True
+                # A declaration whose discard is ronned never gets a step="2":
+                # the riichi is NOT established and Tenhou never charges the 1000.
+                # Proof from sheet row 2: seats 1 and 0 both emit <REACH step=1>,
+                # only seat 1 has step=2, and the AGARI before-scores are
+                # 237,233,233,287 against a start of 237,243,233,287 -- exactly one
+                # 1000 deduction. Emitting ``reach`` here made the replaying engine
+                # charge a stick it should not have (logcheck batch kyoku #1:
+                # engine paid the winner +14000 where the log says +13000).
+                if seat not in accepted_reach:
+                    continue
                 events.append({"type": "reach", "actor": seat})
             else:
                 ev = {"type": "reach_accepted", "actor": seat}
@@ -330,7 +341,7 @@ def parse_row(row: str) -> list[dict]:
             # string) and logcheck.kyoku_to_wall reads e["dora_marker"], so match
             # that exactly. a["hai"] is a raw Tenhou id string, so convert first.
             events.append({"type": "dora",
-                           "dora_marker": _tile_name(t2p(int(a["hai"])))})
+                           "dora_marker": _name_of_raw(int(a["hai"]))})
             continue
 
         if tag == "AGARI":
@@ -377,35 +388,70 @@ def _tile_name(t: int) -> str:
     return _NUM[num] + _SUITS[suit]
 
 
+def _red_name(t: int) -> str:
+    """Project index of a *red five* -> MJAI's red spelling ``"0m"/"0p"/"0s"``."""
+    return "0" + _SUITS[t // 9]
+
+
+def _name_of_raw(tenhou_id: int) -> str:
+    """Raw Tenhou tile id -> MJAI name, **keeping red-five identity**.
+
+    Tenhou ids 16 / 52 / 88 are the red fives. ``t2p`` maps them onto the same
+    project index as an ordinary five (4 / 13 / 22), so calling ``_tile_name``
+    directly loses that bit and every hand containing a red five silently loses
+    its aka-dora han (measured: sheet row 1 -- Tenhou scores ``ten=20,2700,0``
+    with ``yaku=0,1,7,1,54,1``, i.e. 3 han including aka; the engine fed ``"5p"``
+    scored 1 han). MJAI spells a red five ``0m``/``0p``/``0s`` and
+    ``mjai.tile_from_mjai`` maps that to ``(index, red=True)``, which is what
+    ``mjai.export``/``hand_to_mjai`` write, so this is the project's own
+    convention -- not a new one.
+    """
+    t = t2p(tenhou_id)
+    if tenhou_id in RED_FIVES and 0 <= t <= 33:
+        return _red_name(t)
+    return _tile_name(t)
+
+
 #: the T/U/V/W and D/E/F/G tags carry their value as the tag body, not an attr
 _TAGVAL_RE = {c: re.compile(rf"<{c}(\d+)/>") for c in "TUVWDEFG"}
 
 #: MJAI tile name -> project index (inverse of _tile_name)
 _NAME_TO_INDEX = {_tile_name(i): i for i in range(34)}
+#: red fives spell the same tile type, so they index identically
+for _i in (4, 13, 22):
+    _NAME_TO_INDEX[_red_name(_i)] = _i
 
 
 def _pai_index(pai) -> int:
-    """'5p' -> 13. Accepts an int unchanged (for internal bookkeeping)."""
+    """'5p' / '0p' -> 13. Accepts an int unchanged (for internal bookkeeping)."""
     if isinstance(pai, int):
         return pai
     return _NAME_TO_INDEX.get(str(pai), -1)
 
 
-def _bare_tile(blob: str, tag: str, row: str) -> int:
-    """Value of a value-carrying tag: ``<T46/>`` -> project index of Tenhou 46.
+def _bare_raw(blob: str, tag: str, row: str) -> int:
+    """Value of a value-carrying tag as the RAW Tenhou id: ``<T46/>`` -> 46.
 
     ``blob`` is what _TAG_RE captured between the tag name and the closing angle
     bracket, e.g. ``"46/"`` or ``"114/"``. Take the FIRST number in it: falling
     back to a whole-row regex search is wrong, because ``<E125/>`` would then
     match some other tag's digits (125//4 = 31 Haku, not 18).
+
+    The raw id is returned (not the project index) because it is the only place
+    the red-five bit survives: 52 -> ``0p``, 53 -> ``5p``.
     """
     m = _BARE_RE.search(blob or "")
     if m:
-        return t2p(int(m.group(1)))
+        return int(m.group(1))
     m = _TAGVAL_RE[tag].search(row) if tag in _TAGVAL_RE else None
     if not m:
         raise ParseError(f"tag <{tag}> has no value")
-    return t2p(m.group(1))
+    return int(m.group(1))
+
+
+def _bare_tile(blob: str, tag: str, row: str) -> int:
+    """As :func:`_bare_raw` but returning the project tile index."""
+    return t2p(_bare_raw(blob, tag, row))
 
 
 def _tag_value(tag: str, row: str) -> int:
@@ -422,160 +468,89 @@ def _remove_tile(hand: list[int], tile: int) -> None:
         pass
 
 
-def _recent_discards(mv: int, seat: int, last_dahai, discards_of, back: int = 6):
-    """Candidate tiles for a chi, newest first.
-
-    ``mv & 3`` gives the discarder relative to the caller, which pins down which
-    player's discard may be taken; we then walk that player's discards backwards
-    a few entries so a small bookkeeping drift cannot lose the call.
-    """
-    low = mv & 3
-    if low:
-        owner = (seat - low) % 4
-        pond = discards_of[owner] if discards_of else []
-        for t in reversed(pond[-back:]):
-            yield t
-    if last_dahai is not None and last_dahai[1] not in (None,):
-        yield last_dahai[1]
-    seen = set()
-    for pond in (discards_of or []):
-        for t in reversed(pond[-back:]):
-            if t not in seen:
-                seen.add(t)
-                yield t
-
-
-def _decode_call(mv: int, seat: int, last_dahai, hand_of, melds_of, discards_of=None):
+def _decode_call(mv: int, seat: int, last_dahai, hand_of):
     """Decode ``m=`` into an MJAI call event plus the tiles the caller gives up.
 
-    Per the agreed recipe (verified independently on this file):
+    Returns ``(event, consumed)``; ``consumed`` holds the project tile indices
+    the caller gives up (never the called tile itself -- ankan gives up four).
+    ``_from`` is set when the tile came from another seat, so the caller can pop
+    it out of that player's pond.
 
-    * the called tile is simply the **immediately preceding discard** in the
-      event stream -- exact, no decoding needed;
-    * ``(m >> 2) & 3``: 2 => pon/minkan, 1 or 3 => chi (suited tiles only),
-      0 with ``m & 3 == 0`` => ankan;
-    * ``m & 3 == (discarder - caller) mod 4`` -- validated on every call in the
-      workbook: 10896/10896 = 100%;
-    * the remaining tiles come from the caller's hand.
-
-    The high-bit "pattern"/copy-number is deliberately ignored: it is not needed
-    once the called tile is taken from the stream, and its exact packing could
-    not be reproduced from the published table (``(m>>4)//96`` scores 31/6450
-    here, so it is NOT used).
-
-    Sets ``_from`` on the returned event when the tile came from another seat,
-    so the caller can pop it out of that player's pond.
+    Every field is taken from the official bit layout (module docstring), so the
+    chi's run *and* which of its three tiles was called, the pon's tile, and the
+    ankan/daiminkan tile all come out of ``m``.  The old code instead guessed the
+    meld from the caller's hand, and guessed wrong whenever the hand could back
+    two different runs for the same called tile: it then removed the wrong two
+    tiles, so a later discard of one of them silently removed nothing and every
+    following call was judged against a hand that had drifted.
     """
-    branch = (mv >> 2) & 3
     low = mv & 3
-
-    def seat_ok(discarder):
-        """Cross-check: m & 3 must equal (discarder - caller) mod 4."""
-        return low == (discarder - seat) % 4
-
+    hand = hand_of[seat]
+    # bits 0-1 name the seat the tile came from, counted FORWARD from the caller
+    # (1 = the next player, 3 = the previous one -- the only seat a chi may take
+    # from; 0 = nobody, i.e. ankan).  In every chi / pon / daiminkan of GL1.xlsm
+    # this agrees with the tile's own immediately preceding discard.
+    source = (seat + low) % 4
     taken = last_dahai[1] if last_dahai else None
-    taker = last_dahai[0] if last_dahai else None
 
-    # -- ankan: no discard involved -----------------------------------------
-    if branch == 0 and low == 0:
-        tile = _pick_tile_with_count(hand_of[seat], 4)
-        if tile is None:
-            raise ParseError("ankan (m&3==0, (m>>2)&3==0) but no four copies in hand")
-        return ({"type": "ankan", "actor": seat, "pai": _tile_name(tile),
-                 "consumed": [_tile_name(tile)] * 3, "_from": None}, [tile] * 4)
-
-    if taken is None:
-        raise ParseError(f"call m={mv} at seat {seat} but no preceding discard")
-    # -- chi ----------------------------------------------------------------
-    if branch in (1, 3):
-        # Chi cannot be decoded from m (the published step model fails on it:
-        # the Mac measured <=12% for sequences). So take the most recent discard
-        # that the caller's hand can ACTUALLY back as a run -- searching back a
-        # little absorbs any drift in our own discard bookkeeping.
-        seq = None
-        tile = None
-        for cand in _recent_discards(mv, seat, last_dahai, discards_of):
-            s2 = _chi_from_hand(hand_of[seat], cand)
-            if s2 is not None:
-                seq, tile = s2, cand
-                break
-        if seq is None:
-            cand = taken if taken is not None else -1
-            raise ParseError(f"chi m={mv}: no discard forms a run with seat "
-                             f"{seat} hand (nearest={_tile_name(cand)})")
-        consumed = [t for t in seq if t != tile]
-        return ({"type": "chi", "actor": seat, "target": taker if taker is not None else 0,
+    # -- chi (bit 2) ---------------------------------------------------------
+    if mv & 0x04:
+        pat = (mv >> 10) & 0x3F              # (suit * 7 + run) * 3 + called_pos
+        pos, suit_run = pat % 3, pat // 3
+        suit, run = suit_run // 7, suit_run % 7
+        seq = [suit * 9 + run + k for k in range(3)]
+        tile = seq[pos]                      # the tile that was called
+        consumed = [t for k, t in enumerate(seq) if k != pos]
+        missing = [_tile_name(t) for t in consumed if t not in hand]
+        if missing:
+            raise ParseError(f"chi of {_tile_name(tile)} (m={mv}) but seat {seat} "
+                             f"holds no {'/'.join(missing)}")
+        if taken is None:
+            raise ParseError(f"call m={mv} at seat {seat} but no preceding discard")
+        return ({"type": "chi", "actor": seat, "target": source,
                  "pai": _tile_name(tile),
                  "consumed": [_tile_name(t) for t in consumed],
-                 "_from": (taker if taker is not None else 0)}, consumed)
+                 "_from": source},
+                consumed)
 
-    # -- pon / minkan -------------------------------------------------------
-    if branch == 2:
-        # The tile for a same-kind call is DECODED, not inferred. On this exact
-        # file (sha256 6b1d3a33...7c52, 17,830,164 bytes) the check
-        # "(m>>4)//96 == 紧邻上一个打牌" scores 2203/2203 = 100.0%.
-        # Trusting the formula is more robust than tracking the previous
-        # discard, which drifts as the hand bookkeeping accumulates.
-        tile = (mv >> 4) // 96
-        if tile > 33:
+    # -- pon (bit 3) / kakan (bit 4) -----------------------------------------
+    if mv & 0x18:
+        tile = ((mv >> 9) & 0x7F) // 3       # == (m >> 4) // 96
+        have = sum(1 for t in hand if t == tile)
+        if mv & 0x08:
+            if have < 2:
+                raise ParseError(f"pon of {_tile_name(tile)} (m={mv}) but seat "
+                                 f"{seat} holds only {have}")
             if taken is None:
-                raise ParseError(f"pon/kan m={mv}: formula tile {tile} out of range "
-                                 f"and no preceding discard")
-            tile = taken  # out of range: fall back to the stream
-        from_player = taker if taker is not None else (seat - low) % 4
-        have = sum(1 for t in hand_of[seat] if t == tile)
-        if have >= 3:
-            return ({"type": "minkan", "actor": seat, "target": from_player,
-                     "pai": _tile_name(tile), "consumed": [_tile_name(tile)] * 3,
-                     "_from": from_player}, [tile] * 3)
-        if have >= 2:
-            return ({"type": "pon", "actor": seat, "target": from_player,
+                raise ParseError(f"call m={mv} at seat {seat} but no preceding discard")
+            return ({"type": "pon", "actor": seat, "target": source,
                      "pai": _tile_name(tile), "consumed": [_tile_name(tile)] * 2,
-                     "_from": from_player}, [tile] * 2)
-        raise ParseError(f"pon/kan of {_tile_name(tile)} (m={mv}) but seat {seat} "
-                         f"holds only {have}")
-
-    # -- branch 0 with low != 0: an added kan (kakan) -----------------------
-    if branch == 0:
-        tile = _meld_tile(melds_of[seat], "pon")
-        if tile is None:
-            raise ParseError(f"kakan m={mv} but no existing pon for seat {seat}")
+                     "_from": source},
+                    [tile] * 2)
+        # kakan: the fourth copy joins the pon this seat already has
+        if have < 1:
+            raise ParseError(f"kakan of {_tile_name(tile)} (m={mv}) but seat {seat} "
+                             f"does not hold the fourth copy")
         return ({"type": "kakan", "actor": seat, "pai": _tile_name(tile),
                  "consumed": [], "_from": None}, [tile])
 
-    raise ParseError(f"unclassified call m={mv} at seat {seat}")
-
-
-def _chi_from_hand(hand: list[int], taken: int):
-    """The three indices of a chi of ``taken`` that the hand can actually back."""
-    if taken >= 27:
-        return None
-    num, suit = taken % 9, taken // 9
-    have = set(hand)
-    for start in (num - 2, num - 1, num):
-        if start < 0 or start + 2 > 8:
-            continue
-        seq = [suit * 9 + start + k for k in range(3)]
-        if all(t in have for t in seq if t != taken):
-            return seq
-    return None
-
-
-def _meld_tile(melds: list[tuple], kind: str):
-    for name, tiles in reversed(melds):
-        if name == kind and tiles:
-            return tiles[0]
-    return None
-
-
-def _pick_tile_with_count(hand: list[int], n: int):
-    from collections import Counter
-
-    c = Counter(hand)
-    for t, k in c.items():
-        if k >= n:
-            return t
-    return None
+    # -- ankan / daiminkan (bits 2-5 clear) ----------------------------------
+    tile = ((mv >> 8) & 0xFF) // 4
+    have = sum(1 for t in hand if t == tile)
+    if low == 0:                             # ankan: no tile was called
+        if have < 4:
+            raise ParseError(f"ankan of {_tile_name(tile)} (m={mv}) but seat {seat} "
+                             f"holds only {have}")
+        return ({"type": "ankan", "actor": seat, "pai": _tile_name(tile),
+                 "consumed": [_tile_name(tile)] * 3, "_from": None}, [tile] * 4)
+    if have < 3:
+        raise ParseError(f"daiminkan of {_tile_name(tile)} (m={mv}) but seat {seat} "
+                         f"holds only {have}")
+    if taken is None:
+        raise ParseError(f"call m={mv} at seat {seat} but no preceding discard")
+    return ({"type": "minkan", "actor": seat, "target": source,
+             "pai": _tile_name(tile), "consumed": [_tile_name(tile)] * 3,
+             "_from": source}, [tile] * 3)
 
 
 def _chi_shape(hand: list[int], tile: int, payload: int):
@@ -606,31 +581,46 @@ def _chi_shape(hand: list[int], tile: int, payload: int):
 def _decode_agari(a: dict, hand_of, melds_of, oya: int) -> dict:
     who = int(a.get("who", -1))
     from_who = int(a.get("fromWho", who))
-    machi = t2p(a["machi"]) if "machi" in a else None
-    hai = [t2p(x) for x in _ints(a.get("hai", ""))]
-    ten = _ints(a.get("ten", ""))          # [fu, points, (yakuman flag)]
+    machi_raw = int(a["machi"]) if "machi" in a else None
+    machi = t2p(machi_raw) if machi_raw is not None else None
+    raw_hai = _ints(a.get("hai", ""))
+    hai = [t2p(x) for x in raw_hai]
+    ten = _ints(a.get("ten", ""))          # [fu, points, (limit tier)]
     yaku = _ints(a.get("yaku", ""))        # pairs (id, han)
     sc = _ints(a.get("sc", ""))
     ba = _ints(a.get("ba", ""))
     deltas = _sc_deltas(sc)
+    # ``ten[2]`` is NOT a yakuman flag -- it is the *limit tier* of the hand.
+    # Measured over all 5,012 AGARI rows of Sheet1 (points seen per tier):
+    #   0 -> 1000..7700      1 -> 8000/12000 (mangan)
+    #   2 -> 12000/18000     3 -> 16000/24000 (baiman)
+    #   4 -> 24000           5 -> 32000/48000 (yakuman; those rows log yaku="")
+    # So a mangan (tier 1) would have been reported as "yakuman" by the old key.
+    tier = ten[2] if len(ten) > 2 else 0
     return {
         "type": "hora",
         "actor": who,
         "target": from_who,
         "tsumo": who == from_who,
-        "pai": _tile_name(machi) if machi is not None else None,
+        "pai": _name_of_raw(machi_raw) if machi_raw is not None else None,
         "oya": oya,
         "fu": ten[0] if ten else None,
         "points": ten[1] if len(ten) > 1 else None,
-        "yakuman_flag": ten[2] if len(ten) > 2 else 0,
+        #: 0 = plain, 1 = mangan, 2 = haneman, 3 = baiman, 4 = sanbaiman, 5 = yakuman
+        "limit_tier": tier,
+        "yakuman_flag": 1 if tier == 5 else 0,
         "yaku_ids": yaku,
         "han_ids": yaku[1::2],
-        "hand_concealed": [_tile_name(t) for t in hai],
+        #: total han as logged (includes dora 52 / ura 53 / aka 54 entries).
+        #: logcheck.check_kyoku only compares han when the key is present.
+        "han": sum(yaku[1::2]),
+        "hand_concealed": [_name_of_raw(x) for x in raw_hai],
         "n_melds": len(melds_of[who]) if who >= 0 else 0,
         "deltas": deltas,
         "raw_sc": sc,
-        "dora_markers": [_tile_name(t2p(x)) for x in _ints(a.get("doraHai", ""))],
-        "ura_markers": [_tile_name(t2p(x)) for x in _ints(a.get("doraHaiUra", ""))],
+        "ba": ba,
+        "dora_markers": [_name_of_raw(x) for x in _ints(a.get("doraHai", ""))],
+        "ura_markers": [_name_of_raw(x) for x in _ints(a.get("doraHaiUra", ""))],
     }
 
 
