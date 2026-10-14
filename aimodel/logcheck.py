@@ -407,7 +407,9 @@ def selftest(n_games: int = 5, players: int = 3) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="牌谱对拍（真实牌谱喂回引擎，比结果）")
-    ap.add_argument("path", nargs="?", help="MJAI 牌谱文件或目录")
+    ap.add_argument("path", nargs="?",
+                    help="MJAI 牌谱文件或目录。**一个文件可以放任意多局** —— "
+                         "按事件流里的 start_kyoku 自动切分，不需要一局一个文件")
     ap.add_argument("--players", type=int, default=3, choices=[3, 4])
     ap.add_argument("--limit", type=int, default=None, help="最多对拍几局")
     ap.add_argument("--selftest", action="store_true", help="自检：自己导出再自己对拍")
@@ -424,9 +426,22 @@ def main(argv: list[str] | None = None) -> None:
         print(f"没找到牌谱：{args.path}")
         return
     reports: list[KyokuReport] = []
+    total_found = 0
     for f in files:
-        reports.extend(check_file(f, n=args.players, limit=args.limit))
-        _summary(reports, f"{f.name}（累计）")
+        events = mjai.read(f)
+        ks = list(mjai.iter_kyoku(events))
+        total_found += len(ks)
+        take = len(ks) if not args.limit else min(args.limit, len(ks))
+        # ★ 必须把「切出几局」和「比了几局」都打出来 —— 不然「8/8 一致」会被
+        #   误读成「全部都对」，而实际上可能只切出了 8 局（踩过这个坑）
+        print(f"  {f.name}：{len(events)} 条事件 → 切出 {len(ks)} 局，本次对拍 {take} 局")
+        if len(ks) == 0 and len(events) > 0:
+            print("    ⚠️ 一条都没切出来 —— 检查牌谱里有没有 start_kyoku 事件")
+        for ky in ks[:take]:
+            reports.append(check_kyoku(ky, n=args.players))
+    print()
+    print(f"  合计：切出 {total_found} 局，本次对拍 {len(reports)} 局")
+    _summary(reports, "对拍结果（累计）")
     bad = [r for r in reports if not r.ok]
     if bad:
         print("\n不一致的局（前 10）：")
