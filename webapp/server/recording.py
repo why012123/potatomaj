@@ -35,10 +35,11 @@ import random
 import string
 import threading
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 log = logging.getLogger("maj.record")
 
@@ -534,47 +535,135 @@ def tile_id(index: int) -> str:
     return T.index_to_id(index)
 
 
+def _get(obj: Any, name: str, default: Any = None) -> Any:
+    """宽容取属性。
+
+    ``View`` / ``Player`` 的字段会随训练侧改动而增减，而记录器是**只读**的
+    旁路，不该因为上游加了个字段就整条记录失败。
+    """
+    try:
+        return getattr(obj, name, default)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _meld_json(m: Any) -> dict:
+    return {
+        "kind": _get(m, "kind", "?"),
+        "tile": tile_id(_get(m, "tile", 0)),
+        "from": _get(m, "from_player", -1),
+        "aka": _get(m, "aka", 0),
+    }
+
+
 def snapshot_view(view: Any) -> dict:
     """把引擎的 :class:`~aimodel.engine.View` 压成可落盘的局面快照。
 
     **这是决策级数据的核心**：有了它 + 合法动作 + 实际选择，这份数据就能
     直接拿去训练（模仿学习 / 离线 RL）。
+
+    ``View`` 的字段是**跨版本**的（训练侧会加字段），所以这里一律用
+    :func:`_get` 取、取不到就退回一个合理的默认值 —— 记录器绝不能因为
+    上游加了个字段就把整条决策丢掉（这个坑踩过一次：少了 ``discards_red``
+    直接让所有 decision 记录报 AttributeError，一条都没落盘）。
     """
+    discards = _get(view, "discards", [])
     return {
-        "seat": view.player,
+        "seat": _get(view, "player", 0),
         "hand": [tile_id(t) for t in range(34) for _ in range(view.hand[t])],
         "hand_counts": list(view.hand),
-        "hand_red": list(view.hand_red),
+        "hand_red": list(_get(view, "hand_red", [0] * 34)),
         "drawn": (tile_id(view.drawn) if view.drawn is not None else None),
-        "melds": [
-            {"kind": m.kind, "tile": tile_id(m.tile), "from": m.from_player, "aka": m.aka}
-            for m in view.melds
-        ],
-        "ponds": [[tile_id(t) for t in row] for row in view.discards],
-        "ponds_red": [list(r) for r in (view.discards_red or [])],
-        "melds_all": [
-            [{"kind": m.kind, "tile": tile_id(m.tile), "from": m.from_player, "aka": m.aka}
-             for m in row]
-            for row in view.melds_all
-        ],
-        "kita": list(view.kita),
-        "scores": list(view.scores),
-        "dora_indicators": [tile_id(d) for d in view.dora_indicators],
-        "round_wind": tile_id(view.round_wind),
-        "seat_wind": tile_id(view.seat_wind),
-        "wall_left": view.wall_left,
-        "turn": view.turn,
-        "riichi": list(view.riichi),
-        "ippatsu": list(view.ippatsu),
+        "melds": [_meld_json(m) for m in _get(view, "melds", [])],
+        "ponds": [[tile_id(t) for t in row] for row in discards],
+        "ponds_red": [list(r) for r in (_get(view, "discards_red", []) or [])],
+        "melds_all": [[_meld_json(m) for m in row]
+                      for row in _get(view, "melds_all", [])],
+        "kita": list(_get(view, "kita", [])),
+        "scores": list(_get(view, "scores", [])),
+        "dora_indicators": [tile_id(d) for d in _get(view, "dora_indicators", [])],
+        "round_wind": tile_id(_get(view, "round_wind", 27)),
+        "seat_wind": tile_id(_get(view, "seat_wind", 27)),
+        "wall_left": _get(view, "wall_left", 0),
+        "turn": _get(view, "turn", 0),
+        "riichi": list(_get(view, "riichi", [])),
+        "ippatsu": list(_get(view, "ippatsu", [])),
         "is_dealer": view.is_dealer,
         "last_discard": (
             [view.last_discard[0], tile_id(view.last_discard[1])]
             if view.last_discard else None
         ),
-        "players": len(view.scores),
-        "aka": bool(view.rule.aka),
-        "kita_rule": bool(view.rule.kita_dora),
+        "players": len(_get(view, "scores", []) or [1]),
+        "aka": bool(getattr(_get(view, "rule", None), "aka", False)),
+        "kita_rule": bool(getattr(_get(view, "rule", None), "kita_dora", False)),
     }
+
+
+def iter_jsonl_gz(path: Path) -> Iterator[dict]:
+    """读一个 gzip JSONL 分片，**容忍被截断的尾巴**。
+
+    分片是**追加**写的（``gzip.open(path, "ab")``），gzip 的追加模式会往同一个
+    文件里接一个新的 gzip 成员。如果进程被强杀，最后一个成员就是**残缺**的。
+
+    两个坑，都踩过：
+
+    1. :func:`gzip.open` 会在**读第一行之前**就抛
+       ``EOFError: Compressed file ended before the end-of-stream marker``，
+       于是整个文件里已经写好的几万条记录一起读不出来。
+    2. 换成「自己管 ``GzipFile``、出错就 break」也**不对** —— 异常抛出的
+       时候，解出来的那几百 KB 数据已经在这个调用的返回值里了，直接 break
+       等于把它们一起丢掉（症状：文件 20KB，读回来 0 条）。
+
+    所以这里用 :mod:`zlib` 自己解：**边解边攒、边攒边切行**，出错就把已经
+    攒到的部分交出去，只丢残缺的最后一行。
+    """
+    if not path.exists():
+        return
+    try:
+        data = bytearray(path.read_bytes())
+    except OSError:
+        return
+    buf = bytearray()
+    i = 0
+    n = len(data)
+    d = zlib.decompressobj(31)          # 31 = gzip 容器（自动跳过文件头）
+    while i < n:
+        take = min(1 << 20, n - i)
+        piece = bytes(data[i : i + take])
+        i += take
+        try:
+            out = d.decompress(piece)
+        except zlib.error:
+            break                        # 这一段坏了：保留之前解出来的
+        buf += out
+        while True:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                break
+            line = bytes(buf[:nl])
+            del buf[: nl + 1]
+            if line.strip():
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    pass
+        if d.eof:
+            # 这个成员结束了；追加写的文件里后面还有成员
+            extra = d.unused_data
+            if extra:
+                data[i - len(extra) : i] = extra
+                i -= len(extra)
+            d = zlib.decompressobj(31)
+    try:
+        buf += d.flush()
+    except zlib.error:
+        pass
+    for line in bytes(buf).split(b"\n"):
+        if line.strip():
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                pass
 
 
 @dataclass
@@ -627,6 +716,9 @@ class GameRecorder:
         self.hands_recorded = 0
         self.timings: dict[int, SeatTiming] = {}
         self.elo_before = {s["seat"]: float(s.get("elo", ELO_START)) for s in seats}
+        #: 牌河里每张牌是不是赤 5（房间在 discard 事件里现读现攒，
+        #: 兜底写成一份副本 —— 引擎的 Player 不带这个信息）
+        self.pond_red: dict[int, list[int]] = {}
         self._closed = False
         self._write("game_start", {
             "game_uid": self.game_uid,
@@ -722,6 +814,7 @@ class GameRecorder:
         hands = []
         for i, pl in enumerate(getattr(game, "players", [])):
             info = self.seat_info(i)
+            hand_counts = list(_get(pl, "hand", [0] * 34))
             hands.append({
                 "seat": i,
                 "player": info.get("uid", ""),
@@ -729,20 +822,19 @@ class GameRecorder:
                 "kind": info.get("kind", "?"),
                 "ai": info.get("ai"),
                 "recorded": self.noting(i),
-                "hand": [tile_id(t) for t in range(34) for _ in range(pl.hand[t])],
-                "hand_counts": list(pl.hand),
-                "hand_red": list(pl.red),
-                "melds": [
-                    {"kind": m.kind, "tile": tile_id(m.tile), "from": m.from_player,
-                     "aka": m.aka}
-                    for m in pl.melds
-                ],
-                "pond": [tile_id(t) for t in pl.pond],
-                "pond_red": list(pl.pond_red),
-                "kita": pl.kita,
-                "riichi": pl.riichi,
-                "riichi_tile": (tile_id(pl.riichi_tile)
-                                if pl.riichi_tile is not None else None),
+                "hand": [tile_id(t) for t in range(34)
+                         for _ in range(hand_counts[t])],
+                "hand_counts": hand_counts,
+                "hand_red": list(_get(pl, "red", [0] * 34)),
+                "melds": [_meld_json(m) for m in _get(pl, "melds", [])],
+                "pond": [tile_id(t) for t in _get(pl, "pond", [])],
+                # Player 没有 pond_red（那是给网页牌桌的字段），所以这里
+                # 用房间自己攒的牌河赤 5 记录；没有就退回全 0。
+                "pond_red": list(self.pond_red.get(i, [])),
+                "kita": _get(pl, "kita", 0),
+                "riichi": bool(_get(pl, "riichi", False)),
+                "riichi_tile": (tile_id(_get(pl, "riichi_tile"))
+                                if _get(pl, "riichi_tile") is not None else None),
                 "score": game.scores[i] if i < len(game.scores) else 0,
             })
         agari = []
@@ -851,7 +943,11 @@ class GameRecorder:
                 "summary": (result.stats[i].summary() if i < len(result.stats) else {}),
                 "profile": self.profiles.snapshot(info.get("uid", "")),
             })
-        self._write("match", {
+        # 一条 match 记录里**每个人一行**。除了 ``players`` 数组，
+        # 还给人类玩家各补一份顶层记录（``player`` = 匿名 ID）——
+        # 「同一个人打了 10 局」这种查询直接按 player 过滤就行，
+        # 不用先去 players 数组里翻。
+        base = {
             "finished_at": time.time(),
             "duration_s": round(time.time() - self.started_at, 2),
             "hands": len(result.hands),
@@ -860,7 +956,30 @@ class GameRecorder:
             "rank_points": [round(x, 2) for x in (result.rank_points or [])],
             "players": rows,
             "decisions": self.decisions,
-        })
+        }
+        # 写完全部记录**再**置 closed —— 顺序反了的话下面那些 per-player
+        # 记录会被 ``_write`` 直接丢掉（这个坑踩过一次：ELO 零和校验
+        # 拿不到任何 match 记录，0 场可查）。
+        for i, row in enumerate(rows):
+            if row["kind"] != "human" or not row["player"]:
+                continue
+            self._write("match", {
+                **base,
+                "seat": i,
+                "player": row["player"],
+                "name": row["name"],
+                "kind_player": "human",
+                "rank": row["rank"],
+                "score": row["score"],
+                "start_score": row["start_score"],
+                "delta": row["delta"],
+                "elo_before": row["elo_before"],
+                "elo_after": row["elo_after"],
+                "elo_delta_raw": row["elo_delta_raw"],
+                "elo_delta": row["elo_delta"],
+                "stats": row["stats"],
+                "profile": row["profile"],
+            })
         self._closed = True
         self.profiles.save()
         return deltas

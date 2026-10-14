@@ -1,0 +1,31 @@
+# 土豆麻将 · 日志轮转（VPS 侧）
+# 装到 /etc/logrotate.d/maj
+#
+# frps 和 nginx 的日志都要轮转，否则 24GB 的盘迟早写满。应用自己的日志
+# 由 Python 的 RotatingFileHandler 管（logs/ 下 8MB × 5 份），不用这里管。
+
+/var/log/maj/*.log {
+    daily
+    rotate 14
+    maxsize 64M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0640 root root
+}
+
+/var/log/nginx/maj.*.log {
+    daily
+    rotate 14
+    maxsize 64M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid) || true
+    endscript
+}
