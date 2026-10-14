@@ -19,6 +19,21 @@ aimodel/arena_state.json
 # ── 牌图缓存（重新拉一次就有）────────────────────────────────
 aimodel/ui/java/.tilecache/
 
+# ── 与麻将平台实时协议相关的部分（本地保留，不入库）──────────
+# 这些是「接入某个商业麻将平台、在牌桌上给提示」的工具。公开它既违反
+# 那个平台的服务条款，也会把整个仓库置于 DMCA 风险之下（连带下架 AI 部分）。
+# 本项目真正对外的是 aimodel/：一个自制的三麻/四麻规则引擎 + AI，不依赖任何平台。
+electron/          # 平台客户端外壳（注入网页、实时读牌）
+.refs/             # 平台 protobuf 协议定义
+tools/protocol.js  # 协议那层密钥的求解工具
+tools/decode.js
+tools/cache/
+potatomaj/bridge.py        # 给上面那个外壳用的「大脑」服务
+run-electron.sh            # 外壳的启动脚本
+土豆麻将.command
+土豆麻将浏览器.command
+archive/           # 开发过程中的弯路（含旧版悬浮窗），留本地可查
+
 # ── 系统杂物 ─────────────────────────────────────────────────
 .DS_Store
 ._*
