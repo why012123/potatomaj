@@ -33,7 +33,9 @@ from .engine import Decision, Game, View
 # ---------------------------------------------------------------------------
 # 把牌谱还原成引擎能吃的牌山
 # ---------------------------------------------------------------------------
-def kyoku_to_wall(kyoku: list[dict], n: int, rule: S.Rule) -> list[tuple[int, int]]:
+def kyoku_to_wall(kyoku: list[dict], n: int, rule: S.Rule,
+                  ura_markers: list[tuple[int, int]] | None = None
+                  ) -> list[tuple[int, int]]:
     """一局 MJAI 事件 -> 引擎的牌山。
 
     排布顺序（和引擎内部一致）::
@@ -78,13 +80,25 @@ def kyoku_to_wall(kyoku: list[dict], n: int, rule: S.Rule) -> list[tuple[int, in
     wall.extend([(0, 0)] * pad)
     wall.extend(reversed(back))
 
-    # 王牌：dead[0]、dead[2]、dead[4]… 是宝牌指示牌，其余位置填无关牌
+    # 王牌：dead[0]、dead[2]、dead[4]… 是**宝牌**指示牌，
+    #       dead[1]、dead[3]、dead[5]… 是**里宝牌**指示牌
+    #       （引擎的 `_indicator(i, ura=True)` 就取奇数位）
+    #
+    # ⚠️ 里宝牌**必须一起放** —— 只放宝牌的话，立直和牌时引擎读到的是垃圾
+    #    （默认填的 (0,0) = 1m），番数会多算/少算，表现成「番数双向不符」。
+    #    这个坑踩过：对拍里 42 例番数不符，根因就在这。
     dead: list[tuple[int, int]] = [(0, 0)] * rule.dead_wall
+    n_slots = max(1, rule.dead_wall // 2)
     indicators = [mjai.tile_from_mjai(e["dora_marker"])
                   for e in kyoku if e.get("type") == "dora"]
-    for i, ind in enumerate(indicators[: max(1, rule.dead_wall // 2)]):
+    for i, ind in enumerate(indicators[:n_slots]):
         if i * 2 < len(dead):
             dead[i * 2] = ind
+    # 里宝牌：优先用和牌事件里带的 `ura_markers`（天鳳牌谱的 doraHaiUra）
+    ura = ura_markers or []
+    for i, ind in enumerate(ura[:n_slots]):
+        if i * 2 + 1 < len(dead):
+            dead[i * 2 + 1] = ind
     wall.extend(dead)
     return wall
 
@@ -98,9 +112,13 @@ class Mismatch:
     kind: str
     expected: str
     got: str
+    #: 这是引擎的第几个动作（从 1 开始）。**用来定位「第一次失步」** ——
+    #: 只看累计数量看不出起点，而这个步号能直接指向分叉的那一手。
+    step: int = 0
 
     def __str__(self) -> str:
-        return f"P{self.seat} {self.kind}: 牌谱写的是 {self.expected}，引擎这边 {self.got}"
+        head = f"[第 {self.step} 手] " if self.step else ""
+        return f"{head}P{self.seat} {self.kind}: 牌谱写的是 {self.expected}，引擎这边 {self.got}"
 
 
 class LogAgent(Agent):
@@ -121,9 +139,18 @@ class LogAgent(Agent):
         self.seat = seat
         self.script = list(script)
         self.problems = problems if problems is not None else []
+        #: 引擎已经做过多少个动作 —— 用来给每个不符打上「第几手」
+        self.step = 0
 
     # -- 由引擎动作流推进 ------------------------------------------------
-    def on_action(self, a: dict) -> None:
+    def on_action(self, a: dict, step: int = 0) -> None:
+        """引擎每做一个动作就调一次。
+
+        ``step`` 是**引擎动作的全局序号**（由派发方传入）—— 必须用全局的，
+        不然每个座位各数各的，和「引擎动作轨迹」的下标对不上，
+        报出来的「第 N 手」就没法在轨迹里定位（踩过）。
+        """
+        self.step = step or (self.step + 1)
         who = a.get("player", a.get("winner"))
         if who != self.seat:
             return
@@ -132,22 +159,24 @@ class LogAgent(Agent):
             got = self._pop("discard")
             if got is None:
                 self.problems.append(Mismatch(
-                    self.seat, k, S.tile_cn(a["tile"]), "牌谱没记这一步"))
+                    self.seat, k, S.tile_cn(a["tile"]), "牌谱没记这一步", self.step))
             elif got[2] != a["tile"]:
                 self.problems.append(Mismatch(
-                    self.seat, k, S.tile_cn(got[2]), S.tile_cn(a["tile"])))
+                    self.seat, k, S.tile_cn(got[2]), S.tile_cn(a["tile"]), self.step))
         elif k == "riichi":
             self._pop("riichi")
         elif k == "kita":
             self._pop("kita")
         elif k == "win":
             if not self._pop("win"):
-                self.problems.append(Mismatch(self.seat, k, "没有和牌", "引擎和了"))
+                self.problems.append(
+                    Mismatch(self.seat, k, "没有和牌", "引擎和了", self.step))
         elif k == "call":
             got = self._pop("call")
             if got is None or got[1] != a["call"]:
                 self.problems.append(Mismatch(
-                    self.seat, k, str(got[1]) if got else "没记这一步", a["call"]))
+                    self.seat, k, str(got[1]) if got else "没记这一步", a["call"],
+                    self.step))
 
     def _pop(self, kind: str):
         if self.script and self.script[0][0] == kind:
@@ -171,12 +200,12 @@ class LogAgent(Agent):
             got = self._peek("discard")
             if got is None:
                 self.problems.append(Mismatch(
-                    self.seat, k, "打牌", "牌谱已经没动作了"))
+                    self.seat, k, "打牌", "牌谱已经没动作了", self.step))
                 return 0
             tile = got[2]
             if tile not in opts:
                 self.problems.append(Mismatch(
-                    self.seat, k, S.tile_cn(tile), "手里没有这张牌"))
+                    self.seat, k, S.tile_cn(tile), "手里没有这张牌", self.step))
                 return 0
             return opts.index(tile)
 
@@ -263,11 +292,17 @@ class KyokuReport:
     ok: bool
     notes: list[str] = field(default_factory=list)
     mismatches: list[Mismatch] = field(default_factory=list)
+    #: 第一处不符（根因所在）；None 表示没有不符
+    first_desync: Mismatch | None = None
+    #: 第一次失步附近的引擎动作轨迹（前后各几手）
+    desync_trace: list[str] = field(default_factory=list)
 
     def line(self) -> str:
         flag = "✅" if self.ok else "❌"
         body = "；".join(self.notes) if self.notes else "一致"
-        extra = f"　（{len(self.mismatches)} 处出牌不符）" if self.mismatches else ""
+        extra = ""
+        if self.mismatches:
+            extra = f"　（{len(self.mismatches)} 处不符，第一次在第 {self.first_desync.step} 手）"
         return f"{flag} 第 {self.hand_no} 局：{body}{extra}"
 
 
@@ -280,14 +315,25 @@ def check_kyoku(kyoku: list[dict], n: int = 3, rule: S.Rule | None = None,
     scripts = build_scripts(kyoku, n)
     agents = [LogAgent(i, scripts[i]) for i in range(n)]
 
+    # 里宝牌：天鳳牌谱放在 AGARI 的 doraHaiUra，转 MJAI 时落在 hora 的 ura_markers
+    ura: list[tuple[int, int]] = []
+    _h = mjai.hora_of(kyoku)
+    if _h:
+        for x in _h.get("ura_markers", []) or []:
+            ura.append(mjai.tile_from_mjai(x))
+
     game = Game(agents, seed=0, rule=rule)
-    game.rigged_wall = kyoku_to_wall(kyoku, n, rule)
+    game.rigged_wall = kyoku_to_wall(kyoku, n, rule, ura_markers=ura)
     if not verbose:
         game.on_event = None
 
+    trace: list[dict] = []
+
     def dispatch(a: dict) -> None:
+        trace.append(a)
+        n = len(trace)                       # 全局序号，从 1 开始
         for ag in agents:
-            ag.on_action(a)
+            ag.on_action(a, step=n)
 
     game.on_action = dispatch
     res = game.play_hand(dealer)
@@ -295,12 +341,42 @@ def check_kyoku(kyoku: list[dict], n: int = 3, rule: S.Rule | None = None,
     rep = KyokuReport(hand_no=int(start.get("kyoku", 1)), ok=True)
     for a in agents:
         rep.mismatches.extend(a.problems)
+    # ★ 按步号排序，把**第一次失步**单独拎出来 —— 累计数量看不出起点，
+    #   而根因就在第一处分叉。远端排查「引擎比牌谱多打 25 张」时缺的就是这个。
+    if rep.mismatches:
+        rep.mismatches.sort(key=lambda m: m.step)
+        first = rep.mismatches[0]
+        rep.first_desync = first
+        lo = max(0, first.step - 4)
+        rep.desync_trace = [
+            ("  ▶ " if i + 1 == first.step else "    ")
+            + f"{i + 1:>3}. {a['kind']:<8}"
+            + f" P{a.get('player', a.get('winner', '?'))}"
+            + f" {S.tile_cn(a['tile']) if isinstance(a.get('tile'), int) else ''}"
+            for i, a in enumerate(trace[lo: first.step + 2], start=lo)
+        ]
 
     hora = mjai.hora_of(kyoku)
     if hora is None:
         if res.kind not in ("draw", "kyuushu", "abort"):
             rep.ok = False
             rep.notes.append(f"牌谱是流局，引擎判成 {res.kind}")
+            return rep
+        # 流局也要逐项比 —— 不检的话「听牌判定 / 不聴罰符」这类错永远抓不到
+        ryu = mjai.ryukyoku_of(kyoku)
+        if ryu is not None:
+            if ryu.get("tenpai") is not None and res.tenpai is not None:
+                want = [bool(x) for x in ryu["tenpai"]]
+                got = [bool(x) for x in res.tenpai]
+                if want != got:
+                    rep.ok = False
+                    rep.notes.append(f"听牌判定不符：牌谱 {want}，引擎 {got}")
+            if ryu.get("deltas"):
+                want_d = [int(x) for x in ryu["deltas"]]
+                got_d = [int(x) for x in res.deltas]
+                if want_d != got_d:
+                    rep.ok = False
+                    rep.notes.append(f"流局收支不符：牌谱 {want_d}，引擎 {got_d}")
         return rep
 
     # ── 和牌：比对谁和、和哪张、番符、点数 ──
@@ -391,7 +467,9 @@ def selftest(n_games: int = 5, players: int = 3) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="牌谱对拍（真实牌谱喂回引擎，比结果）")
-    ap.add_argument("path", nargs="?", help="MJAI 牌谱文件或目录")
+    ap.add_argument("path", nargs="?",
+                    help="MJAI 牌谱文件或目录。**一个文件可以放任意多局** —— "
+                         "按事件流里的 start_kyoku 自动切分，不需要一局一个文件")
     ap.add_argument("--players", type=int, default=3, choices=[3, 4])
     ap.add_argument("--limit", type=int, default=None, help="最多对拍几局")
     ap.add_argument("--selftest", action="store_true", help="自检：自己导出再自己对拍")
@@ -408,14 +486,37 @@ def main(argv: list[str] | None = None) -> None:
         print(f"没找到牌谱：{args.path}")
         return
     reports: list[KyokuReport] = []
+    total_found = 0
     for f in files:
-        reports.extend(check_file(f, n=args.players, limit=args.limit))
-        _summary(reports, f"{f.name}（累计）")
+        events = mjai.read(f)
+        ks = list(mjai.iter_kyoku(events))
+        total_found += len(ks)
+        take = len(ks) if not args.limit else min(args.limit, len(ks))
+        # ★ 必须把「切出几局」和「比了几局」都打出来 —— 不然「8/8 一致」会被
+        #   误读成「全部都对」，而实际上可能只切出了 8 局（踩过这个坑）
+        print(f"  {f.name}：{len(events)} 条事件 → 切出 {len(ks)} 局，本次对拍 {take} 局")
+        if len(ks) == 0 and len(events) > 0:
+            print("    ⚠️ 一条都没切出来 —— 检查牌谱里有没有 start_kyoku 事件")
+        for ky in ks[:take]:
+            reports.append(check_kyoku(ky, n=args.players))
+    print()
+    print(f"  合计：切出 {total_found} 局，本次对拍 {len(reports)} 局")
+    _summary(reports, "对拍结果（累计）")
     bad = [r for r in reports if not r.ok]
     if bad:
-        print("\n不一致的局（前 10）：")
+        print(f"\n不一致的局（共 {len(bad)}，列前 10）：")
         for r in bad[:10]:
             print("  ", r.line())
+        # ★ 第一次失步的上下文 —— 根因就在第一处分叉，不在累计的第 64 处
+        with_desync = [r for r in bad if r.first_desync][:3]
+        if with_desync:
+            print("\n第一次失步的位置（前 3 局）—— 根因在这一手，不在累计数量里：")
+            for r in with_desync:
+                print(f"  第 {r.hand_no} 局：{r.first_desync}")
+                if r.desync_trace:
+                    print("     引擎在那前后的动作：")
+                    for line in r.desync_trace:
+                        print("    " + line)
 
 
 if __name__ == "__main__":

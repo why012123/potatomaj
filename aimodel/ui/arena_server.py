@@ -249,8 +249,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
 
+def _startup_audit() -> None:
+    """启动自检：权重加载不了要**在启动时**就喊出来，别等玩家点了才发现。"""
+    try:
+        from ..variants import audit_weights
+
+        r = audit_weights(verbose=True)
+        if r["failed"]:
+            print("⚠️ 有模型加载失败 —— 这些模型在界面上会点不动，先修权重再开服务")
+    except Exception as e:                          # noqa: BLE001
+        print(f"（权重自检跳过：{type(e).__name__}: {e}）")
+
+
 def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
           copies: int = 3, divisor: float = 500.0) -> None:
+    _startup_audit()
     session = Session(players=players, copies=copies, divisor=divisor)
     Handler.session = session
     httpd = ThreadingHTTPServer((host, port), Handler)

@@ -222,6 +222,94 @@ rsync -av 服务器:~/potatomaj/aimodel/weights/*.npz ./aimodel/weights/
 | 16 核 / 32 GB | `--jobs 6`，`--hands 12000`，`--iters 30` |
 | 32 核 / 128 GB | `--jobs 8`（**别再往上加**：8 个模型就是 8 个任务，多了没意义），把 `--hands` 提到 20000 |
 
+### ⚠️ Windows / PowerShell 上的坑（都是实测踩出来的）
+
+**① 命令行传列表参数必须用 `=` 或引号** ✗
+
+```powershell
+python -m aimodel.train bc --hidden 512,512     # ❌ PowerShell 当数组 → python 收到 "512 512"
+python -m aimodel.train bc --hidden=512,512     # ✅
+python -m aimodel.train bc --hidden "512,512"   # ✅
+python -m aimodel.train bc --hidden 512-512     # ❌ 被当成 hashtable 字面量
+```
+
+**② `Start-Process` 不能把 stdout 和 stderr 重定向到同一个文件** ✗
+（PowerShell 5.1 直接报错）→ 用两个不同文件 ✓
+
+**③ 用 `cmd /c start /b ... 2> log` 脱离会话会失败** ✗
+`cmd` 会在 `2>` 的 `|` 上分词 → python 根本没启动 ✓
+改成 `2>&1` 又会被 `Start-Process` 吞掉嵌套引号 ✗
+
+**④ 停 selfplay 时别按 `*selfplay*` 匹配进程** ✗✗
+
+multiprocessing 的子进程命令行是
+`from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=...)`
+—— **里面没有 "selfplay" 这个词** ✗ 按名字匹配一个都杀不到 ✓
+父进程死后这些子进程会被重挂，**继续吃内存、甚至把你删掉的目录重新写出来** ✗
+
+```powershell
+# 正确做法
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -like '*multiprocessing-fork*' -or
+                 $_.CommandLine -like '*multiprocessing.spawn*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+实测：杀掉 9 个孤儿后可用内存从 **6.8 GB 回到 21.9 GB** ✓
+
+**⑤ 不要同时开多份重活** ✗
+
+实测：selfplay 两批 + 一个训练基准同时跑 → **一批卡死 1 小时、0 个 shard 写出**
+（正常单批 13 分钟）、留下 **17 个僵尸进程** ✓
+**并行纪律：最多 2 个重活进程** ✓
+
+### ⚠️ 并行数和 `--matches` 要一起看 —— 产数据的内存**随 matches 线性增长**
+
+| 场景 | 单进程实测 | 上限（**内存硬上限 16 GB**） |
+|---|---|---|
+| **训练**（577k 参数 + 约 96 万条样本 + 优化器） | 约 **5 GB** | **最多 2 个** ✓（3 个贴线 ⚠️，4 个超限 ✗） |
+| **selfplay worker** | 约 **1.8 GB** | **≤ 8 worker**（8×1.8 ≈ 14 GB）✓ |
+| selfplay（大批量） | **≈ workers × matches × 3 MB** | 见下 |
+
+> **16 GB 是用户指定的硬上限**（不是机器的 32 GB）—— 机器上还有网页平台等服务在跑 ✓
+
+**踩过两次，方向相反，都值得记**：
+
+1. **第一次**：把训练的 5GB 套到数据生成上，把并行卡在 4，白白浪费很多轮 ✗
+   —— 训练和数据生成不是一回事。
+2. **第二次**：看到「启动时才 186MB/worker」就以为 16 workers 随便开 ✗
+   —— **186MB 是刚启动的读数，不是稳态** ✗
+   `selfplay.py` 会把每个 worker 的**全部对局缓存在内存里、最后才写 shard**
+   （所以磁盘上一直 0 个文件）→ **内存随 `--matches` 线性增长** ✓
+   实测：`16 workers × 2500 matches` **把可用内存打到 0.6 GB**（16×7.5GB≈120GB，远超 32GB）✗
+
+**安全做法**：
+
+```bash
+# ① 限制每 worker 的 matches（16 workers 时 ≤ 200）
+python -m aimodel.selfplay --matches 200 --workers 16 --out data/batch01
+
+# ② 或者分批多次调用，每次一个新目录（推荐 —— 每批内存都在 10GB 以内）
+for i in $(seq -w 1 42); do
+  python -m aimodel.selfplay --matches 200 --workers 16 --out data/batch$i
+done
+```
+
+**不要靠加 worker 提速** ✗ —— 那样只会更快撞内存墙 ✓
+（实测 4→16 workers 只快 1.5 倍，瓶颈本来就不在核上）
+
+**但要注意收益递减**（实测）：
+
+| workers | 吞吐 |
+|---|---|
+| 4 | 70,270 局/小时 |
+| 6 | 97,048 局/小时 |
+| **16** | **105,577 局/小时** |
+
+**4 → 16 只提升 1.5 倍，不是 4 倍** ✗ 瓶颈不在 CPU 核数（机器 24 核），
+而在**每个 worker 各自落盘/序列化 shard**。
+所以要真提速得改 **shard 写入方式（批量缓冲）**，而不是继续加核。
+
 **注意**：只有 8 个模型，所以并行数超过 8 是浪费。想再快只能加每轮的
 `--matches`（自对弈场数）或者缩短 `--hands`。
 

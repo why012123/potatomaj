@@ -103,6 +103,39 @@ def test_wall_reconstruction():
 # ---------------------------------------------------------------------------
 # ③ 数据抽取
 # ---------------------------------------------------------------------------
+def test_iter_kyoku_without_end():
+    """真实牌谱导出器不一定给 ``end_kyoku`` —— 只认它会把多局并成一局。
+
+    实测踩过：天鳳牌谱转 MJAI 的导出器不给 ``end_kyoku``，
+    497 局里只切出 8 局，对拍报「8/8 一致」但实际上 98% 的局根本没比。
+    """
+    ev = [{"type": "start_game", "names": ["A", "B", "C", "D"], "aka_flag": True}]
+    for h in range(1, 6):
+        ev.append({"type": "start_kyoku", "bakaze": "E", "kyoku": h, "honba": 0,
+                   "kyotaku": 0, "oya": 0, "scores": [25000] * 4,
+                   "tehais": [["1m"] * 13] * 4})
+        ev.append({"type": "tsumo", "actor": 0, "pai": "1m"})
+        ev.append({"type": "dahai", "actor": 0, "pai": "1m", "tsumogiri": True})
+        ev.append({"type": "hora", "actor": 0, "pai": "1m", "hora_tsumo": True})
+        if h == 1:
+            ev.append({"type": "end_kyoku"})      # 只有第一局有
+    ev.append({"type": "end_game"})
+    ks = list(mjai.iter_kyoku(ev))
+    assert len(ks) == 5, f"5 局（只有 1 局带 end_kyoku）只切出 {len(ks)} 局"
+    # 正常带 end_kyoku 的情况也不能坏
+    for e in ev:
+        pass
+    ev2 = []
+    for h in range(1, 4):
+        ev2.append({"type": "start_kyoku", "bakaze": "E", "kyoku": h, "honba": 0,
+                    "kyotaku": 0, "oya": 0, "scores": [25000] * 4,
+                    "tehais": [["1m"] * 13] * 4})
+        ev2.append({"type": "ryukyoku", "tenpai": [True, False], "deltas": [1000, -1000]})
+        ev2.append({"type": "end_kyoku"})
+    assert len(list(mjai.iter_kyoku(ev2))) == 3
+    print("  ✅ 没有 end_kyoku 也能正确按局切开（两端都不漏）")
+
+
 def test_extract_shapes():
     n = 3
     samples = LD.Samples()
@@ -138,6 +171,7 @@ def main() -> None:
     print("【牌谱管线】")
     test_tile_names()
     test_wall_reconstruction()
+    test_iter_kyoku_without_end()
     test_replay_roundtrip_3p()
     test_replay_roundtrip_4p()
     test_extract_shapes()
