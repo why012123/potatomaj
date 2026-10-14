@@ -30,6 +30,7 @@ TESTS = [
     "test_encode.py",       # 特征编码：全局特征 / 动作特征 / 掩码
     "test_net.py",          # 神经网络：数值梯度、掩码、存档、PPO 截断
     "test_logs.py",         # 牌谱管线：MJAI 读写 / 重放对拍 / 数据抽取
+    "test_danger_model.py", # 危险度模型接入：布局一致性 / 人数维度守卫 / 退回手写路径
 ]
 
 
