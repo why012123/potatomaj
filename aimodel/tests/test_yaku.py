@@ -204,6 +204,36 @@ check(a6 is not None and "yakuhai_seat" in keys(a6), "四麻北家的北刻子�
 print(f"  ✅ 北：三麻{'无役' if a5 is None else a5.describe()} / 四麻北家 {a6.describe()}")
 
 print()
+
+# 5) 高点法：同一张和牌张有**多种听形解释**时必须取最高分
+#
+#    远端用 4 万局天鳳牌谱对拍时抓出来的真 bug：老代码取**第一个**含和牌张的
+#    顺子就返回听形，于是 `123s`（start=0、offset=2）被判成「边张」✗ ——
+#    可同一张 3s 也能补 `345s` → 是「两面」✓ 结果平和被丢掉、符数多算 2 符，
+#    荣和时甚至**直接拒和**（实测能实战打穿）。
+print()
+print("== 高点法：多种听形解释取最高分 ==")
+_h = "1m2m3m4m5m6m1s2s3s3s4s5s9s9s"      # 3s 既补 123s 也补 345s
+_a_t = ev(_h, "3s", tsumo=True)
+check(_a_t is not None and "pinfu" in keys(_a_t),
+      f"自摸应当是「门前清自摸和 + 平和」，实际 {_a_t.describe() if _a_t else '拒和'}")
+check(_a_t is not None and _a_t.fu == 20,
+      f"平和自摸应当 20 符，实际 {_a_t.fu if _a_t else '拒和'}")
+_a_r = ev(_h, "3s", tsumo=False)
+check(_a_r is not None, "荣和**不能拒和** —— 最严重的表现（能实战打穿）")
+check(_a_r is not None and "pinfu" in keys(_a_r), "荣和应当有平和")
+if _a_t and _a_r:
+    print(f"  ✅ 自摸 {_a_t.describe()} / 荣和 {_a_r.describe()}")
+# 反向断言：听形候选必须**多于一个**，只有一个就说明又退回「取第一个」了
+from aimodel.sanma import _decompose, wait_types
+_cands: set = set()
+for _sm, _pr in _decompose(list(S.parse_hand(_h)), 4, 1):
+    if _pr is not None and len(_sm) == 4:
+        _cands.update(wait_types(_sm, _pr, S.parse_hand("3s").index(1)))
+check(len(_cands) > 1, f"这副牌应当有多个听形解释，实际只有 {_cands}")
+check("ryanmen" in _cands, f"应当包含两面，实际 {_cands}")
+print(f"  ✅ 听形候选 = {sorted(_cands)}")
+
 if FAILED:
     print(f"❌ {len(FAILED)} 项失败：")
     for f in FAILED[:20]:

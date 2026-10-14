@@ -600,25 +600,46 @@ def _score_kokushi(counts: Sequence[int], ctx: WinContext) -> list[Agari]:
     return [Agari(0, 0, [(name, mult)], 0, mult, {})]
 
 
-def _wait_type(shape_melds: list[MeldShape], pair: int, win: int) -> str:
-    """听牌形：``ryanmen`` / ``kanchan`` / ``penchan`` / ``shanpon`` / ``tanki``。"""
+def wait_types(shape_melds: list[MeldShape], pair: int, win: int) -> list[str]:
+    """和牌张在这副牌里的**全部**听形解释（高点法要用）。
+
+    ⚠️ 这里的「全部」是关键 —— 老代码取**第一个**含和牌张的顺子就返回，
+    于是 `1m2m3m4m5m6m1s2s3s3s4s5s9s9s` 和 3s 这种牌：
+    先撞上顺子 `123s`（start=0、offset=2）→ 判成**边张** ✗
+    可同一张 3s 也能补 `345s` → 是**两面** ✓ 结果平和被丢掉、
+    符数多算 2 符，荣和时甚至会**直接拒和**（实测复现）。
+
+    返回去重后的候选，至少一个。调用方应**逐个算分取最高**（高点法）。
+    """
+    cands: list[str] = []
     if pair == win and not any(k == "tri" and t == win for k, t in shape_melds):
-        return "tanki"
+        cands.append("tanki")
     for kind, t in shape_melds:
         if kind != "seq" or t // 9 != win // 9:
             continue
         start = t % 9
         offset = (win % 9) - start
         if offset == 1:
-            return "kanchan"
-        if offset == 0:
-            return "ryanmen" if start <= 5 else "penchan"  # 89 等 7
-        if offset == 2:
-            return "ryanmen" if start >= 1 else "penchan"  # 12 等 3
+            cands.append("kanchan")
+        elif offset == 0:
+            cands.append("ryanmen" if start <= 5 else "penchan")   # 89 等 7
+        elif offset == 2:
+            cands.append("ryanmen" if start >= 1 else "penchan")   # 12 等 3
     for kind, t in shape_melds:
         if kind == "tri" and t == win:
-            return "shanpon"
-    return "tanki"
+            cands.append("shanpon")
+    if not cands:
+        cands.append("tanki")
+    return list(dict.fromkeys(cands))
+
+
+def _wait_type(shape_melds: list[MeldShape], pair: int, win: int) -> str:
+    """单个听形（保留给不需要高点法的调用方）。多种解释时**优先两面**。"""
+    cands = wait_types(shape_melds, pair, win)
+    for prefer in ("ryanmen", "kanchan", "penchan", "shanpon", "tanki"):
+        if prefer in cands:
+            return prefer
+    return cands[0]
 
 
 def _meld_has_yaochu(kind: str, tile: int) -> bool:
@@ -636,6 +657,30 @@ def _score_normal(
     wind_yakuhai: set[int],
     ctx: WinContext,
 ) -> list[Agari]:
+    """按**高点法**返回所有听形解释下的结果 —— 调用方取最高分。
+
+    同一副牌 + 同一张和牌，听形可能有多种解释（两面 / 边张 / 嵌张 / 双碰 / 单骑），
+    各自的役和符不同，规则上取**得点最高**的那种。
+    """
+    out: list[Agari] = []
+    for wt in wait_types(shape_melds, pair, ctx.win_tile):
+        out.extend(
+            _score_normal_one(counts, melds, shape_melds, pair, menzen,
+                              wind_yakuhai, ctx, wt)
+        )
+    return out
+
+
+def _score_normal_one(
+    counts: Sequence[int],
+    melds: Sequence[Meld],
+    shape_melds: list[MeldShape],
+    pair: int,
+    menzen: bool,
+    wind_yakuhai: set[int],
+    ctx: WinContext,
+    wait_type: str,
+) -> list[Agari]:
     win = ctx.win_tile
     shapes: list[MeldShape] = list(shape_melds) + [
         ("seq", m.tile) if m.is_chi else ("tri", m.tile) for m in melds
@@ -647,7 +692,6 @@ def _score_normal(
     if not ctx.is_tsumo and any(k == "tri" and t == win for k, t in shape_melds):
         concealed_tri -= 1
 
-    wait_type = _wait_type(shape_melds, pair, win)
     seqs = [t for k, t in shape_melds if k == "seq"]
     n_seq = len(seqs)
     n_tri = len(shapes) - n_seq
