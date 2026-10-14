@@ -42,3 +42,7 @@ run-electron.sh
 ._*
 *.log
 *.swp
+
+# 识图那套已被协议解码替代，这些是它的遗留物（本地保留）
+tools/evaluate.py
+samples/
