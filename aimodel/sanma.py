@@ -302,6 +302,9 @@ class Meld:
     tile: int  # 牌型下标（吃的时候是顺子里最小的那张）
     from_player: int = -1  # 副露来源座位；-1 表示自己（暗杠 / 加杠）
     aka: int = 0  # 这组副露里含几张赤 5
+    #: 吃的时候「被吃的那张」（来自哪张打牌）。顺子最小的那张在 ``tile``，
+    #: 但被吃的不一定是它 —— 导出 MJAI 时 ``pai`` 要的是**被吃的这张**。
+    called: int = -1
 
     @property
     def is_kan(self) -> bool:

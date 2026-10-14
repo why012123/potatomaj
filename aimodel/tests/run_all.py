@@ -22,6 +22,7 @@ TESTS = [
     "test_engine.py",       # 对局引擎：守恒、规则、状态机
     "test_encode.py",       # 特征编码：全局特征 / 动作特征 / 掩码
     "test_net.py",          # 神经网络：数值梯度、掩码、存档、PPO 截断
+    "test_logs.py",         # 牌谱管线：MJAI 读写 / 重放对拍 / 数据抽取
 ]
 
 

@@ -115,6 +115,28 @@ bash aimodel/ui/java/build.sh && bash aimodel/ui/java/run.sh
 只依赖 numpy。在别的机器上训练见 [aimodel/README.md](aimodel/README.md) 的
 「在别的机器（服务器）上训练」一节。
 
+### 真实牌谱：对拍与数据抽取
+
+有一套现成的管线，把 **MJAI 格式**（麻将 AI 的通用牌谱格式，Mortal、akochan
+都用它）的牌谱喂回引擎：
+
+```bash
+# ① 对拍：把整局喂回引擎，比和牌者 / 和牌张 / 番数 / 符数 / 役种 / 点数收支
+python -m aimodel.logcheck game.json
+python -m aimodel.logcheck logs/ --limit 500
+python -m aimodel.logcheck --selftest          # 自检：自己导出再自己对拍
+
+# ② 抽训练数据：(可见局面 → 动作) 用于行为克隆，(局面 + 打出的牌 → 是否放铳) 用于危险度
+python -m aimodel.logdata logs/ --out human.npz
+```
+
+**对拍是抓规则 bug 最狠的手段** —— 牌谱写的是 5 番 8000 点、引擎算出来 8 番
+12000 点，这种事写用例想不到，拿真实对局一跑就露馅。
+
+自检（导出 → 还原牌山 → 重放 → 比对）目前在**三麻四麻各 20 场、共 108 局**
+上逐项一致，`test_logs.py` 把它钉住了。等拿到真实牌谱（天凤 / 雀魂 / 自己录的），
+这条链路直接能用。
+
 ---
 
 ## 六、目录结构
@@ -132,6 +154,9 @@ aimodel/                  AI 主体
 ├── rewards.py            四种得分条件
 ├── variants.py           模型注册表（多版本）
 ├── arena.py              ELO 混战池
+├── mjai.py               牌谱格式读写（MJAI）
+├── logcheck.py           牌谱对拍：重放真实牌谱、比对规则
+├── logdata.py            从牌谱抽训练数据
 ├── evaluate.py           对战评测
 ├── progress.py           训练巡检
 ├── ab.py                 两个模型配对对战
@@ -163,6 +188,7 @@ for t in tests/*.py; do .venv/bin/python "$t"; done
 * `test_4p.py` —— 四麻的 136 张守恒、吃、北家自风、三色同顺、点数分摊
 * `test_engine.py` —— 引擎状态机、牌数守恒、流局/振听/多家和牌
 * `test_net.py` —— 数值梯度校验、掩码、存档、PPO 截断
+* `test_logs.py` —— 牌谱管线：导出 → 还原牌山 → 重放 → 逐项比对（三麻四麻都测）
 
 ---
 

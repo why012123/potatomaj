@@ -308,6 +308,10 @@ class Game:
         self.dealer = dealer
         self.max_hands = max_hands
         self.on_event = on_event
+        #: 结构化动作钩子（导出牌谱 / 回放 / 对拍用；见 :meth:`_act`）
+        self.on_action: Callable[[dict], None] | None = None
+        #: 灌入的牌山。设了它 :meth:`play_hand` 就会用这副牌，而不是随机发。
+        self.rigged_wall: list[tuple[int, int]] | None = None
         #: 局间回调（打完一局、开下一局之前调用；可以阻塞等玩家确认）
         self.on_between = on_between
         self.hands: list[HandResult] = []
@@ -321,8 +325,21 @@ class Game:
         if self.on_event is not None:
             self.on_event(msg)
 
+    def _act(self, kind: str, **kw) -> None:
+        """**结构化**动作钩子（和 ``on_event`` 的文本日志并行）。
+
+        文本日志是给人看的，这个是给程序用的：导出牌谱（MJAI 格式）、
+        逐手回放、以及「把真实牌谱喂回引擎对拍」都要靠它。
+
+        事件种类：``start_hand`` / ``draw`` / ``discard`` / ``riichi`` /
+        ``call``（吃碰杠）/ ``kita`` / ``win`` / ``ryukyoku``
+        """
+        if self.on_action is not None:
+            self.on_action({"kind": kind, **kw})
+
     def _mark_agari(self, winner: int, tile: int, loser: int | None = None) -> None:
         """记下「谁和了、和的哪张、谁放铳」——回放要拿这个把铳牌标红。"""
+        self._act("win", winner=winner, tile=tile, loser=loser, tsumo=loser is None)
         self.last_agari = {
             "winner": winner,
             "loser": loser,
@@ -418,6 +435,7 @@ class Game:
                     f"  [{self._seat_name(p)}] {'岭上' if rinshan else '摸'} "
                     f"{S.tile_cn(tile)}（剩 {self.wall_left()}）"
                 )
+                self._act("draw", player=p, tile=tile, red=red, rinshan=rinshan)
 
                 if self._is_winning(pl):
                     res = self._offer_tsumo(p, turn, rinshan=rinshan)
@@ -455,7 +473,10 @@ class Game:
 
                 # 暗杠 / 加杠
                 kan_tile = self._kan_options(pl)
-                if kan_tile is not None and self._ask_choice(p, "kan", ["pass", "kan"]) == 1:
+                if (
+                    kan_tile is not None
+                    and self._ask_choice(p, "kan", ["pass", "kan"], tile=kan_tile) == 1
+                ):
                     was_kakan = any(m.kind == "pon" and m.tile == kan_tile for m in pl.melds)
                     self._do_kan(p, kan_tile)
                     self.any_call = True
@@ -505,7 +526,12 @@ class Game:
     def _setup(self, dealer: int) -> None:
         # 先清掉上一局的铳牌标记，否则新一局第一帧会挂着上一局的「荣和」
         self.last_agari = None
-        wall = build_wall(self.rng, self.rule)
+        #: 灌入的牌山（对拍真实牌谱用）。给了就用它，不给就按 seed 随机发。
+        #: 顺序：前 ``hand_size × n`` 张按座位依次发牌（P0 的 13 张、P1 的、P2 的），
+        #: 之后是牌山摸牌顺序，最后 ``rule.dead_wall`` 张是王牌。
+        wall = (
+            list(self.rigged_wall) if self.rigged_wall else build_wall(self.rng, self.rule)
+        )
         self.players = [Player(seat=i) for i in range(self.n)]
         dead = self.rule.dead_wall
         self.live = wall[: len(wall) - dead]
@@ -528,6 +554,17 @@ class Game:
         self._log(
             f"── 第 {len(self.hands) + 1} 局  亲家 {self._seat_name(dealer)}"
             f"  宝牌指示 {S.tile_cn(self._indicator(0))}"
+        )
+        self._act(
+            "start_hand",
+            hand_no=len(self.hands) + 1,
+            dealer=dealer,
+            round_wind=self.round_wind,
+            dora=[self._indicator(k) for k in range(self.dora_slots)],
+            hands=[list(pl.hand) for pl in self.players],
+            reds=[list(pl.red) for pl in self.players],
+            scores=list(self.scores),
+            sticks=self.sticks,
         )
 
     def _draw(self) -> tuple[int, int]:
@@ -643,6 +680,7 @@ class Game:
         for q in self.players:
             q.ippatsu = False
         self._log(f"  [{self._seat_name(p)}] 拔北（累计 {pl.kita}）")
+        self._act("kita", player=p)
 
     def _do_kan(self, p: int, tile: int) -> None:
         pl = self.players[p]
@@ -655,6 +693,8 @@ class Game:
                 pl.hand[tile] -= 1
                 pl.melds[i] = S.Meld("kakan", tile, m.from_player, aka)
                 self._log(f"  [{self._seat_name(p)}] 加杠 {S.tile_cn(tile)}")
+                self._act("call", player=p, call="kakan", tile=tile,
+                          from_player=p, consumed=[tile, tile, tile])
                 break
         else:
             pl.hand[tile] -= 4
@@ -664,6 +704,8 @@ class Game:
                 aka += 1
             pl.melds.append(S.Meld("ankan", tile, -1, aka))
             self._log(f"  [{self._seat_name(p)}] 暗杠 {S.tile_cn(tile)}")
+            self._act("call", player=p, call="ankan", tile=tile,
+                      from_player=p, consumed=[tile] * 4)
         for q in self.players:
             q.ippatsu = False
         if self.dora_slots < self.rule.dora_slots:
@@ -679,6 +721,7 @@ class Game:
         self.sticks += 1
         self.stats[p].riichi += 1
         self._log(f"  [{self._seat_name(p)}] 立直！{'（两立直）' if pl.double_riichi else ''}")
+        self._act("riichi", player=p, double=pl.double_riichi)
 
     def _choose_discard(self, p: int, force_tsumogiri: bool | None = None) -> int:
         pl = self.players[p]
@@ -707,6 +750,8 @@ class Game:
         if pl.riichi and pl.ippatsu and len(pl.discards) > pl.riichi_discards + 1:
             pl.ippatsu = False
         self._log(f"  [{self._seat_name(p)}] 打 {S.tile_cn(tile)}")
+        self._act("discard", player=p, tile=tile, tsumogiri=(pl.drawn is None),
+                  riichi=pl.riichi)
 
     def _after_discard(
         self, p: int, tile: int, turn: int, from_kita: bool = False
@@ -813,10 +858,12 @@ class Game:
         pl.hand[b] -= 1
         start = min(tile, a, b)
         self._take_from_pond(from_p, tile)
-        pl.melds.append(S.Meld("chi", start, from_p))
+        pl.melds.append(S.Meld("chi", start, from_p, called=tile))
         pl.kuikae_tile = tile
         self._log(f"  [{self._seat_name(p)}] 吃 {S.tile_cn(start)}"
                   f"{S.tile_cn(start + 1)}{S.tile_cn(start + 2)}")
+        self._act("call", player=p, call="chi", tile=start, called=tile,
+                  from_player=from_p, consumed=[a, b])
 
     def _take_from_pond(self, p: int, tile: int) -> None:
         """被碰/杠走的牌从牌河里拿掉（但打牌历史保留，振听照算）。"""
@@ -837,6 +884,8 @@ class Game:
         pl.melds.append(S.Meld("pon", tile, from_p, aka))
         pl.kuikae_tile = tile  # 喰い替え禁止：下一张不能打同种牌
         self._log(f"  [{self._seat_name(p)}] 碰 {S.tile_cn(tile)}")
+        self._act("call", player=p, call="pon", tile=tile, from_player=from_p,
+                  consumed=[tile, tile])
 
     def _do_minkan(self, p: int, tile: int, from_p: int) -> None:
         pl = self.players[p]
@@ -850,6 +899,8 @@ class Game:
         if self.dora_slots < self.rule.dora_slots:
             self.dora_slots += 1
         self._log(f"  [{self._seat_name(p)}] 明杠 {S.tile_cn(tile)}")
+        self._act("call", player=p, call="kan", tile=tile, from_player=from_p,
+                  consumed=[tile, tile, tile])
 
     def _chankan_check(self, tile: int, from_p: int, turn: int) -> HandResult | None:
         """抢杠：加杠的那张牌被别人荣和。"""
@@ -1017,6 +1068,7 @@ class Game:
         for p in range(self.n):
             self.stats[p].draws += 1
         self._log(f"  🌊 流局（听牌 {''.join('T' if t else '-' for t in tenpai)}）")
+        self._act("ryukyoku", tenpai=list(tenpai), deltas=list(deltas))
         return HandResult(kind="draw", deltas=tuple(deltas), tenpai=tuple(tenpai), turns=turn)
 
     # -- 与 agent 的接口 -----------------------------------------------------
