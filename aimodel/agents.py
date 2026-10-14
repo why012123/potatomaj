@@ -21,6 +21,8 @@ from .encode import (
     ACTION_DIM,
     HEAD_SIZE,
     tile_danger,
+    danger_model_loaded,
+    danger_score,
     action_features,
     action_index,
     action_label,
@@ -200,7 +202,17 @@ class HeuristicAgent(Agent):
         ]
 
     def _danger(self, view: View, tile: int, opp_riichi: Sequence[int]) -> float:
-        """直接用 :func:`aimodel.encode.tile_danger` —— 教师和网络看同一份危险度。"""
+        """危险度：默认仍走手写 :func:`aimodel.encode.tile_danger`。
+
+        若用 ``--danger-model`` 载入了学出来的模型，且该模型**能安全地用**，
+        则改走 :func:`aimodel.encode.danger_score` —— 教师和网络始终看同一份
+        危险度，所以两条路不会各说各话。
+
+        ``danger_score`` 在「输入布局尚未验证一致」时会自己退回手写路径，
+        所以这里不需要再判断一次；保留手写路径本身就是为了 A/B。
+        """
+        if danger_model_loaded():
+            return danger_score(view, tile)
         return tile_danger(view, tile, opp_riichi)
 
     def _pressure(self, view: View, opp_riichi: Sequence[int]) -> float:

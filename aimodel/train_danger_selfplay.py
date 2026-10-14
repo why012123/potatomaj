@@ -60,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--epochs", type=int, default=300)
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--save", default="_data/danger_model.npz",
+                    help="where to write the trained model for --danger-model")
     args = ap.parse_args(argv)
 
     X, y = load_pool(args.pattern)
@@ -78,6 +80,10 @@ def main(argv: list[str] | None = None) -> int:
     n_tr, n_va = int(len(X) * 0.6), int(len(X) * 0.2)
     tr, va, te = perm[:n_tr], perm[n_tr:n_tr + n_va], perm[n_tr + n_va:]
     Xtr, Xva, Xte = standardise(X[tr], X[va], X[te])
+    # keep the training statistics so inference can reproduce the same scaling
+    Xtr_mu = X[tr].mean(axis=0, keepdims=True)
+    Xtr_sd = X[tr].std(axis=0, keepdims=True)
+    Xtr_sd[Xtr_sd < 1e-6] = 1.0
     ytr, yva, yte = y[tr], y[va], y[te]
     print(f"  split: train {len(tr):,} (pos {int(ytr.sum())})  "
           f"val {len(va):,} (pos {int(yva.sum())})  test {len(te):,} (pos {int(yte.sum())})")
@@ -112,6 +118,24 @@ def main(argv: list[str] | None = None) -> int:
           f"   (n={int((~nr).sum()):,}, pos={int(yte[~nr].sum())})")
     print()
     print("  logs baseline : overall 0.6996 | NO-RIICHI 0.6838 | WITH-RIICHI 0.5872")
+
+    # Persist for --danger-model. Store the standardisation alongside the weights
+    # so inference does not depend on the training data still being on disk.
+    out = args.save
+    np.savez_compressed(
+        out,
+        w=wvec.astype(np.float32),
+        b=np.float32(b),
+        mu=Xtr_mu.astype(np.float32),
+        sd=Xtr_sd.astype(np.float32),
+        players=np.int32(4),
+        dim=np.int32(X.shape[1]),
+        auc_overall=np.float32(auc(yte, st)),
+        auc_no_riichi=np.float32(auc(yte[nr], st[nr])),
+        val_auc=np.float32(val_auc),
+        selected_epoch=np.int32(best_ep),
+    )
+    print(f"  saved -> {out}")
     return 0
 
 
