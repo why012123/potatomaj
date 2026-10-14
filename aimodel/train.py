@@ -345,15 +345,24 @@ def train_rl(
     vf_coef: float = 0.5,
     verbose: bool = True,
     ent_coef_adapt: bool = False,
+    kl_coef: float = 0.0,
+    ref: Net | None = None,
 ) -> list[dict]:
     rng = np.random.default_rng(seed)
     data = dict(data)
     data["adv"] = compute_advantages(net, data)
+    # KL 锚定（P1-2）：先按这一批轨迹把参考策略的概率冻结下来。
+    # 参考就是**克隆阶段的权重**，所以 RL 不会被推着走远。
+    if kl_coef > 0.0 and ref is not None:
+        net.set_reference(ref, data, kl_coef=kl_coef)
+    elif kl_coef <= 0.0:
+        net.kl_coef = 0.0
     n = len(data["X"])
     hist = []
     for ep in range(epochs):
         idx = rng.permutation(n)
-        tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0}
+        tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+               "clip_frac": 0.0, "kl": 0.0}
         ent_by_kind: dict[str, float] = {}
         ent_n: dict[str, int] = {}
         nb = 0
@@ -597,7 +606,13 @@ def cmd_rl(args) -> Net:
     )
     print(f"  起始：{fmt_eval(best)}")
     best_delta = best["平均段位分"]
+    # KL 锚定的参考 = **进入 RL 之前**的那份权重（BC 克隆出来的牌效）。
+    ref_net = net.copy()
     snapshot = net.copy()
+    # 「新高才保存」原来只保护**文件**，不保护**内存里的权重**：
+    # 崩掉那一轮之后的训练数据是用崩掉的策略采的，会越跑越远。
+    # 所以同时留一份内存里的最优备份，跑完回滚回去。
+    best_net = net.copy()
     for it in range(1, args.iters + 1):
         t0 = time.perf_counter()
         data, st = collect_selfplay(
@@ -617,6 +632,8 @@ def cmd_rl(args) -> Net:
             batch_size=args.batch,
             seed=args.seed + it,
             ent_coef=max(0.002, 0.01 * (1 - it / (args.iters + 1))),
+            kl_coef=args.kl_coef,
+            ref=ref_net,
         )
         ev = quick_eval(
             net, n_matches=args.eval_matches, seed=args.seed + 777, spec=spec
@@ -630,10 +647,19 @@ def cmd_rl(args) -> Net:
         if ev["平均段位分"] > best_delta:
             best_delta = ev["平均段位分"]
             net.save(args.out)
-            print(f"    ↑ 新高，已保存 {args.out}")
+            # ★ 同时把最优权重**留一份在内存里**（P1-2）：
+            # 只存文件的话，后面训崩了内存里已经变坏，下一轮自对弈就是
+            # 用坏策略采的数据，等于自己把自己越推越远。
+            best_net = net.copy()
+            print(f"    ↑ 新高，已保存 {args.out}（内存里也留了一份最优）")
         if it % 5 == 0:
             snapshot = net.copy()
-    if not Path(args.out).exists():
+    # 跑完把最优那份**回滚进内存**，并且以它为准落盘
+    if best_net is not net:
+        net = best_net
+        net.save(args.out)
+        print(f"  ↩ 已回滚到最优权重（段位分 {best_delta:+.1f}）并保存 -> {args.out}")
+    elif not Path(args.out).exists():
         net.save(args.out)
     save_log(args, log)
     return net
@@ -692,6 +718,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--resume", action="store_true", help="从已有权重继续")
     ap.add_argument("--force", action="store_true",
                     help="目标权重已存在时允许直接覆盖（不加就改写成 <name>.new.npz）")
+    ap.add_argument("--kl-coef", type=float, default=0.1,
+                    help="KL 锚定强度（0 = 关）。把 RL 策略拉回克隆阶段的参考策略，"
+                         "防止把 BC 学的牌效训崩；太紧 RL 动不了，太松等于没锚")
     args = ap.parse_args(argv)
 
     if args.list_models:

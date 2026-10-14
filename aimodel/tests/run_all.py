@@ -23,6 +23,7 @@ TESTS = [
     "test_weight_guard.py", # 裸跑不许覆盖已训好的权重（P0-6 回归）
     "test_eval_resolution.py",  # 同牌山注入 / 置信区间 / 还要多少场（P1-4 回归）
     "test_exploration.py",  # 逐头熵 / 分头自适应 / 软标签 / tie-break（P1-1 回归）
+    "test_kl_anchor.py",    # KL 锚定 + 最优权重回滚进内存（P1-2 回归）
     "test_models.py",       # 八个模型 + 四种得分条件
     "test_fastshanten.py",  # 快速向听，与既有实现交叉验证
     "test_engine.py",       # 对局引擎：守恒、规则、状态机
