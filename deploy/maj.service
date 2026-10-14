@@ -1,0 +1,59 @@
+# 土豆麻将 · 网页对战平台 —— systemd 单元（放 VPS 上跑 frps + nginx 那一侧用）
+#
+# ⚠️ 先读这段话，别装错地方：
+#
+#   **真正的服务（python run.py）跑在本机 i9-14900HX 上**，因为它要跑 AI 推理。
+#   VPS 只有 2 核 / ~890MB，跑不动模型。VPS 上只需要 nginx + frps。
+#
+#   所以这个 unit 在 VPS 上是**给 frps 用的**（或者你在别的、够大的服务器上
+#   直接跑应用时用）。它做了三件部署要求里写死的事：
+#
+#     1. 开机自启        WantedBy=multi-user.target
+#     2. 崩溃重启        Restart=always + RestartSec
+#     3. 日志进文件轮转   StandardOutput=append:（配 logrotate），不是只打 stdout
+#
+# 安装（在 VPS 上，root）：
+#
+#     # 1) 装 frps（示例：把二进制放到 /opt/frps）
+#     mkdir -p /opt/frps && cp frps /opt/frps/ && chmod +x /opt/frps/frps
+#     cp deploy/frps.toml /opt/frps/frps.toml
+#     install -m 0644 deploy/maj.service /etc/systemd/system/maj.service
+#     systemctl daemon-reload && systemctl enable --now maj
+#     systemctl status maj --no-pager
+#
+#     # 2) 日志轮转（不然 frps 的日志会把 24GB 盘写满）
+#     install -m 0644 deploy/maj.logrotate /etc/logrotate.d/maj
+#
+# 如果你确实要在这台 VPS 上直接跑应用（不推荐），把 ExecStart 换成：
+#     ExecStart=/opt/maj/.venv/bin/python /opt/maj/run.py --host 127.0.0.1 --port 8790 --ai-workers 1 --ai-delay 1.5
+
+[Unit]
+Description=PotatoMaj relay (frps) for maj.xjtuwhy.com
+Documentation=https://github.com/why012123/potatomaj
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/frps
+ExecStart=/opt/frps/frps -c /opt/frps/frps.toml
+
+# 崩溃就重启（部署要求：进程挂了要自己回来）
+Restart=always
+RestartSec=3
+# 短时间内反复崩就别无限重启了，留给运维看
+StartLimitIntervalSec=120
+StartLimitBurst=8
+
+# 日志进文件（logrotate 管轮转）；也可以在 frps.toml 里用 log.to 让它自己写
+StandardOutput=append:/var/log/maj/frps.log
+StandardError=append:/var/log/maj/frps.err.log
+
+# 一点基本的收敛
+NoNewPrivileges=true
+PrivateTmp=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

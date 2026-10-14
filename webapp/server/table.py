@@ -276,6 +276,9 @@ class Room:
             # 原样抛给调用方，而不是留下一个「phase=playing 但引擎没跑」的死房间。
             self.recorder = self._open_recorder()
             seat_agents = self._build_agents()
+            log.info("房间 %s 开局：记录器=%s，座位=%s", self.id,
+                     "开" if self.recorder else "关",
+                     [type(a).__name__ for a in seat_agents])
             if len(seat_agents) != self.players:
                 raise RoomError(f"座位没配齐（{len(seat_agents)}/{self.players}），开不了桌")
             self._agents = seat_agents
@@ -555,6 +558,9 @@ class Room:
         """
         self._pending_hand_end = False
         rec = self.recorder
+        # 牌河赤 5 的记录交给记录器一份副本（Player 上没这个字段）
+        if rec is not None:
+            rec.pond_red = {i: list(row) for i, row in enumerate(self._pond_red)}
         if rec is None:
             return
         total = len(game.hands)

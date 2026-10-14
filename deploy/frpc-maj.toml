@@ -1,0 +1,43 @@
+# 土豆麻将 · 网页对战平台 —— frp 客户端配置
+#
+# 架构（为什么这么绕）：
+#
+#     玩家浏览器
+#        │  https://maj.xjtuwhy.com   (443, TLS 在 VPS 的 nginx 上终结)
+#        ▼
+#     VPS 47.82.118.193
+#        │  nginx 反代 -> 127.0.0.1:8080  (frps 的 vhostHTTPPort)
+#        ▼
+#     frps ──frp 隧道──▶ frpc（本机，就是本文件）
+#        │
+#        ▼
+#     127.0.0.1:8790  （python run.py，真正的服务在这里）
+#
+# 为什么不把服务直接放 VPS：那台机器只有 2 核 / ~890MB 内存，
+# 而 AI 推理要 CPU。本机 i9-14900HX / 32GB 跑服务 + AI 更合适。
+#
+# 用法：
+#     frpc.exe -c deploy\frpc-maj.toml
+# 或者用 deploy\maj.ps1 start（会连服务一起拉起来）
+
+serverAddr = "47.82.118.193"
+serverPort = 7000
+auth.token = "LJ7vWBzEQglH5Sa0UC3Yn4sw"
+
+# frps 临时重启时不要退出，一直重试
+loginFailExit = false
+
+# 保活：更快发现断线并自动重连
+transport.dialServerKeepAlive = 15
+transport.heartbeatInterval = 30
+transport.heartbeatTimeout = 90
+
+# 土豆麻将网页平台
+# customDomains 走的是 frps 的 vhostHTTPPort（VPS 上是 8080），
+# 由 nginx 按 Host 头转发进来；WebSocket 的 Upgrade 头会原样透传。
+[[proxies]]
+name = "maj-web"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 8790
+customDomains = ["maj.xjtuwhy.com"]

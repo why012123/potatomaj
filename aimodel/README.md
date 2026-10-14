@@ -316,6 +316,50 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 （正常单批 13 分钟）、留下 **17 个僵尸进程** ✓
 **并行纪律：最多 2 个重活进程** ✓
 
+**⑥ 脱离会话这件事，试了 5 种全部失败** ✗✗ → 所以不要靠脱离，要靠**切片**
+
+想在「15 秒~3.5 分钟杀长进程」的机器上跑完一轮训练，第一反应是让进程脱离会话。
+**实测 5 种写法都撑不过 10 分钟**：
+
+| 方式 | 结果 |
+|---|---|
+| `cmd /c start /b cmd /c "... 2> log"` | cmd 在 `2>` 的 `\|` 上分词，python 没启动 |
+| `Start-Process` 双流同文件 | PS 5.1 拒绝，python 启动前失败 |
+| Python `Popen` + `DETACHED_PROCESS\|CREATE_BREAKAWAY_FROM_JOB` | 跑到 **76 s** 后死 |
+| 计划任务 + `.bat` | 日志停在 **50 s**，`Last Result: 0` |
+| 计划任务 + `wscript.exe`（完全脱离） | **120 s** 后仍死 |
+
+计划任务那条尤其容易骗人：**任务本身报告成功退出（0）**，但
+`.venv\Scripts\python.exe` 是个 **launcher**，真正的解释器是它的**子进程**；
+任务结束时 Task Scheduler 会**整棵进程树拆掉**，子进程跟着死。`start /b` 也没逃出去。
+
+**结论：不要指望脱离。** 用 `aimodel/shortjob.py` 把工作切成 **≤10 秒**的片 +
+断点续跑 —— 那样**任何**杀进程窗口都杀不完整，被杀只丢一片。
+
+```bash
+python -m aimodel.shortjob plan   --model maj-normal4v1.3 --hands 15000
+python -m aimodel.shortjob run    --model maj-normal4v1.3 --hands 15000 --budget 600
+python -m aimodel.shortjob status --model maj-normal4v1.3
+python -m aimodel.shortjob merge  --model maj-normal4v1.3 --out _data/bc_tv13.npz
+```
+
+实测（maj-normal4v1.3 教师，四麻）：**100 手/片 = 8.6 秒**（生成 8.3 + 落盘 0.24），
+150 片 = 15,000 手，共约 21.5 分钟。硬杀后续跑实测
+**`made 0  skipped(already done) 4  of 4`** —— 零重复计算 ✓
+
+**⑦ `np.savez_compressed("x.tmp")` 会偷偷写成 `x.tmp.npz`** ✗
+
+它会在文件名不是 `.npz` 结尾时**自动追加 `.npz`**，于是
+「先写 `.tmp` 再 `os.replace`」的原子落盘**静默失效**
+（`os.replace` 找不到 `x.tmp` → `FileNotFoundError`）。**传文件句柄**：
+
+```python
+with open(tmp, "wb") as fh:
+    np.savez_compressed(fh, **data)
+os.replace(tmp, final)
+```
+
+
 ### ⚠️ 并行数和 `--matches` 要一起看 —— 产数据的内存**随 matches 线性增长**
 
 | 场景 | 单进程实测 | 上限（**内存硬上限 16 GB**） |

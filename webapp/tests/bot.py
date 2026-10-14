@@ -71,8 +71,13 @@ class Bot:
         return u.split("/ws")[0]
 
     async def login(self, name: str | None = None) -> str:
-        """走一次 ``/api/name`` 拿签名 cookie —— 和浏览器完全一样的身份流程。"""
-        body = json.dumps({"name": name or self.name}).encode()
+        """走一次 ``/api/name`` 拿签名 cookie —— 和浏览器完全一样的身份流程。
+
+        传了 ``self.uid`` 就带上，服务端会沿用这个匿名 ID。**这是「同一个人
+        跨连接还是同一个人」的关键**：验收 8（同一玩家打 10 局、记录按 ID
+        串起来）靠的就是它。
+        """
+        body = json.dumps({"name": name or self.name, "uid": self.uid or ""}).encode()
 
         def _do() -> tuple[dict, str]:
             req = urllib.request.Request(
@@ -91,6 +96,14 @@ class Bot:
         if data.get("uid"):
             self.uid = data["uid"]
         return self.name
+
+    async def reconnect_as(self, uid: str, name: str | None = None) -> None:
+        """换一条连接，但**还是同一个人**（沿用 uid / cookie）。"""
+        self.uid = uid
+        self.name = name or self.name
+        if not self.auth:
+            await self.login()
+        await self.open()
 
     # -- 连接 ---------------------------------------------------------------
     async def open(self, **kw) -> None:
