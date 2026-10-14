@@ -172,6 +172,59 @@ check(net2.dim == net.dim and net2.hidden == net.hidden, "结构参数应当一�
 check(net.n_params() == net2.n_params(), "参数量一致")
 print(f"  ✅ 存档往返一致（{net.n_params()} 参数）")
 
+print("\n== l2 必须一起存档并恢复（P0-4）==")
+# 老 bug：save() 的 _meta 里存了 dim/hidden/kinds/steps/lr/action_dim，**没有 l2**，
+# 于是 load() 用 cls(...) 时 l2 回落到构造默认值 1e-5。
+# 而训练 CLI 的 --l2 默认是 1e-4（比构造默认大 10 倍）
+# -> BC 存盘、RL 加载之后，权重衰减悄悄变了 10 倍。
+import argparse as _argparse  # noqa: E402
+import json as _json  # noqa: E402
+
+# 1) 训练 CLI 的默认 --l2 必须真的比构造默认大（否则这条 bug 不成立）
+from aimodel import train as _train  # noqa: E402
+
+_ap = _argparse.ArgumentParser()
+_ap.add_argument("--l2", type=float, default=None)
+# 直接读 CLI 里那个默认值：用 train.main 的解析器不方便，改为读源码常量
+import inspect as _inspect  # noqa: E402
+
+_src = _inspect.getsource(_train.main)
+_cli_l2 = float(_src.split('"--l2"')[1].split("default=")[1].split(",")[0])
+check(_cli_l2 > 1e-5,
+      f"训练 CLI 的 --l2 默认值应大于构造默认 1e-5，得到 {_cli_l2}"
+      "（若相等，P0-4 这条 bug 就不成立，测试要改）")
+
+with tempfile.TemporaryDirectory() as td:
+    path = Path(td) / "l2.npz"
+    big = Net(dim=DIM, hidden=(32, 32), seed=6, lr=3e-4, l2=_cli_l2)
+    big.save(path)
+    # 2) l2 必须真的写进 _meta
+    _data = np.load(path, allow_pickle=False)
+    _meta = _json.loads(bytes(_data["_meta"]).decode())
+    check("l2" in _meta, f"_meta 里必须有 l2，实际键：{sorted(_meta)}")
+    check(abs(float(_meta.get("l2", -1)) - _cli_l2) < 1e-12,
+          f"_meta['l2'] 应为 {_cli_l2}，得到 {_meta.get('l2')}")
+    # 3) load 之后 l2 与 lr 都要一致（这就是「RL 学习率掉 10 倍」那个症状）
+    back = Net.load(path)
+    check(abs(back.l2 - _cli_l2) < 1e-12,
+          f"load 后 l2 应恢复为 {_cli_l2}，得到 {back.l2}"
+          "（老 bug 会回落成构造默认 1e-5）")
+    check(abs(back.lr - 3e-4) < 1e-12, f"load 后 lr 应为 3e-4，得到 {back.lr}")
+    print(f"  ✅ l2 {_cli_l2} / lr 3e-4 存档往返一致")
+
+    # 4) 老权重（没有 l2 字段）必须能加载，且兜底成构造默认 1e-5 —— 不能报错
+    _data = dict(np.load(path, allow_pickle=False))
+    _meta.pop("l2")
+    _data["_meta"] = np.frombuffer(_json.dumps(_meta).encode(), dtype=np.uint8)
+    np.savez_compressed(path, **_data)
+    try:
+        old = Net.load(path)
+        check(abs(old.l2 - 1e-5) < 1e-12,
+              f"缺 l2 的老权重应兜底成 1e-5，得到 {old.l2}")
+        print("  ✅ 老权重（无 l2 字段）仍可加载，兜底 1e-5")
+    except Exception as e:  # noqa: BLE001
+        check(False, f"缺 l2 的老权重不该加载失败，却抛了 {type(e).__name__}: {e}")
+
 print("\n== PPO：优势为正应当抬高该动作的概率 ==")
 net = Net(dim=48, hidden=(16, 16), seed=2, lr=5e-3, l2=0.0)  # 关掉 L2，才能断言「完全不动」
 kind_pg = np.array(["discard"] * N)
