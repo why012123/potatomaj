@@ -222,15 +222,37 @@ rsync -av 服务器:~/potatomaj/aimodel/weights/*.npz ./aimodel/weights/
 | 16 核 / 32 GB | `--jobs 6`，`--hands 12000`，`--iters 30` |
 | 32 核 / 128 GB | `--jobs 8`（**别再往上加**：8 个模型就是 8 个任务，多了没意义），把 `--hands` 提到 20000 |
 
-### ⚠️ 并行数要分清「训练」和「产数据」—— 两者差 27 倍
+### ⚠️ 并行数和 `--matches` 要一起看 —— 产数据的内存**随 matches 线性增长**
 
-| 场景 | 单进程内存（**实测**） | 并行上限 |
+| 场景 | 内存 | 上限 |
 |---|---|---|
-| **训练**（克隆阶段样本常驻） | 四麻 15000 局时约 **5 GB** | 受内存限制，32GB 机器 `--jobs 4` |
-| **selfplay 产数据** | **~186 MB** | 16 个 worker 实测安全（峰值远低于 32GB） |
+| **训练**（克隆阶段样本常驻） | 四麻 15000 局时约 **5 GB/进程** | 32GB 机器 `--jobs 4` |
+| **selfplay 产数据** | **≈ workers × matches × 3 MB** | 见下 |
 
-**曾经把「5GB」套到数据生成上，把并行数卡在 4，白白浪费了很多轮** ✗
-产数据时该开 16 就开 16。
+**踩过两次，方向相反，都值得记**：
+
+1. **第一次**：把训练的 5GB 套到数据生成上，把并行卡在 4，白白浪费很多轮 ✗
+   —— 训练和数据生成不是一回事。
+2. **第二次**：看到「启动时才 186MB/worker」就以为 16 workers 随便开 ✗
+   —— **186MB 是刚启动的读数，不是稳态** ✗
+   `selfplay.py` 会把每个 worker 的**全部对局缓存在内存里、最后才写 shard**
+   （所以磁盘上一直 0 个文件）→ **内存随 `--matches` 线性增长** ✓
+   实测：`16 workers × 2500 matches` **把可用内存打到 0.6 GB**（16×7.5GB≈120GB，远超 32GB）✗
+
+**安全做法**：
+
+```bash
+# ① 限制每 worker 的 matches（16 workers 时 ≤ 200）
+python -m aimodel.selfplay --matches 200 --workers 16 --out data/batch01
+
+# ② 或者分批多次调用，每次一个新目录（推荐 —— 每批内存都在 10GB 以内）
+for i in $(seq -w 1 42); do
+  python -m aimodel.selfplay --matches 200 --workers 16 --out data/batch$i
+done
+```
+
+**不要靠加 worker 提速** ✗ —— 那样只会更快撞内存墙 ✓
+（实测 4→16 workers 只快 1.5 倍，瓶颈本来就不在核上）
 
 **但要注意收益递减**（实测）：
 
