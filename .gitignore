@@ -62,7 +62,4 @@ data/tenhou*.npz
 data/tenhou*/
 samples/*.json
 samples/*.mjai
-# mjlog.py --out 的默认落点（mjlog.py:850），是同一批天鳳牌谱的 dump
-aimodel/mjai_dump/
-mjai_dump/
 

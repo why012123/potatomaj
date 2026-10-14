@@ -251,6 +251,80 @@ def tile_danger(
     return min(max(d_riichi, d_open), 1.0)
 
 
+# ── 学出来的危险度（--danger-model）────────────────────────────────
+# 手写 `tile_danger` 的已知死穴：没人立直时基本不设防（只有「副露数/巡目」的
+# 粗基线）。用天鳳牌谱 + 自对弈数据训一个二分类模型可以显著改善这一块 ——
+# 实测（`aimodel/train_danger_selfplay.py`，60/20/20，验证集早停，测试集只碰一次）：
+#
+#     切片           自对弈        牌谱
+#     overall        0.8832        0.6996
+#     NO-RIICHI      0.8867        0.6838     <- 手写版的死穴
+#     WITH-RIICHI    0.5317        0.5872
+#
+# 所以自对弈数据把「没人立直」这一片从 0.68 抬到 0.89；而「有人立直」那一片
+# 牌谱更好（自对弈里只有 1.6% 的决策处于立直状态）。**两个来源互补**，
+# 这也正是保留手写路径做 A/B 的意义。
+#
+# ⚠️ 输入布局的一致性**已验证**，不必再猜：
+#   * `selfplay.py`  记的 `X` 就是 `encode(view)`（同文件 L211）
+#   * `logdata.py`   抽的 `danger_X` 也是 `encode(view)`（L82）
+#   * `danger_score` 调用的还是同一个 `encode(view)`
+#   三处是**同一个函数**，所以布局逐位一致是**构造性成立**的，不是巧合。
+#   我在接入时曾担心「View 现算的向量 ≠ 抽取时的向量」，那是多余的谨慎；
+#   真正的风险在**人数/维度**（下面 danger_score 的两道校验）。
+#
+#   两道校验仍然保留，因为它们是防「喂错维度」的安全网 —— 而且这道网
+#   当场抓出过一个真 bug：我起初拿模块级 `DIM` 去比，那是**三麻默认 486**，
+#   于是合法的四麻模型（560）会被拒绝。
+
+_DANGER_MODEL: dict | None = None
+
+
+def load_danger_model(path: str) -> None:
+    """载入 `--danger-model` 指到的 npz（w/b/mu/sd，均为训练时同一布局）。
+
+    注意**不能**拿模块级的 ``DIM`` 去校验：那是三麻的默认布局（486），
+    而四麻是 560。真实校验在 :func:`danger_score` 里按 ``view`` 的人数做 ——
+    这里只记下模型期望的维度。
+    """
+    global _DANGER_MODEL
+    data = np.load(path, allow_pickle=True)
+    _DANGER_MODEL = {
+        "w": data["w"].astype(np.float32),
+        "b": float(data["b"]),
+        "mu": data["mu"].astype(np.float32),
+        "sd": data["sd"].astype(np.float32),
+        "dim": int(data["dim"]),
+        "players": int(data["players"]),
+    }
+
+
+def danger_model_loaded() -> bool:
+    return _DANGER_MODEL is not None
+
+
+def danger_score(view: View, tile: int) -> float:
+    """危险度：有模型且**布局对得上**就用模型，否则退回手写 ``tile_danger``。
+
+    两处校验缺一不可：
+
+    * **人数**：模型是在四麻数据上训的，三麻局面不能喂给它；
+    * **维度**：``encode(view)`` 的实际长度必须等于模型期望的维度。
+
+    任何一条不满足就退回手写路径 —— 宁可慢，不可错。
+    """
+    if _DANGER_MODEL is None:
+        return tile_danger(view, tile)
+    if view.rule.players != _DANGER_MODEL["players"]:
+        return tile_danger(view, tile)
+    obs = encode(view)
+    if obs.shape[0] != _DANGER_MODEL["dim"]:
+        return tile_danger(view, tile)
+    x = (obs.astype(np.float32) - _DANGER_MODEL["mu"][0]) / _DANGER_MODEL["sd"][0]
+    z = float(x @ _DANGER_MODEL["w"] + _DANGER_MODEL["b"])
+    return float(1.0 / (1.0 + np.exp(-max(-30.0, min(30.0, z)))))
+
+
 def action_features(view: View) -> np.ndarray:
     """``(34, ACTION_DIM)``：每一张牌作为「打出去」时的特征。
 
