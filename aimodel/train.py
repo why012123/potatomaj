@@ -231,17 +231,24 @@ def collect_selfplay(
                 agents.append(HeuristicAgent(game_seed * n + seat, style=spec.style))
                 recorded.append(False)
             elif u < teacher_ratio + snapshot_ratio and snapshot is not None:
-                agents.append(MLAgent(snapshot, seed=game_seed * n + seat, greedy=False))
+                agents.append(
+                    MLAgent(snapshot, seed=game_seed * n + seat, greedy=False,
+                            style=spec.style)
+                )
                 recorded.append(False)
             elif u < teacher_ratio + snapshot_ratio + pool_ratio and pool:
                 # **对手池**：坐一个别的风格的模型（v1.1 的另外三个）。
                 # 只跟自己+教师下，学不到「面对速攻该怎么防」这类东西。
                 opp = pool[int(rng.integers(len(pool)))]
-                agents.append(MLAgent(opp, seed=game_seed * n + seat, greedy=False))
+                agents.append(
+                    MLAgent(opp, seed=game_seed * n + seat, greedy=False,
+                            style=spec.style)
+                )
                 recorded.append(False)
             else:
                 agents.append(
-                    MLAgent(net, seed=game_seed * n + seat, tracker=tracker, greedy=False)
+                    MLAgent(net, seed=game_seed * n + seat, tracker=tracker,
+                            greedy=False, style=spec.style)
                 )
                 recorded.append(True)
         game_start = len(tracker)
@@ -349,7 +356,9 @@ def quick_eval(
     hands = 0
     for m in range(n_matches):
         game_seed = seed * 7919 + m
-        agents: list[Agent] = [MLAgent(net, seed=game_seed, greedy=greedy)]
+        agents: list[Agent] = [
+            MLAgent(net, seed=game_seed, greedy=greedy, style=spec.style)
+        ]
         for i in range(1, n):
             if opponent == "teacher":
                 agents.append(HeuristicAgent(game_seed * n + i, style=spec.style))

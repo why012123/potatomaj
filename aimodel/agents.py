@@ -42,6 +42,20 @@ class Agent:
 
     name = "agent"
 
+    @staticmethod
+    def _n_players(view: View) -> int:
+        """这一桌几家。三麻 3 / 四麻 4。
+
+        **不要写死 3** —— 历史 bug：``_opp_riichi`` / ``_pressure`` /
+        ``show_table`` 里的对手范围曾经写死 ``range(3)``，四麻的第 4 家（P3）
+        被完全忽略，导致教师看不见 P3 的立直（实测 649 次「场上有立直」的
+        四麻决策里 38.7% 漏看立直家，同一张 5m 危险度 0.62 被算成 0.08）。
+        """
+        n = getattr(getattr(view, "rule", None), "players", 0)
+        if n:
+            return int(n)
+        return len(view.scores)  # 兜底：手写 View 没带 rule 时从点数表推
+
     def reset(self, seed: int = 0) -> None:  # pragma: no cover - 可选钩子
         pass
 
@@ -174,7 +188,10 @@ class HeuristicAgent(Agent):
         return visible_counts(view)
 
     def _opp_riichi(self, view: View) -> list[int]:
-        return [p for p in range(3) if p != view.player and view.riichi[p]]
+        return [
+            p for p in range(self._n_players(view))
+            if p != view.player and view.riichi[p]
+        ]
 
     def _danger(self, view: View, tile: int, opp_riichi: Sequence[int]) -> float:
         """直接用 :func:`aimodel.encode.tile_danger` —— 教师和网络看同一份危险度。"""
@@ -189,7 +206,7 @@ class HeuristicAgent(Agent):
         """
         if opp_riichi:
             return 1.0
-        others = [q for q in range(3) if q != view.player]
+        others = [q for q in range(self._n_players(view)) if q != view.player]
         opens = max((len(view.melds_all[q]) for q in others), default=0)
         if opens >= 2:
             return 0.7
@@ -225,7 +242,13 @@ class HeuristicAgent(Agent):
         if k == "call":
             return self._call(decision, view)
         if k == "chi":
-            return 0 if self._want_chi(view) else 1
+            # 选项顺序是 ACTION_TABLE["chi"] = ("pass", "chi")：
+            # options[0] = 过、options[1] = 吃。老代码写成
+            # `0 if self._want_chi(view) else 1` —— **正好反了**，
+            # 「想吃的时候过、想过的时候吃」，教师给出的 chi 标签全是反的。
+            # 实测（engine.py:877 + Decision("chi", ["pass","chi"])）：
+            # 恒返回 1 时 12 场 599 次吃，恒返回 0 时 0 次 —— 1 才是吃。
+            return 1 if self._want_chi(view) else 0
         if k in ("tsumo", "ron"):
             return 0
         if k == "kita":
@@ -414,12 +437,18 @@ class MLAgent(Agent):
         tracker: Tracker | None = None,
         fallback: Agent | None = None,
         temperature: float = 1.0,
+        *,
+        style: str | TeacherStyle = "normal",
     ) -> None:
         self.net = net
         self.rng = np.random.default_rng(seed)
         self.greedy = greedy
         self.tracker = tracker
-        self.fallback = fallback or HeuristicAgent(seed)
+        # 兜底教师必须跟着**这个模型自己的风格**走。老代码恒为
+        # HeuristicAgent(seed)（normal 风格），于是 flash / huge 模型
+        # 遇到没有策略头的决策时，吃牌规则和 normal 一模一样 ——
+        # 风格在这个分支上等于没生效（P0-2）。
+        self.fallback = fallback or HeuristicAgent(seed, style=style)
         self.temperature = temperature
         self.counts: dict[str, int] = {}
 
@@ -484,18 +513,29 @@ class HumanAgent(Agent):
         self.input_fn = input_fn
         self.print_fn = print_fn
 
+    #: 三麻座位名（自己 + 两家）
     SEAT_CN = ("自己", "下家", "上家")
+    #: 四麻座位名（自己 / 下家 / 对家 / 上家）—— 四麻有 4 家，
+    #: 老代码只有 3 个名字，第 4 家会 IndexError 或顶掉「上家」。
+    SEAT_CN4 = ("自己", "下家", "对家", "上家")
+
+    @classmethod
+    def seat_cn(cls, players: int) -> tuple[str, ...]:
+        return cls.SEAT_CN4 if players == 4 else cls.SEAT_CN
 
     def show_table(self, view: View) -> None:
         p = view.player
-        others = [q for q in range(3) if q != p]
+        n = self._n_players(view)
+        names = self.seat_cn(n)
+        others = [q for q in range(n) if q != p]
         self.print_fn(f"\n  ── 第 {view.turn} 巡 · 剩余 {view.wall_left} 张 ──")
         self.print_fn(f"  你的手牌   {S.hand_str(view.hand)}")
         if view.melds:
             self.print_fn("  你的副露   " + " ".join(str(m) for m in view.melds))
         self.print_fn(f"  你的牌河   {self._pond(view.discards[p])}")
         for q in others:
-            tag = self.SEAT_CN[q]
+            # 用「相对自己的第几家」取名，别拿绝对座位号去查表
+            tag = names[(q - p) % n]
             flag = " 立直!" if view.riichi[q] else ""
             self.print_fn(
                 f"  {tag}牌河   {self._pond(view.discards[q])}"
@@ -505,7 +545,7 @@ class HumanAgent(Agent):
         dora = [S.tile_cn(d) for d in view.dora_indicators]
         self.print_fn(
             f"  宝牌指示 {dora}"
-            f"   点数 " + " ".join(f"P{q}:{view.scores[q]}" for q in range(3))
+            f"   点数 " + " ".join(f"P{q}:{view.scores[q]}" for q in range(n))
         )
         n_melds = view.meld_count()
         sh = shanten(view.hand, n_melds)
@@ -549,12 +589,16 @@ class HumanAgent(Agent):
             self.print_fn("  输入序号")
 
 
-def make_agents(kind: str, seed: int = 0, **kw) -> list[Agent]:
-    """按名字造三个 agent（评测 / 演示共用）。"""
+def make_agents(kind: str, seed: int = 0, players: int = 3, **kw) -> list[Agent]:
+    """按名字造 ``players`` 个 agent（评测 / 演示共用）。
+
+    四麻要 4 个 —— 老版本写死 ``range(3)``，四麻调用方只能自己再补一个。
+    """
+    n = int(players)
     if kind == "random":
-        return [RandomAgent(seed + i) for i in range(3)]
+        return [RandomAgent(seed + i) for i in range(n)]
     if kind == "teacher":
-        return [HeuristicAgent(seed + i, **kw) for i in range(3)]
+        return [HeuristicAgent(seed + i, **kw) for i in range(n)]
     raise ValueError(f"未知 agent 类型: {kind}")
 
 

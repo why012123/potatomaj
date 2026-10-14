@@ -32,6 +32,10 @@ HEAD_SIZE: dict[str, int] = {
     "ron": 2,
     "riichi": 2,
     "call": 3,
+    "chi": 2,        # 四麻才有「吃」。老版本漏了这个键 -> 引擎
+                     # engine.py:877 真的会问 chi，但 train.py:65 的
+                     # `if kind in HEAD_SIZE` 判定失败 -> Tracker 里 0 条 chi
+                     # 记录（实测 30 场四麻 chi 占 1541/12185 = 12.6% 全丢）。
     "kita": 2,
     "kan": 2,
     "kyuushu": 2,

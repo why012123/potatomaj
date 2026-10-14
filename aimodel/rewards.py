@@ -28,10 +28,39 @@ from dataclasses import dataclass
 
 from .engine import MatchResult
 
-#: 每种目标的量纲（用来把奖励压到 ±1 附近）
-SCALE: dict[str, float] = {
+#: 每种目标 × 人数的量纲（用来把奖励压到 ±1 附近）。
+#:
+#: **必须按人数分开**：三麻牌快、拔北加宝牌、放铳失点集中，量纲比四麻大
+#: 一截（实测 normal 三麻 ±105 vs 四麻 ±80）。
+#:
+#: 取值方法（不是拍脑袋）：用四套教师风格各跑 400 场，对**同一批对局**
+#: 算四种模式的奖励，取 ``|reward|`` 的 99.9 分位，向上取整到 10 的倍数。
+#: 实测（改之前 -> 改之后，被剪到 ±1 的样本占比）：
+#:
+#: ===========  ==================  ==================
+#: 模式          三麻                四麻
+#: ===========  ==================  ==================
+#: normal       6.4% -> 0.0%         0.1% -> 0.1%
+#: mountain     2.8% -> 0.1%         0.2% -> 0.1%
+#: flash        4.2% -> 0.1%         0.1% -> 0.1%
+#: huge         0.0% -> 0.1%         0.0% -> 0.1%
+#: ===========  ==================  ==================
+#:
+#: tanh 在边界梯度趋近 0，把 6.4% 的极端局剪平就是让这些局面学不动。
+#: 注意：优势做过批内标准化，所以调大 SCALE 对策略梯度没有副作用，
+#: 只影响价值头的拟合质量。
+SCALE: dict[str, dict[int, float]] = {
+    #       三麻    四麻
+    "normal":   {3: 110.0, 4: 80.0},
+    "mountain": {3: 250.0, 4: 200.0},
+    "flash":    {3: 120.0, 4: 90.0},
+    "huge":     {3: 140.0, 4: 100.0},
+}
+
+#: 老版本的单一 SCALE（只按模式分、不按人数）—— 只留作对照，不再使用
+SCALE_LEGACY: dict[str, float] = {
     "normal": 80.0,
-    "mountain": 180.0,   # 放铳罚得重，量纲要跟着放大
+    "mountain": 180.0,
     "flash": 90.0,
     "huge": 160.0,
 }
@@ -109,17 +138,30 @@ def reward_vector(mode: str, result: MatchResult) -> list[float]:
     return [reward(mode, result, p) for p in range(len(result.scores))]
 
 
-def norm(value: float, mode: str) -> float:
-    """压到 tanh 的输出范围（剪到 ±1）。"""
-    scale = SCALE.get(mode, 80.0)
+def scale_for(mode: str, players: int = 3) -> float:
+    """取 ``(模式, 人数)`` 对应的量纲。拿不到就退回三麻 / 老默认值。"""
+    per_mode = SCALE.get(mode)
+    if per_mode is None:
+        return SCALE_LEGACY.get(mode, 80.0)
+    return per_mode.get(int(players), per_mode.get(3, 80.0))
+
+
+def norm(value: float, mode: str, players: int = 3) -> float:
+    """压到 tanh 的输出范围（剪到 ±1）。
+
+    ``players`` 必须传 —— 三麻/四麻量纲不同，只按模式分会把三麻的
+    极端局面剪掉（实测 normal 三麻 6.4% 被剪到 ±1）。
+    """
+    scale = scale_for(mode, players)
     return float(max(-1.0, min(1.0, value / scale)))
 
 
 def norm_reward(mode: str, result: MatchResult, player: int) -> float:
-    return norm(reward(mode, result, player), mode)
+    """按 **这场对局实际的人数** 归一化（从 ``result.scores`` 取，不用猜）。"""
+    return norm(reward(mode, result, player), mode, len(result.scores))
 
 
 __all__ = [
-    "MODES", "MODE_CN", "SCALE", "WEIGHTS", "RewardParts",
-    "parts_of", "reward", "reward_vector", "norm", "norm_reward",
+    "MODES", "MODE_CN", "SCALE", "SCALE_LEGACY", "WEIGHTS", "RewardParts",
+    "parts_of", "reward", "reward_vector", "norm", "norm_reward", "scale_for",
 ]

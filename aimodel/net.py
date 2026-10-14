@@ -28,8 +28,16 @@ ACTION_HIDDEN = 32
 
 #: 参与训练的决策种类（顺序固定，存档里会记下来）
 KINDS: tuple[str, ...] = (
-    "discard", "tsumo", "ron", "riichi", "call", "kita", "kan", "kyuushu",
+    "discard", "tsumo", "ron", "riichi", "call", "chi", "kita", "kan", "kyuushu",
 )
+
+#: 加了新头之后，旧权重里缺哪些头是可以明确说清的。
+#: ``chi`` 是四麻的「吃」：engine.py:877 会向 agent 抛 chi 决策，
+#: 但老版本 encode.HEAD_SIZE / 这里的 KINDS 都没有它 —— 于是 chi 一条都
+#: 没被记录过（实测四麻 12.6% 的决策丢失）。
+_NEW_HEADS: dict[str, str] = {
+    "chi": "四麻的「吃」头（老版本完全没记录过 chi，见 P0-2）",
+}
 
 
 class Net:
@@ -306,6 +314,10 @@ class Net:
                     "kinds": self.kinds,
                     "steps": self.total_steps,
                     "lr": self.lr,
+                    # l2 必须存档：BC 阶段用的 L2 比构造函数默认值大 10 倍，
+                    # 不存的话 load() 会悄悄回落到 1e-5，RL 阶段的权重衰减
+                    # 就变了（P0-4）。
+                    "l2": self.l2,
                     "action_dim": int(self.Wa1.shape[0]),
                 }
             ).encode(),
@@ -324,7 +336,25 @@ class Net:
                 f"当前代码是 {ACTION_DIM} 维）。改了特征就必须重新训练 —— "
                 f"用 `python -m aimodel.train bc` 重跑一遍。"
             )
-        net = cls(meta["dim"], tuple(meta["hidden"]), lr=meta.get("lr", 1e-3))
+        # 旧权重缺新头：必须显式报错并说清是哪个头，否则那些头会是随机权重，
+        # 模型会「永远学不会吃」还看不出来。
+        saved_kinds = list(meta.get("kinds", ()))
+        added = [k for k in KINDS if k not in saved_kinds]
+        if added:
+            why = "；".join(f"{k}: {_NEW_HEADS[k]}" for k in added if k in _NEW_HEADS)
+            raise ValueError(
+                f"{path}: 旧权重里没有这些决策头：{added}"
+                + (f"（{why}）" if why else "")
+                + "。加头会让参数量变化，旧权重不兼容 —— "
+                "用 `python -m aimodel.train bc` 重新训练。"
+            )
+        net = cls(
+            meta["dim"],
+            tuple(meta["hidden"]),
+            lr=meta.get("lr", 1e-3),
+            # 老权重没有 l2 字段：兜底用构造默认值，别让它们加载失败。
+            l2=meta.get("l2", 1e-5),
+        )
         net.kinds = list(meta["kinds"])
         # 注意：Adam 的 m/v 不存档，所以偏差修正的步数必须从 0 重新开始。
         # 如果这里沿用原来的步数，前几步会变成 m/(1-0.9^t) ≈ m、v/(1-0.999^t) ≈ v，
