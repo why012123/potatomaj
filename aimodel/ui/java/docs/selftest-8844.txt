@@ -1,0 +1,70 @@
+═══ 土豆麻将 Java 客户端自检 ═══
+后端      : http://127.0.0.1:8844
+Java      : 21.0.11（Eclipse Adoptium）
+
+── 1/6 GET /api/models
+      ✓ models=[maj-flash, maj-flash4, maj-huge, maj-huge4, maj-mountain, maj-mountain4, maj-normal, maj-normal4, policy, policy_bc4]  builtin=[teacher, random]  seats=[human, external]
+      ✓ 观战模式会用的座位值：maj-flash
+
+── 2/6 GET /api/state?seat=0：player_count / players / players_detail 三字段都要能读
+      原始 JSON 前 300 字：
+        {"player_count": 3, "delay": 0.2, "allow_chi": false, "allow_kita": true, "seats": [{"index": 0, "type": "human", "name": "你（P0）"}, {"index": 1, "type": "teacher", "name": "脚本·teacher（P1）"}, {"index": 2, "type": "teacher", "name": "脚本·teacher（P2）"}], "seed": 23, "finished": false, "result": null, "y
+      ✓ player_count=3（int）· players 是数组，3 项 · players_detail 是数组，3 项
+      ✓ 三个字段一致，解析出来的人数=3，座位明细 3 条
+      ✓ parse 出来的 seats=3 details=3  剩余=47 巡=2 场风=东 宝牌指示=[7z] 种子=23
+      ✓ 吃=false 拔北=true 节拍=0.2s 结束=false
+      座位一览（三字段渲染用到的全部信息）：
+        P0 你（P0）                 27000 点 西家   副露0 牌河0  14 张 一万 三筒 五筒 六筒 六筒 八筒 一索 六索 六索 七索 九索 东 白 发
+        P1 脚本·teacher（P1）        35000 点 东家 亲 副露0 牌河1  牌背 13 张
+        P2 脚本·teacher（P2）        43000 点 南家   副露0 牌河1 拔北1 牌背 13 张
+      ✓ 视角过滤正确：只有 seat=0 能看到手牌
+      当前决策：seat=0 kind=discard（打哪张）yours=true 选项 12 个
+      · 这次 pending 没有 tile（后端只在鸣/荣时给）
+
+── 3/6 以人类座位提交一次合法 discard（pending.options[0].index）
+      人 / 外部接口座位 = P0
+      拿到 discard：可选 12 种，提交 options[0] → index=0 label=1m（一万），刚摸 六筒
+      ✓ POST /api/act → {ok=true, seat=0, index=0}
+      ✓ 提交后：pending=null，牌谱最后一行：  [P2(南)] 摸 发（剩 45）
+
+── 4/6 POST /api/config 切四麻再切回三麻（返回体要有 human_wait）
+      ✓ 当前配置：3人 [human, teacher, teacher] 节拍 0.2s 种子 23
+      ✓ 切四麻返回：{ok=true, players=4, seats=[human, teacher, teacher, teacher], delay=0.2, seed=24, human_wait=900.0}
+      ✓ 返回体带 human_wait=900.0
+      ✓ 复查四麻：player_count=4 明细=4 allow_chi=true allow_kita=false
+      ✓ 切回三麻返回：{ok=true, players=3, seats=[human, teacher, teacher], delay=0.2, seed=25, human_wait=900.0}
+      ✓ 复查三麻：player_count=3 明细=3 allow_kita=true allow_chi=false
+
+── 5/6 GET /tiles/1m.png 存到临时文件
+      ✓ 已保存 /var/folders/ct/mn5nhjsx3yz5cqv0ks5drc3h0000gn/T/maj-1m-13704593720544934603.png（3913 字节 > 1000，PNG 头 正常）
+      ✓ 其它牌图：0m=7587B 0p=11874B 0s=8129B 1z=3950B 7z=2713B
+
+── 6/6 越界下标必须被后端拒绝（ok:false）
+      这个座位现在还有待决策（kita），越界测试可能会被「先到先得」吃掉，先等它过去
+      提交 seat=0 index=999 → HTTP 400 {ok=false, error=下标越界：999（可选 0~1）}
+      ✓ 越界被拒：ok=false，HTTP 400，error=下标越界：999（可选 0~1）
+      ✓ 负数下标也被拒：HTTP 400 下标越界：-1（可选 0~1）
+
+── 7/9 回放：/api/replay 元信息 · 单帧 · 批量 · 越界 400
+      ✓ frames=2 players=3 spectator_ok=false seats=[你（P0）, 脚本·teacher（P1）, 脚本·teacher（P2）]
+      ✓ 单帧 i=0：text=「── 第 1 局  亲家 P0(东)  宝牌指示 八索」 hand_no=1 turn=1 wall=51
+      ✓ 回放帧里 3 家 hand 都是全的（没有视角过滤）—— 全亮画得出来
+      ✓ 批量取帧 0~1：拿到 2 帧（一次预取一批，不是一帧一请求）
+      ✓ 越界帧号 i=99999 → HTTP 400 {"ok": false, "error": "帧号越界：99999"}
+      · 这 100 帧里没有和牌帧，跳过铳牌信息检查
+
+── 8/9 局间确认：hand_result 字段齐全 + POST /api/next
+      ✓ hand_result：第 1 局 荣和 kind=ron 赢家=P1 放铳=P0
+      ✓ 字段齐全：yaku 4 个 · 4 番 40 符（宝牌 2 番）· 和牌张 7p · deltas=[-8000, 9000, 0]
+      awaiting_next=true confirm_between=true last_hand_note=第 1 局结束（P1 荣和）
+      ✓ POST /api/next → {ok=true, awaiting_next=true}，之后 awaiting_next=false（牌局继续）
+
+── 9/9 观战全亮：reveal=1 只能在 spectator_ok=true 时拿到别家手牌
+      spectator_ok=false（桌上有没有人）
+      ✓ 桌上有真人：reveal=1 也拿不到别家手牌（后端防作弊生效，没被绕过）
+      ✓ 自己的手牌照常可见（13 张）
+
+──── 结果 ────
+通过 29 项，失败 0 项
+全部通过 ✓
+（配置面板可选座位：[maj-flash, maj-huge, maj-mountain, maj-normal, policy, policy_bc4, human, teacher, random, external]）

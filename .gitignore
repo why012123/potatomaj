@@ -1,0 +1,26 @@
+# ── 环境 / 构建产物（体积大、可重建，绝不入库）────────────────
+.venv/
+build/
+out/
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# ── 训练过程的中间产物 ────────────────────────────────────────
+# _bcbase 是「纯克隆基线」（做「强化学习到底有没有用」的对照用），
+# _prev 是重训前的备份。它们能加载，但不是给人用的。
+aimodel/weights/*_bcbase.npz
+aimodel/weights/*_prev.npz
+aimodel/weights/logs/
+aimodel/arena_state.json
+
+# ── 牌图缓存（重新拉一次就有）────────────────────────────────
+aimodel/ui/java/.tilecache/
+
+# ── 系统杂物 ─────────────────────────────────────────────────
+.DS_Store
+._*
+*.log
+*.swp

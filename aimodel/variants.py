@@ -1,0 +1,154 @@
+"""八个模型的注册表。
+
+命名规则（用户定的）：三麻叫 ``maj-<风格>``，四麻在原名后面加 ``4``。
+别名也认：``flash`` / ``flash4`` / ``maj-flash`` / ``maj-flash4`` 都能用。
+
+===============  ======  ==========  ========  ==========================
+模型              人数    得分条件     教师风格   一句话
+===============  ======  ==========  ========  ==========================
+``maj-normal``    3     normal      normal    标准段位分
+``maj-mountain``  3     mountain    mountain  防守专精（重罚放铳）
+``maj-flash``     3     flash       flash     速攻（按和牌次数给钱）
+``maj-huge``      3     huge        huge      大牌（按番数给钱）
+``maj-normal4``   4     normal      normal    四麻标准
+``maj-mountain4`` 4     mountain    mountain  四麻防守
+``maj-flash4``    4     flash       flash     四麻速攻
+``maj-huge4``     4     huge        huge      四麻大牌
+===============  ======  ==========  ========  ==========================
+
+**得分条件**（奖励函数）在 :mod:`aimodel.rewards`；
+**教师风格**（拿来行为克隆的启发式口味）在 :mod:`aimodel.agents`。
+两套要配套：追速度的模型就该跟「爱碰爱快的教师」学，不然一上来方向就是歪的。
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+
+WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
+
+#: 当前版本。改名规则跟着用户定的来：**原名称直接接版本号**
+#: （三麻 ``maj-flashv1.1``、四麻 ``maj-flash4v1.1``）。
+#: 不带版本号的写法一律当别名，指向最新版。
+VERSION = "v1.1"
+
+#: 四种风格的说明（中文，报告和日志里用）
+STYLE_CN = {
+    "normal": "标准",
+    "mountain": "防守",
+    "flash": "速攻",
+    "huge": "大牌",
+}
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str  #: 正名（带版本），比如 maj-flash4v1.1
+    players: int  #: 3 或 4
+    reward: str  #: rewards.MODES 之一
+    style: str  #: 教师风格（agents.TeacherStyle 的名字）
+    version: str = VERSION
+
+    @property
+    def path(self) -> Path:
+        return WEIGHTS_DIR / f"{self.name}.npz"
+
+    @property
+    def cn(self) -> str:
+        return f"{'四麻' if self.players == 4 else '三麻'}·{STYLE_CN.get(self.style, self.style)}"
+
+    def describe(self) -> str:
+        from .rewards import MODE_CN
+
+        return f"{self.name:<15} {self.cn:<8} 得分条件: {MODE_CN.get(self.reward, self.reward)}"
+
+
+def _build(version: str = VERSION) -> dict[str, ModelSpec]:
+    out: dict[str, ModelSpec] = {}
+    for players, suffix in ((3, ""), (4, "4")):
+        for style in ("normal", "mountain", "flash", "huge"):
+            name = f"maj-{style}{suffix}{version}"
+            out[name] = ModelSpec(name, players, style, style, version)
+    return out
+
+
+#: 正名 -> 规格
+MODELS: dict[str, ModelSpec] = _build()
+
+#: 别名（不带版本、不带 maj- 前缀、下划线等写法都认，一律指向最新版）
+_ALIASES: dict[str, str] = {}
+for _name, _spec in MODELS.items():
+    _bare = _name[: -len(_spec.version)]          # maj-flash4
+    _forms = {
+        _name,                                     # maj-flash4v1.1
+        _bare,                                     # maj-flash4  -> 最新版
+        _name.replace("-", "_"),
+        _bare.replace("-", "_"),
+        _name.replace("maj-", ""),
+        _bare.replace("maj-", ""),                 # flash4
+        _bare.replace("maj-", "").replace("-", "_"),
+    }
+    for _f in _forms:
+        _ALIASES[_f.lower()] = _name
+del _name, _spec, _bare, _forms, _f
+
+
+def versions(style: str, players: int) -> list[str]:
+    """某个风格/人数下，历史上存在过的版本（新→旧）。"""
+    out = []
+    for f in sorted(WEIGHTS_DIR.glob(f"maj-{style}{'4' if players == 4 else ''}v*.npz")):
+        out.append(f.stem)
+    return out
+
+
+def resolve(name: str) -> str:
+    """把别名归一成正名。"""
+    key = name.strip().lower()
+    if key in _ALIASES:
+        return _ALIASES[key]
+    # 宽松匹配：majflash4 / maj_flash_4 / flash4_v1.1 这种写法都认。
+    # 注意要把版本号也归一化掉，否则 "majflash4" 对不上 "majflash4v1.1"。
+    squash = key.replace("_", "").replace("-", "").replace(".", "")
+    for cand, spec in MODELS.items():
+        bare = cand[: -len(spec.version)]
+        for form in (cand, bare):
+            if squash == form.replace("-", "").replace(".", "").lower():
+                return spec.name
+    raise KeyError(f"没有这个模型: {name}（可选: {', '.join(sorted(MODELS))}）")
+
+
+_VERSIONED = re.compile(r"^(maj-[a-z]+4?)(v[\d.]+)$")
+
+
+def get(name: str) -> ModelSpec:
+    """按名字取规格。**显式带版本号的写法一定认**（即使那不是当前版本），
+    这样训练 v1.2 的时候还能引用 v1.1 的模型当对手。"""
+    key = name.strip().lower()
+    m = _VERSIONED.match(key)
+    if m and key not in MODELS:
+        built = _build(m.group(2))
+        if key in built:
+            return built[key]
+    return MODELS[resolve(name)]
+
+
+def all_specs(version: str | None = None) -> list[ModelSpec]:
+    """不传版本就是当前版本；传了就按那个版本生成（训练下一版时用）。"""
+    if version is None or version == VERSION:
+        return [MODELS[n] for n in sorted(MODELS)]
+    built = _build(version)
+    return [built[n] for n in sorted(built)]
+
+
+def same_players(players: int, version: str | None = None) -> list[ModelSpec]:
+    return [s for s in all_specs(version) if s.players == players]
+
+
+def existing() -> list[ModelSpec]:
+    """已经训练出来的（有权重文件的）。"""
+    return [s for s in all_specs() if s.path.exists()]
+
+
+__all__ = ["ModelSpec", "MODELS", "STYLE_CN", "get", "resolve", "all_specs", "existing"]

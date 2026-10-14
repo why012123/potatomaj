@@ -1,0 +1,32 @@
+▸ 项目根：/Users/derivation/Desktop/Project potato/potatomaj
+▸ 故意先不起后端，直接开窗口（= 用户 bash run.sh 之后的第一次）
+▸ 第一眼是选择页？true · 状态： 后端 http://127.0.0.1:8888 连不上 —— 点「开始对局」会自动拉起，或点「启动后端」
+  这时后端还没起、模型列表为空，座位默认是 [human, teacher, teacher]（预期是 teacher，因为还不知道有哪些模型）
+▸ 用户直接点「开始对局」（带出去的座位还是 [human, teacher, teacher]）
+  UI 自己起后端：本窗口启动的后端（PID 88619，端口 8888） · owned=true alive=true · lastMessage=后端已就绪（PID 88619）
+  状态： http://127.0.0.1:8888 · 三麻 · 视角 P0（你（P0）） · 节拍 1.0s · 种子 1 · 2ms · 牌图 37/37 · 后端本窗口启动
+  开完这一局，选择页座位已经变成 [human, maj-flash, maj-huge]
+  第一次点开始对局后（冷启动） /api/state 实际输出：
+    player_count = 3
+    seats        = [{"index":0,"type":"human","name":"你（P0）"},{"index":1,"type":"maj-flash","name":"脚本·maj-flash（P1）"},{"index":2,"type":"maj-huge","name":"脚本·maj-huge（P2）"}]
+    -> type 列表 [human, maj-flash, maj-huge] ✓ 有模型
+▸ 切到三麻，选择页默认座位 = [human, maj-flash, maj-huge]（模型：[maj-flash, maj-huge]）
+  三麻（点开始对局后） /api/state 实际输出：
+    player_count = 3
+    seats        = [{"index":0,"type":"human","name":"你（P0）"},{"index":1,"type":"maj-flash","name":"脚本·maj-flash（P1）"},{"index":2,"type":"maj-huge","name":"脚本·maj-huge（P2）"}]
+    -> type 列表 [human, maj-flash, maj-huge] ✓ 有模型
+    牌桌：还在选择页？false · 3 人 · player_count=3 · 明细 3 条
+▸ 切到四麻，选择页默认座位 = [human, maj-flash4, maj-huge4, maj-mountain4]（模型：[maj-flash4, maj-huge4, maj-mountain4]）
+  四麻（点开始对局后） /api/state 实际输出：
+    player_count = 4
+    seats        = [{"index":0,"type":"human","name":"你（P0）"},{"index":1,"type":"maj-flash4","name":"脚本·maj-flash4（P1）"},{"index":2,"type":"maj-huge4","name":"脚本·maj-huge4（P2）"},{"index":3,"type":"maj-mountain4","name":"脚本·maj-mountain4（P3）"}]
+    -> type 列表 [human, maj-flash4, maj-huge4, maj-mountain4] ✓ 有模型
+    牌桌：4 人 · player_count=4 · 明细 4 条
+▸ 后端日志退化警告：✓ 没有（座位都真的用上了模型）
+▸ 三麻默认值的校验结果：通过（无问题）
+▸ 故意选错（三麻里塞 maj-flash4 + no-such-model）的校验结果：
+    ⚠ P1 选了 4 人模型「maj-flash4」，当前是 3 人
+    ⚠ P2 的「no-such-model」不是已知座位 / 模型（weights 里没有）
+    ✓ 两条都抓到了（开始前会弹窗拦一下）
+▸ 关窗清理后：后端进程活着？false · 端口 8888 已释放 ✓
+FLOWTEST PASS（默认=模型 · 三/四麻各自正确 · 无退化 · 关窗停服务）

@@ -1,0 +1,19 @@
+{
+  "name": "potatomaj-shell",
+  "version": "0.1.0",
+  "private": true,
+  "description": "土豆麻将 Electron 外壳：在自带浏览器里开雀魂并直接读牌局数据",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dump-frames": "POTATOMAJ_DUMP=1 electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron"
+    ]
+  }
+}
