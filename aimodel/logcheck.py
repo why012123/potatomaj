@@ -301,6 +301,22 @@ def check_kyoku(kyoku: list[dict], n: int = 3, rule: S.Rule | None = None,
         if res.kind not in ("draw", "kyuushu", "abort"):
             rep.ok = False
             rep.notes.append(f"牌谱是流局，引擎判成 {res.kind}")
+            return rep
+        # 流局也要逐项比 —— 不检的话「听牌判定 / 不聴罰符」这类错永远抓不到
+        ryu = mjai.ryukyoku_of(kyoku)
+        if ryu is not None:
+            if ryu.get("tenpai") is not None and res.tenpai is not None:
+                want = [bool(x) for x in ryu["tenpai"]]
+                got = [bool(x) for x in res.tenpai]
+                if want != got:
+                    rep.ok = False
+                    rep.notes.append(f"听牌判定不符：牌谱 {want}，引擎 {got}")
+            if ryu.get("deltas"):
+                want_d = [int(x) for x in ryu["deltas"]]
+                got_d = [int(x) for x in res.deltas]
+                if want_d != got_d:
+                    rep.ok = False
+                    rep.notes.append(f"流局收支不符：牌谱 {want_d}，引擎 {got_d}")
         return rep
 
     # ── 和牌：比对谁和、和哪张、番符、点数 ──

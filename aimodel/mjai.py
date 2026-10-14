@@ -202,17 +202,29 @@ def export(
 # 按局切开
 # ---------------------------------------------------------------------------
 def iter_kyoku(events: Iterable[dict]) -> Iterator[list[dict]]:
-    """把牌谱按「局」切开，每局一个事件列表（从 start_kyoku 到 end_kyoku）。"""
+    """把牌谱按「局」切开，每局一个事件列表（从 start_kyoku 到 end_kyoku）。
+
+    ⚠️ **不能只认 ``end_kyoku`` 当结束标志** —— 真实牌谱的导出器不一定每局都给
+    这个事件（天鳳牌谱转 MJAI 的常见实现就不给）。只认它的话，多局会被并成一局、
+    大部分局直接丢掉（实测：497 局里只切出 8 局）。
+
+    所以规则是：**遇到下一个 ``start_kyoku`` 就把上一局收掉**；
+    文件末尾剩的那一局也要收。``end_kyoku`` 有就切、没有也不影响。
+    """
     cur: list[dict] = []
     for e in events:
         t = e.get("type")
         if t == "start_kyoku":
+            if cur:                      # 上一局没给 end_kyoku 也要收
+                yield cur
             cur = [e]
         elif cur:
             cur.append(e)
             if t == "end_kyoku":
                 yield cur
                 cur = []
+    if cur:                              # 文件结尾的最后一局
+        yield cur
 
 
 def hora_of(kyoku: Iterable[dict]) -> dict | None:
