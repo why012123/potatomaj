@@ -57,6 +57,9 @@ class Net:
         self.lr = lr
         self.l2 = l2
         self.kinds = list(KINDS)
+        #: 加载时因「旧权重缺这个头」被零初始化补上的决策种类。
+        #: MLAgent 见到它们会走启发式兜底，保证老模型行为不变。
+        self.untrained_heads: set[str] = set()
 
         sizes = [dim, *self.hidden]
         self.W: list[np.ndarray] = []
@@ -336,17 +339,28 @@ class Net:
                 f"当前代码是 {ACTION_DIM} 维）。改了特征就必须重新训练 —— "
                 f"用 `python -m aimodel.train bc` 重跑一遍。"
             )
-        # 旧权重缺新头：必须显式报错并说清是哪个头，否则那些头会是随机权重，
-        # 模型会「永远学不会吃」还看不出来。
+        # 旧权重缺新头（例如后来加的 chi）。
+        #
+        # ⚠️ 这里**不能直接抛错** —— 一抛错，加一个头就让**全部** 44 个存量权重
+        # 加载失败，天梯 / Java 牌桌 / 网页平台一起瘫（踩过一次）。
+        #
+        # 正确做法：**零初始化补上，并记进 `untrained_heads`**：
+        #   · 零权重的头输出恒为 0，对已有头的输出**没有任何影响**；
+        #   · `MLAgent` 见到 untrained 的头会走**启发式兜底** ——
+        #     于是老模型的行为和加头之前**逐比特一致**（三麻根本走不到 chi；
+        #     四麻继续用兜底规则吃牌，跟以前一样）；
+        #   · 重训之后的权重里有这个头，就不再是 untrained，正常使用。
         saved_kinds = list(meta.get("kinds", ()))
         added = [k for k in KINDS if k not in saved_kinds]
         if added:
             why = "；".join(f"{k}: {_NEW_HEADS[k]}" for k in added if k in _NEW_HEADS)
-            raise ValueError(
+            import warnings
+            warnings.warn(
                 f"{path}: 旧权重里没有这些决策头：{added}"
                 + (f"（{why}）" if why else "")
-                + "。加头会让参数量变化，旧权重不兼容 —— "
-                "用 `python -m aimodel.train bc` 重新训练。"
+                + "。已零初始化并标记为「未训练」，这些决策会走启发式兜底；"
+                "想让模型自己学这些决策，用 `python -m aimodel.train bc` 重训。",
+                stacklevel=2,
             )
         net = cls(
             meta["dim"],
@@ -360,6 +374,7 @@ class Net:
         # 如果这里沿用原来的步数，前几步会变成 m/(1-0.9^t) ≈ m、v/(1-0.999^t) ≈ v，
         # 相当于把学习率放大 3 倍多 —— 一脚就能把行为克隆学的牌效踹散。
         net.total_steps = int(meta.get("steps", 0))
+        net.untrained_heads = set(added)
         net.steps = 0
         missing = []
         for name, p in net.params():
@@ -367,6 +382,12 @@ class Net:
                 p[...] = data[name]
             else:
                 missing.append(name)
+        # 补上的新头必须**显式清零** —— 留着随机初始化的话，万一哪天被走到，
+        # 输出就是噪声（这正是当初写那句报错要防的事）。
+        for k in added:
+            if k in net.Wp:
+                net.Wp[k][...] = 0.0
+                net.bp[k][...] = 0.0
         if missing:
             # 多半是「旧结构 + 新代码」：特征维度或动作塔变了。
             # 这时候缺的那部分会是随机权重，打出来的牌没有意义，必须明说。

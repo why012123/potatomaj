@@ -866,6 +866,11 @@ def serve(
 
 
 def main(argv: list[str] | None = None) -> None:
+    try:
+        from ..variants import audit_weights
+        audit_weights(verbose=True)
+    except Exception as e:                          # noqa: BLE001
+        print(f"（权重自检跳过：{type(e).__name__}: {e}）")
     ap = argparse.ArgumentParser(description="三麻简易 UI")
     ap.add_argument(
         "--seats", type=str, default="",

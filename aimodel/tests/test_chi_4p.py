@@ -213,7 +213,7 @@ def main() -> int:
     check(m1[0] == 0.0 and m1[1] == 1.0, "只给 chi 时掩码应只开第 1 位")
     print("  ✅ chi 掩码 2 维 / 下标映射正确")
 
-    print("\n== 旧权重（没有 chi 头）必须被安全拦住并说清原因 ==")
+    print("\n== 旧权重（没有 chi 头）必须被安全处理，且不能静默 ==")
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "old.npz"
         net.save(p)
@@ -230,15 +230,33 @@ def main() -> int:
             if name.startswith("Wp_chi") or name.startswith("bp_chi"):
                 del data[name]
         np.savez_compressed(p, **data)
-        try:
-            Net.load(p)
-            check(False, "加载缺 chi 头的旧权重应该报错，而不是静默通过")
-        except ValueError as e:
-            msg = str(e)
-            check("chi" in msg, f"报错信息必须点明 chi，实际：{msg}")
-            check("吃" in msg or "重新训练" in msg,
-                  f"报错信息必须说清原因/怎么办，实际：{msg}")
-            print(f"  ✅ 正确拦住：{msg[:150]}")
+        # ⚠️ 契约在 2026-10-15 变过一次，这里说明为什么：
+        #
+        # 原契约是「缺头 → 直接抛 ValueError」。它的意图是对的（不能静默接受
+        # 随机初始化的头），但**代价是加一个头就让全部 44 个存量权重加载失败** ✗
+        # —— 天梯 / Java 牌桌 / 网页平台一起瘫，实测踩过一次。
+        #
+        # 新契约（三条一起满足，意图不变、代价没了）：
+        #   ① 加载成功（不再抛错）
+        #   ② **必须有 UserWarning**（不是静默）
+        #   ③ 缺的头**零初始化**并记进 `untrained_heads`，
+        #      MLAgent 见到它走启发式兜底 → 老模型行为与加头前一致
+        import warnings as _w
+
+        with _w.catch_warnings(record=True) as w:
+            _w.simplefilter("always")
+            net2 = Net.load(p)
+        msgs = [str(x.message) for x in w if issubclass(x.category, UserWarning)]
+        check(bool(msgs), "加载缺头的旧权重必须发 UserWarning，不能静默")
+        check(any("chi" in m for m in msgs), f"警告必须点明 chi，实际：{msgs[:1]}")
+        check(any("吃" in m or "重新训练" in m for m in msgs),
+              f"警告必须说清原因/怎么办，实际：{msgs[:1]}")
+        check("chi" in net2.untrained_heads, "缺的头必须记进 untrained_heads")
+        z = net2.Wp["chi"]
+        check(float(abs(z).max()) == 0.0, f"缺的头必须零初始化，实际最大 {abs(z).max()}")
+        check("chi" not in net2.kinds,
+              "缺的头不应进 net.kinds —— MLAgent 靠这个走启发式兜底，行为才和老版本一致")
+        print(f"  ✅ 正确处理：{msgs[0][:110]}")
 
     print("\n== l2 必须存档并恢复（P0-4，与加头同批改动）==")
     with tempfile.TemporaryDirectory() as td:
