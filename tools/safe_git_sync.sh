@@ -56,13 +56,17 @@ fi
 
 # ── ③ 未跟踪文件（git clean -fd 会删掉）────────────────────
 echo
-echo "【3】未跟踪文件 —— 只有 \`git clean -fd\` 会删，但先看一眼"
+echo "【3】🔴 未跟踪文件 —— **这一类就是被清掉过的东西**"
 UNTRACKED=$(git ls-files --others --exclude-standard)
 if [ -n "${UNTRACKED}" ]; then
-    echo "${UNTRACKED}" | head -20 | sed 's/^/   ·  /'
+    DANGER=1
+    echo "${UNTRACKED}" | head -20 | sed 's/^/   ⚠️  /'
     N=$(echo "${UNTRACKED}" | wc -l | tr -d ' ')
     [ "${N}" -gt 20 ] && echo "   …（共 ${N} 个）"
-    echo "   → 只是提醒：这些**不在 git 里**，别指望能恢复"
+    echo "   → **这些不在 git 里、删了就没了** ✗ 已经因此丢过一次："
+    echo "     平台侧的 webapp/（约 2000 行）+ run.py + 对 engine.py 的改动，全部归零 ✗"
+    echo "   → 先提交：git add <你写的文件> && git commit"
+    echo "   → 如果这些是**别人的**：先让本人提交，或者用手动备份"
 else
     echo "   ✅ 没有"
 fi
