@@ -112,10 +112,58 @@ check(bad == 0, f"{bad}/300 手「向听 -1」与和牌形判定不一致")
 if bad == 0:
     print("  ✅ 向听 -1 与和牌形判定完全对应")
 
+print("\n== 记忆化与 base 复用必须完全等价（P1-3）==")
+# P1-3：ukeire_count 曾占 action_features 91% 的时间（1565µs/1711µs）。
+# 改了两处：① shanten 结果按 (counts, n_melds) 记忆化
+#           ② useful_tiles/ukeire/ukeire_count 接受调用方已算好的 base
+# 两处都必须**数值完全不变**，否则特征就变了、旧权重白训。
+sample = [random_hand(rng) for _ in range(60)]
+
+# ① 记忆化：清空 memo 重算一遍，结果必须与预热后一致
+before = [F.shanten(c, 0) for c in sample]
+saved = dict(F._SHANTEN_MEMO)
+F._SHANTEN_MEMO.clear()
+cold = [F.shanten(c, 0) for c in sample]
+check(before == cold, "清空 memo 前后，shanten 结果必须一致")
+# 再算一次（这次全命中 memo）也必须一致
+again = [F.shanten(c, 0) for c in sample]
+check(before == again, "memo 命中时 shanten 结果必须一致")
+F._SHANTEN_MEMO.update(saved)
+print("  ✅ shanten 记忆化：冷/热/命中三次结果一致")
+
+# ② base 复用：传 base 与不传 base，进张必须逐张相同
+bad_base = 0
+for c in sample:
+    s = F.shanten(c, 0)
+    if F.useful_tiles(c, 0, sanma=True) != F.useful_tiles(c, 0, sanma=True, base=s):
+        bad_base += 1
+    if F.ukeire(c, None, 0, True) != F.ukeire(c, None, 0, True, base=s):
+        bad_base += 1
+    if F.ukeire_count(c, None, 0, True) != F.ukeire_count(c, None, 0, True, base=s):
+        bad_base += 1
+check(bad_base == 0, f"{bad_base} 手在传/不传 base 时结果不同 —— base 复用不等价")
+print("  ✅ base 复用：useful_tiles / ukeire / ukeire_count 三者逐手等价")
+
+# ③ 带副露（n_melds != 0）时也要等价，且 memo 不能把 n_melds 混掉
+bad_meld = 0
+for c in sample[:30]:
+    for nm in (0, 1, 2):
+        s = F.shanten(c, nm)
+        if F.ukeire_count(c, None, nm, True) != F.ukeire_count(c, None, nm, True, base=s):
+            bad_meld += 1
+check(bad_meld == 0, f"{bad_meld} 处带副露时 base 复用不等价")
+# memo 的键必须含 n_melds：同一手牌不同副露数不能互相顶掉
+_diff = sum(1 for c in sample[:30] if F.shanten(c, 0) != F.shanten(c, 2))
+check(_diff > 0, "n_melds 应当影响 shanten（否则 memo 键少一维也看不出来，测试无效）")
+print(f"  ✅ 带副露等价；且 n_melds 确实影响结果（{_diff}/30 手不同）")
+
 print("\n== 速度 ==")
 hands = [random_hand(rng) for _ in range(200)]
-for c in hands[:20]:
-    F.useful_tiles(c)  # 预热缓存
+# 预热：上面的等价性测试会清空 memo，所以这里必须把**即将计时的那批手牌**
+# 先各算一遍，否则测到的是冷缓存，速度断言会假红。
+for c in hands:
+    F.shanten(c)
+    F.useful_tiles(c)
 t0 = time.perf_counter()
 for c in hands:
     F.shanten(c)

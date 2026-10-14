@@ -37,6 +37,24 @@ from .net import Net
 
 WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 
+#: 各决策头的**目标熵**（P1-1）。必须分头设 —— 打牌头有 34 个动作、上限 log34≈3.53，
+#: 而二分类头上限只有 log2≈0.693。用一个全局系数会把立直/和了这些头推坏。
+#:
+#: 取值思路：**二分类头保持低熵**（它们本来就该果断：能和就和、能立就立），
+#: 多分类头给足探索空间（打牌头是策略的主体，也是实测塌得最狠的那个：
+#: H=0.291 / 上限 2.27，argmax 与采样 87.7% 重合）。
+ENT_TARGETS: dict[str, float] = {
+    "discard": 1.2,    # 上限 ln34≈3.53 —— 给足探索，别让它变成确定性策略
+    "call": 0.55,      # 上限 ln3≈1.10
+    "chi": 0.35,       # 上限 ln2≈0.69
+    "tsumo": 0.06,     # 上限 ln2 —— 能和就和，几乎不该探索
+    "ron": 0.06,
+    "riichi": 0.25,    # 立不立直可以有探索
+    "kita": 0.15,
+    "kan": 0.10,
+    "kyuushu": 0.05,
+}
+
 #: 默认模型（不指定 --model 时用它）
 DEFAULT_MODEL = "maj-normal"
 
@@ -124,11 +142,27 @@ def train_bc(
     seed: int = 0,
     verbose: bool = True,
     holdout: dict | None = None,
-) -> list[dict]:
+    patience: int = 3,
+    label_smoothing: float = 0.05,
+) -> tuple[list[dict], Net, dict]:
+    """行为克隆。返回 ``(hist, best_net, best_info)``。
+
+    **为什么返回 best_net 而不是就用传进来的 net**：留出集一致率通常在
+    中途见顶然后回落（权重日志里实测 18.5 个百分点：训练 87.6%->93.4%，
+    留出 75.9%->74.9%）。老代码只打印留出率、**不做决策**，
+    ``cmd_bc`` 又无条件 ``net.save()`` —— 存下来的是**过拟合最重的那一轮**。
+
+    现在每轮记一次留出率，**只在变好时留一份网络快照**，跑完把最好的那份
+    返回给调用方去存。``patience`` 轮没有改善就提前停（0 = 不早停）。
+    """
     rng = np.random.default_rng(seed)
     n = len(data["X"])
     adv = np.ones(n, dtype=np.float32)
     hist: list[dict] = []
+    best_hold = -1.0
+    best_epoch = 0
+    best_net = net
+    stale = 0
     for ep in range(epochs):
         idx = rng.permutation(n)
         tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
@@ -152,12 +186,20 @@ def train_bc(
                 clip=0.0,
                 ent_coef=0.001,
                 vf_coef=0.5,
+                label_smoothing=label_smoothing,
             )
             for k in tot:
                 tot[k] += st[k]
             nb += 1
         acc = agreement(net, data)
         hold = agreement(net, holdout) if holdout else acc
+        improved = hold > best_hold
+        if improved:
+            # net.copy() 是深拷贝（含 steps / total_steps），所以拿回来能直接存
+            best_hold, best_epoch, best_net = hold, ep + 1, net.copy()
+            stale = 0
+        else:
+            stale += 1
         row = {
             "epoch": ep + 1,
             "policy_loss": tot["policy_loss"] / max(1, nb),
@@ -165,14 +207,30 @@ def train_bc(
             "entropy": tot["entropy"] / max(1, nb),
             "与教师一致率": acc,
             "留出集一致率": hold,
+            "最优留出轮次": best_epoch,
         }
         hist.append(row)
         if verbose:
             print(
                 f"    epoch {ep + 1}/{epochs}  一致率={acc:.1%}"
                 f"（留出 {hold:.1%}）  value_loss={row['value_loss']:.4f}"
+                + ("  ★最优" if improved else f"  （已 {stale} 轮没进步）")
             )
-    return hist
+        if patience > 0 and stale >= patience:
+            if verbose:
+                print(f"    ⏹ 留出集连续 {patience} 轮没进步，提前停在 epoch {ep + 1}")
+            break
+    info = {
+        "best_epoch": best_epoch,
+        "best_holdout": best_hold,
+        "last_epoch": len(hist),
+    }
+    if verbose:
+        print(
+            f"    ★ 最优留出率 {best_hold:.1%} 出现在 **第 {best_epoch} 轮**"
+            f"（共跑 {len(hist)} 轮）—— 存的是这一轮，不是最后一轮"
+        )
+    return hist, best_net, info
 
 
 def agreement(net: Net, data: dict, limit: int = 4000) -> float:
@@ -286,15 +344,27 @@ def train_rl(
     ent_coef: float = 0.008,
     vf_coef: float = 0.5,
     verbose: bool = True,
+    ent_coef_adapt: bool = False,
+    kl_coef: float = 0.0,
+    ref: Net | None = None,
 ) -> list[dict]:
     rng = np.random.default_rng(seed)
     data = dict(data)
     data["adv"] = compute_advantages(net, data)
+    # KL 锚定（P1-2）：先按这一批轨迹把参考策略的概率冻结下来。
+    # 参考就是**克隆阶段的权重**，所以 RL 不会被推着走远。
+    if kl_coef > 0.0 and ref is not None:
+        net.set_reference(ref, data, kl_coef=kl_coef)
+    elif kl_coef <= 0.0:
+        net.kl_coef = 0.0
     n = len(data["X"])
     hist = []
     for ep in range(epochs):
         idx = rng.permutation(n)
-        tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0}
+        tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0,
+               "clip_frac": 0.0, "kl": 0.0}
+        ent_by_kind: dict[str, float] = {}
+        ent_n: dict[str, int] = {}
         nb = 0
         for s in range(0, n, batch_size):
             sel = idx[s : s + batch_size]
@@ -315,12 +385,21 @@ def train_rl(
                 clip=clip,
                 ent_coef=ent_coef,
                 vf_coef=vf_coef,
+                ent_target=ENT_TARGETS,
+                ent_coef_adapt=ent_coef_adapt,
             )
             for k in tot:
                 tot[k] += st[k]
+            for k, hv in st.get("entropy_by_kind", {}).items():
+                ent_by_kind[k] = ent_by_kind.get(k, 0.0) + hv
+                ent_n[k] = ent_n.get(k, 0) + 1
             nb += 1
         row = {k: v / max(1, nb) for k, v in tot.items()}
         row["epoch"] = ep + 1
+        row["entropy_by_kind"] = {
+            k: ent_by_kind[k] / max(1, ent_n[k]) for k in ent_by_kind
+        }
+        row["ent_coef_by_kind"] = dict(net._ent_coef)
         hist.append(row)
     if verbose and hist:
         h = hist[-1]
@@ -328,7 +407,42 @@ def train_rl(
             f"    PPO  policy_loss={h['policy_loss']:+.4f}  entropy={h['entropy']:.3f}"
             f"  clip={h['clip_frac']:.1%}  value_loss={h['value_loss']:.4f}"
         )
+        print_entropy_by_kind(h)
     return hist
+
+
+def print_entropy_by_kind(row: dict) -> None:
+    """**逐头**打印熵，并标出离目标最远的头（P1-1）。
+
+    老代码把 8 个头的熵**平均成一个数**（``net.py`` 原 :284），
+    所以「打牌头塌到 H=0.291」这种信息会被其他头摊平、根本看不出来。
+    这里逐头列出：实际熵 / 目标熵 / 该头的自适应系数。
+    """
+    by_kind = row.get("entropy_by_kind") or {}
+    if not by_kind:
+        return
+    coefs = row.get("ent_coef_by_kind") or {}
+    parts = []
+    worst, worst_gap = None, -1.0
+    for k in sorted(by_kind):
+        h = by_kind[k]
+        tgt = ENT_TARGETS.get(k)
+        if tgt:
+            gap = (tgt - h) / tgt      # >0 表示熵偏低（探索不足）
+            if gap > worst_gap:
+                worst, worst_gap = k, gap
+            parts.append(f"{k}={h:.2f}/{tgt:.2f}")
+        else:
+            parts.append(f"{k}={h:.2f}")
+    print("    逐头熵（实际/目标）: " + "  ".join(parts))
+    if coefs:
+        print("    逐头熵系数: " + "  ".join(
+            f"{k}={coefs[k]:.4f}" for k in sorted(coefs)
+        ))
+    if worst is not None and worst_gap > 0.3:
+        print(f"    ⚠️ 探索最不足的是 **{worst}**"
+              f"（{by_kind[worst]:.2f} vs 目标 {ENT_TARGETS[worst]:.2f}"
+              f"，差 {worst_gap:.0%}）—— 这个头在向确定性塌缩")
 
 
 # ---------------------------------------------------------------------------
@@ -403,24 +517,65 @@ def build_net(args, resume: bool = True) -> Net:
     return Net(dim=dim, hidden=hidden, seed=args.seed, lr=args.lr, l2=args.l2)
 
 
+def guard_out_path(args, resume: bool) -> Path:
+    """**止损门禁**：不让人一裸跑就把已训好的权重覆盖掉。
+
+    老行为：直接 `python -m aimodel.train bc` 会用**默认的 256×256 新建网络**
+    去覆盖 `weights/maj-normalv1.1.npz` —— 无备份、无确认。
+    一次手滑就丢掉一个训好的模型。
+
+    规则（``cmd_bc`` / ``cmd_rl`` 都走这里）：
+    * 目标不存在            -> 正常写
+    * 目标存在 + ``--force`` -> 正常写（明确授权覆盖）
+    * 目标存在 + ``--resume``-> 正常写（本来就是接着它训）
+    * 目标存在 + 都没有      -> **改写 ``<name>.new.npz``**，并打印提示
+    """
+    out = Path(args.out)
+    if not out.exists():
+        return out
+    if getattr(args, "force", False) or resume:
+        return out
+    alt = out.with_name(out.stem + ".new.npz")
+    print(
+        f"  ⚠️ {out} 已存在 —— 裸跑会用**新建的网络**把它覆盖掉。\n"
+        f"     已改为写 {alt}\n"
+        f"     （要覆盖原文件就加 --force；要接着它训就加 --resume）"
+    )
+    return alt
+
+
 def cmd_bc(args) -> Net:
     spec = spec_of(args)
     print(f"① 行为克隆：{spec.cn}（{spec.name}）")
     print(f"   {spec.describe()}")
     net = build_net(args, resume=args.resume)
+    args.out = str(guard_out_path(args, resume=args.resume))
     data = collect_bc(args.hands, seed=args.seed, spec=spec)
     holdout = collect_bc(
         max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
     )
     print(f"  留出集：{len(holdout['X'])} 条决策（种子不同，用来判断有没有过拟合）")
-    hist = train_bc(
+    hist, best_net, bc_info = train_bc(
         net, data, epochs=args.epochs, batch_size=args.batch, seed=args.seed,
-        holdout=holdout,
+        holdout=holdout, patience=args.patience,
     )
-    net.save(args.out)
-    print(f"  已保存 -> {args.out}（{net.n_params()} 参数）")
-    save_log(args, {"bc": {"hist": hist, "samples": int(len(data["X"]))}})
-    return net
+    # 存**留出最优**那一轮，不是最后一轮。老代码无条件 net.save()，
+    # 存下来的是过拟合最重的那份（实测训练 87.6%->93.4% 时留出 75.9%->74.9%）。
+    saved_net = best_net
+    saved_net.lr = getattr(args, "lr", saved_net.lr)
+    saved_net.save(args.out)
+    print(
+        f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
+        f"  [最优留出 {bc_info['best_holdout']:.1%} @ 第 {bc_info['best_epoch']} 轮"
+        f" / 共 {bc_info['last_epoch']} 轮]"
+    )
+    save_log(args, {"bc": {
+        "hist": hist, "samples": int(len(data["X"])),
+        "best_epoch": bc_info["best_epoch"],
+        "best_holdout": bc_info["best_holdout"],
+        "last_epoch": bc_info["last_epoch"],
+    }})
+    return saved_net
 
 
 def cmd_rl(args) -> Net:
@@ -429,6 +584,7 @@ def cmd_rl(args) -> Net:
     print(f"   得分条件 = {rewards.MODE_CN.get(spec.reward, spec.reward)}")
     net = build_net(args, resume=True)
     net.lr = args.rl_lr  # 强化学习用更小的步长，别把克隆来的牌效打散
+    args.out = str(guard_out_path(args, resume=True))
     # 对手池：同人数的**其它风格**模型（比如训「防守」时让「速攻」「大牌」上桌）
     pool: list[Net] = []
     if args.pool_ratio > 0:
@@ -450,7 +606,13 @@ def cmd_rl(args) -> Net:
     )
     print(f"  起始：{fmt_eval(best)}")
     best_delta = best["平均段位分"]
+    # KL 锚定的参考 = **进入 RL 之前**的那份权重（BC 克隆出来的牌效）。
+    ref_net = net.copy()
     snapshot = net.copy()
+    # 「新高才保存」原来只保护**文件**，不保护**内存里的权重**：
+    # 崩掉那一轮之后的训练数据是用崩掉的策略采的，会越跑越远。
+    # 所以同时留一份内存里的最优备份，跑完回滚回去。
+    best_net = net.copy()
     for it in range(1, args.iters + 1):
         t0 = time.perf_counter()
         data, st = collect_selfplay(
@@ -470,6 +632,8 @@ def cmd_rl(args) -> Net:
             batch_size=args.batch,
             seed=args.seed + it,
             ent_coef=max(0.002, 0.01 * (1 - it / (args.iters + 1))),
+            kl_coef=args.kl_coef,
+            ref=ref_net,
         )
         ev = quick_eval(
             net, n_matches=args.eval_matches, seed=args.seed + 777, spec=spec
@@ -483,10 +647,19 @@ def cmd_rl(args) -> Net:
         if ev["平均段位分"] > best_delta:
             best_delta = ev["平均段位分"]
             net.save(args.out)
-            print(f"    ↑ 新高，已保存 {args.out}")
+            # ★ 同时把最优权重**留一份在内存里**（P1-2）：
+            # 只存文件的话，后面训崩了内存里已经变坏，下一轮自对弈就是
+            # 用坏策略采的数据，等于自己把自己越推越远。
+            best_net = net.copy()
+            print(f"    ↑ 新高，已保存 {args.out}（内存里也留了一份最优）")
         if it % 5 == 0:
             snapshot = net.copy()
-    if not Path(args.out).exists():
+    # 跑完把最优那份**回滚进内存**，并且以它为准落盘
+    if best_net is not net:
+        net = best_net
+        net.save(args.out)
+        print(f"  ↩ 已回滚到最优权重（段位分 {best_delta:+.1f}）并保存 -> {args.out}")
+    elif not Path(args.out).exists():
         net.save(args.out)
     save_log(args, log)
     return net
@@ -527,6 +700,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--matches", type=int, default=300, help="每轮自对弈的场数")
     ap.add_argument("--iters", type=int, default=20, help="自对弈轮数")
     ap.add_argument("--epochs", type=int, default=6, help="行为克隆的 epoch 数")
+    ap.add_argument("--patience", type=int, default=3,
+                    help="留出集连续多少轮没进步就早停（0 = 不早停，始终跑满 --epochs）")
     ap.add_argument("--ppo-epochs", type=int, default=3, help="每轮 PPO 的 epoch 数")
     ap.add_argument("--batch", type=int, default=256, help="minibatch 大小")
     ap.add_argument("--lr", type=float, default=1e-3, help="行为克隆的学习率")
@@ -541,6 +716,11 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", type=str, default=str(WEIGHTS_DIR / "policy.npz"))
     ap.add_argument("--log", type=str, default=str(WEIGHTS_DIR / "train_log.json"))
     ap.add_argument("--resume", action="store_true", help="从已有权重继续")
+    ap.add_argument("--force", action="store_true",
+                    help="目标权重已存在时允许直接覆盖（不加就改写成 <name>.new.npz）")
+    ap.add_argument("--kl-coef", type=float, default=0.1,
+                    help="KL 锚定强度（0 = 关）。把 RL 策略拉回克隆阶段的参考策略，"
+                         "防止把 BC 学的牌效训崩；太紧 RL 动不了，太松等于没锚")
     args = ap.parse_args(argv)
 
     if args.list_models:

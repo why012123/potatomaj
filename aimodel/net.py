@@ -60,6 +60,12 @@ class Net:
         #: 加载时因「旧权重缺这个头」被零初始化补上的决策种类。
         #: MLAgent 见到它们会走启发式兜底，保证老模型行为不变。
         self.untrained_heads: set[str] = set()
+        #: 逐头熵系数（P1-1）。默认值在第一次 step(ent_coef_adapt=True) 时播种。
+        self._ent_coef: dict[str, float] = {}
+        #: KL 锚定的参考策略（P1-2）：**不参与求导**的冻结副本。
+        #: 全仓库原来 `grep -i "kl|anchor|reference"` 在 train/net 里零命中。
+        self.ref_probs: dict[str, np.ndarray] = {}
+        self.kl_coef: float = 0.0
 
         sizes = [dim, *self.hidden]
         self.W: list[np.ndarray] = []
@@ -120,6 +126,32 @@ class Net:
 
     def n_params(self) -> int:
         return sum(p.size for _, p in self.params())
+
+    # -- KL 锚定（P1-2）-----------------------------------------------------
+    def set_reference(self, ref: "Net", data: dict, kl_coef: float = 0.1) -> None:
+        """冻结一份参考策略，之后 ``step`` 会把策略往它身上拉。
+
+        为什么需要：BC 学出来的牌效是**好权重**，而 RL 训崩了会把它冲掉。
+        老代码的「新高才保存」只保护**文件**，不保护**内存里的权重** ——
+        崩掉那一轮之后的训练数据就是用崩掉的策略采的，越跑越远。
+        加一个 KL 锚点，等于给 RL 系了根安全绳。
+
+        ``ref_probs`` 按决策头整批缓存（不是逐样本），所以内存很小。
+        """
+        self.ref_probs = {}
+        for k in self.kinds:
+            idx = np.nonzero(data["kind"] == k)[0]
+            if len(idx) == 0:
+                continue
+            size = HEAD_SIZE[k]
+            m = data["mask"][idx][:, :size]
+            af = None
+            if k == "discard" and data.get("actfeat") is not None:
+                af = np.asarray(data["actfeat"][idx], dtype=np.float32)
+            z = ref.logits(ref.trunk(data["X"][idx]), k, af)
+            z = np.where(m > 0, z, -1e9)
+            self.ref_probs[k] = softmax_rows(z).astype(np.float32)
+        self.kl_coef = float(kl_coef)
 
     # -- 前向 ---------------------------------------------------------------
     def _forward(self, X: np.ndarray):
@@ -186,8 +218,27 @@ class Net:
         clip: float = 0.2,
         ent_coef: float = 0.01,
         vf_coef: float = 0.5,
+        ent_target: dict[str, float] | None = None,
+        ent_coef_adapt: bool = False,
+        ent_adapt_rate: float = 0.25,
+        label_smoothing: float = 0.0,
+        kl_coef: float | None = None,
     ) -> dict:
-        """一次 minibatch 更新。``batch`` 由 :mod:`aimodel.train` 组装。"""
+        """一次 minibatch 更新。``batch`` 由 :mod:`aimodel.train` 组装。
+
+        ``ent_target`` / ``ent_coef_adapt``（P1-1）：**分头**自适应熵系数。
+        实测打牌头熵 H=0.291（上限 2.27）、argmax 与采样 87.7% 重合 ——
+        探索已经塌了，而全局 ent_coef 从 0.01 降到 0.002 之后梯度贡献 <1%。
+
+        做法：每个决策头有自己的熵系数 ``self._ent_coef[k]``，按
+        「实际熵 vs 目标熵」做比例反馈：
+
+            coef_k *= exp(rate * (target_k - H_k) / target_k)
+
+        熵低于目标就**调大** coef（逼它多探索），高于目标就调小。
+        二分类头（立直/和了）目标熵天然低，所以**必须分头设目标** ——
+        用一个全局系数会把这些头推坏。
+        """
         X = batch["X"]
         mask = batch["mask"]
         act = batch["action"]
@@ -208,6 +259,11 @@ class Net:
         ent_sum = 0.0
         clip_frac = 0.0
         n_kind = 0
+        kl_sum = 0.0
+        kl_n = 0
+        kc = self.kl_coef if kl_coef is None else float(kl_coef)
+        #: 逐头熵（P1-1）：把 8 个头的熵分开记，否则看不出是哪个头塌了
+        ent_by_kind: dict[str, float] = {}
 
         for k in self.kinds:
             idx = np.nonzero(kinds == k)[0]
@@ -243,9 +299,53 @@ class Net:
             # 注意符号：dL/dz = coef * (onehot - p)，写反了就会「越训越差」
             dz = -coef[:, None] * p
             dz[np.arange(len(idx)), a] += coef
-            if ent_coef:
-                dz += ent_coef * p * (np.log(np.maximum(p, 1e-12)) + ent[:, None])
-            dz /= n
+            # 软标签 / label smoothing（P1-1）。硬交叉熵 + 确定性教师
+            # = 学出「一个确定性策略的三份镜像」，打牌头熵实测只有 0.291。
+            #
+            # 目标换成 (1-eps)*onehot + eps*(1/K)（K = 该头合法动作数）之后：
+            #   损失 = (1-eps)*CE + eps*mean(log K)
+            # 第二项与参数**无关**（常数），所以精确梯度就是原来的
+            #   dL/dz = coef*(p - onehot)  乘上 (1-eps)
+            #
+            # 别画蛇添足：`-(eps/K)*coef*(1 - K*p)` 看着像均匀项，但它对每行
+            # 求和恒等于 0（softmax 行和对 z 的导数为 0），加上去是错的。
+            keep = 1.0
+            if mode == "bc" and label_smoothing > 0.0:
+                keep = 1.0 - float(min(max(label_smoothing, 0.0), 0.999))
+            # 分头熵系数（P1-1）：每个头有自己的系数，别用一个全局值
+            k_coef = self._ent_coef.get(k, ent_coef) if ent_coef_adapt else ent_coef
+            if k_coef:
+                dz += k_coef * p * (np.log(np.maximum(p, 1e-12)) + ent[:, None])
+            # KL 锚定（P1-2）：把策略拉回克隆阶段的参考策略。
+            #   KL(pref || p) = sum pref*(log pref - log p)
+            #   dKL/dz_j = -sum_k pref_k*(delta_kj - p_j) = p_j - pref_j
+            # 也就是 **dKL/dz = p - pref** —— 干净得不像话。
+            #
+            # 我最初写的版本是 `p * (log(p/pref) + KL_row)`，看着像标准推导，
+            # 但它**连「对动作求和必须为 0」都不满足**，数值梯度一验就露了
+            # （最大绝对差 1.67）。别自己推，用 p - pref。
+            if kc > 0.0 and mode != "bc":
+                pref = self.ref_probs.get(k)
+                if pref is not None and pref.shape == p.shape:
+                    dz += kc * (p - pref)
+                    kl_row = np.sum(
+                        pref * (np.log(np.maximum(pref, 1e-12))
+                                - np.log(np.maximum(p, 1e-12))),
+                        axis=1,
+                    )
+                    kl_sum += float(np.mean(kl_row))
+                    kl_n += 1
+            dz = dz * keep / n
+
+            h_k = float(np.mean(ent))
+            ent_by_kind[k] = h_k
+            # 比例反馈：熵低于目标 -> 调大系数（逼它探索），高于目标 -> 调小
+            if ent_coef_adapt and ent_target and k in ent_target and ent_target[k] > 0:
+                ratio = (ent_target[k] - h_k) / ent_target[k]
+                new_c = self._ent_coef.get(k, ent_coef) * float(
+                    np.exp(np.clip(ent_adapt_rate * ratio, -0.5, 0.5))
+                )
+                self._ent_coef[k] = float(np.clip(new_c, 1e-4, 1.0))
 
             grads[f"Wp_{k}"] = feat[idx].T @ dz + self.l2 * self.Wp[k]
             grads[f"bp_{k}"] = dz.sum(axis=0)
@@ -259,7 +359,7 @@ class Net:
                 grads["ba1"] = dz1.sum(axis=(0, 1))
 
             pol_loss += float(-np.mean(np.where(use_un, unclipped, clipped)))
-            ent_sum += float(np.mean(ent))
+            ent_sum += h_k
             clip_frac += float(np.mean(~use_un))
 
         v = np.tanh(feat @ self.Wv + self.bv)[:, 0]
@@ -285,7 +385,10 @@ class Net:
         return {
             "policy_loss": pol_loss / nk,
             "value_loss": value_loss,
+            # 整体熵保留（向后兼容），但**逐头熵**才是能看出「哪个头塌了」的东西
             "entropy": ent_sum / nk,
+            "entropy_by_kind": ent_by_kind,
+            "kl": (kl_sum / kl_n) if kl_n else 0.0,
             "clip_frac": clip_frac / nk,
         }
 
