@@ -25,7 +25,11 @@ Differences from a real mjlog file, all handled below:
 * ``haiN=`` has no surrounding tag;
 * a row holds ONE hand, not a whole game, and it may end with a lone ``<``
   which actually belongs to the next row's ``<INIT``; some rows instead end
-  with ``</mjloggm>`` (the last hand of a game).
+  with ``</mjloggm>`` (the last hand of a game). A draw row ends with the
+  ``<RYUUKYOKU ... />`` tag followed by that same lone ``<``.
+
+Note on the draw tag's spelling: it is ``RYUUKYOKU`` (two U's), the official
+Tenhou mjlog spelling, not ``RYUKYOKU``. Both are accepted below.
 
 Tile encoding
 -------------
@@ -77,7 +81,12 @@ DAHAI_SEAT = {c: i for i, c in enumerate(DAHAI_TAGS)}
 HONORS = {"E": 27, "S": 28, "W": 29, "N": 30, "P": 31, "F": 32, "C": 33}
 
 #: event tags we expect to see (anything else is recorded as unknown)
-KNOWN_TAGS = set("TUVWDEFG") | {"N", "REACH", "DORA", "AGARI", "RYUKYOKU", "BYE", "UN"}
+#: NOTE: the draw tag is spelled RYUUKYOKU (two U's) -- that is the official
+#: Tenhou mjlog spelling and it is what the workbook actually contains: a full
+#: scan of Sheet1's sharedStrings.xml finds 6,643 ``<RYUUKYOKU`` and exactly 0
+#: ``<RYUKYOKU``. Accepting both keeps a differently-spelled source working.
+RYUUKYOKU_TAGS = ("RYUUKYOKU", "RYUKYOKU")
+KNOWN_TAGS = set("TUVWDEFG") | {"N", "REACH", "DORA", "AGARI", "BYE", "UN"} | set(RYUUKYOKU_TAGS)
 
 
 class ParseError(Exception):
@@ -289,7 +298,7 @@ def parse_row(row: str) -> list[dict]:
             events.append(_decode_agari(a, hand_of, melds_of, oya))
             continue
 
-        if tag == "RYUKYOKU":
+        if tag in RYUUKYOKU_TAGS:
             events.append(_decode_ryukyoku(a, hand_of, melds_of, ten))
             continue
 
@@ -601,6 +610,17 @@ def _decode_ryukyoku(a: dict, hand_of, melds_of, ten: list[int]) -> dict:
     for i in range(0, min(len(sc), 8), 2):
         if i + 1 < len(sc):
             deltas.append(sc[i + 1] - sc[i])
+    # ``sc`` is 8 numbers = (before, after) per seat, so ``deltas`` is exact --
+    # it is the noten/tenpai transfer: sc=248,-15,228,15,335,-15,179,15 gives
+    # deltas [-15, +15, -15, +15]. ``raw_sc`` is kept for consumers that want
+    # the before/after form.
+    #
+    # ``tenpai`` is left as-is (per-seat tenpai HAND tile lists, matching what
+    # ``mjai.export`` writes) but is empty for these clipped rows: the workbook
+    # puts the draw's ``haiN=`` tenpai hands *after* the tag's ``/>``, not in
+    # the attribute blob this function receives, so nothing is found here.
+    # Decoding that needs the row text and a signature change, so it is
+    # deliberately left alone rather than guessed at.
     return {
         "type": "ryukyoku",
         "reason": _RYUKYOKU_TYPE.get(t, t or "exhaustive_draw"),
