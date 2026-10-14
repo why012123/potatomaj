@@ -30,6 +30,7 @@ TESTS = [
     "test_encode.py",       # 特征编码：全局特征 / 动作特征 / 掩码
     "test_net.py",          # 神经网络：数值梯度、掩码、存档、PPO 截断
     "test_logs.py",         # 牌谱管线：MJAI 读写 / 重放对拍 / 数据抽取
+    "test_repo_hygiene.py",  # 仓库卫生：天鳳牌谱的保护规则必须一直生效
 ]
 
 
