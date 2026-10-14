@@ -124,11 +124,26 @@ def train_bc(
     seed: int = 0,
     verbose: bool = True,
     holdout: dict | None = None,
-) -> list[dict]:
+    patience: int = 3,
+) -> tuple[list[dict], Net, dict]:
+    """行为克隆。返回 ``(hist, best_net, best_info)``。
+
+    **为什么返回 best_net 而不是就用传进来的 net**：留出集一致率通常在
+    中途见顶然后回落（权重日志里实测 18.5 个百分点：训练 87.6%->93.4%，
+    留出 75.9%->74.9%）。老代码只打印留出率、**不做决策**，
+    ``cmd_bc`` 又无条件 ``net.save()`` —— 存下来的是**过拟合最重的那一轮**。
+
+    现在每轮记一次留出率，**只在变好时留一份网络快照**，跑完把最好的那份
+    返回给调用方去存。``patience`` 轮没有改善就提前停（0 = 不早停）。
+    """
     rng = np.random.default_rng(seed)
     n = len(data["X"])
     adv = np.ones(n, dtype=np.float32)
     hist: list[dict] = []
+    best_hold = -1.0
+    best_epoch = 0
+    best_net = net
+    stale = 0
     for ep in range(epochs):
         idx = rng.permutation(n)
         tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
@@ -158,6 +173,13 @@ def train_bc(
             nb += 1
         acc = agreement(net, data)
         hold = agreement(net, holdout) if holdout else acc
+        improved = hold > best_hold
+        if improved:
+            # net.copy() 是深拷贝（含 steps / total_steps），所以拿回来能直接存
+            best_hold, best_epoch, best_net = hold, ep + 1, net.copy()
+            stale = 0
+        else:
+            stale += 1
         row = {
             "epoch": ep + 1,
             "policy_loss": tot["policy_loss"] / max(1, nb),
@@ -165,14 +187,30 @@ def train_bc(
             "entropy": tot["entropy"] / max(1, nb),
             "与教师一致率": acc,
             "留出集一致率": hold,
+            "最优留出轮次": best_epoch,
         }
         hist.append(row)
         if verbose:
             print(
                 f"    epoch {ep + 1}/{epochs}  一致率={acc:.1%}"
                 f"（留出 {hold:.1%}）  value_loss={row['value_loss']:.4f}"
+                + ("  ★最优" if improved else f"  （已 {stale} 轮没进步）")
             )
-    return hist
+        if patience > 0 and stale >= patience:
+            if verbose:
+                print(f"    ⏹ 留出集连续 {patience} 轮没进步，提前停在 epoch {ep + 1}")
+            break
+    info = {
+        "best_epoch": best_epoch,
+        "best_holdout": best_hold,
+        "last_epoch": len(hist),
+    }
+    if verbose:
+        print(
+            f"    ★ 最优留出率 {best_hold:.1%} 出现在 **第 {best_epoch} 轮**"
+            f"（共跑 {len(hist)} 轮）—— 存的是这一轮，不是最后一轮"
+        )
+    return hist, best_net, info
 
 
 def agreement(net: Net, data: dict, limit: int = 4000) -> float:
@@ -403,11 +441,39 @@ def build_net(args, resume: bool = True) -> Net:
     return Net(dim=dim, hidden=hidden, seed=args.seed, lr=args.lr, l2=args.l2)
 
 
+def guard_out_path(args, resume: bool) -> Path:
+    """**止损门禁**：不让人一裸跑就把已训好的权重覆盖掉。
+
+    老行为：直接 `python -m aimodel.train bc` 会用**默认的 256×256 新建网络**
+    去覆盖 `weights/maj-normalv1.1.npz` —— 无备份、无确认。
+    一次手滑就丢掉一个训好的模型。
+
+    规则（``cmd_bc`` / ``cmd_rl`` 都走这里）：
+    * 目标不存在            -> 正常写
+    * 目标存在 + ``--force`` -> 正常写（明确授权覆盖）
+    * 目标存在 + ``--resume``-> 正常写（本来就是接着它训）
+    * 目标存在 + 都没有      -> **改写 ``<name>.new.npz``**，并打印提示
+    """
+    out = Path(args.out)
+    if not out.exists():
+        return out
+    if getattr(args, "force", False) or resume:
+        return out
+    alt = out.with_name(out.stem + ".new.npz")
+    print(
+        f"  ⚠️ {out} 已存在 —— 裸跑会用**新建的网络**把它覆盖掉。\n"
+        f"     已改为写 {alt}\n"
+        f"     （要覆盖原文件就加 --force；要接着它训就加 --resume）"
+    )
+    return alt
+
+
 def cmd_bc(args) -> Net:
     spec = spec_of(args)
     print(f"① 行为克隆：{spec.cn}（{spec.name}）")
     print(f"   {spec.describe()}")
     net = build_net(args, resume=args.resume)
+    args.out = str(guard_out_path(args, resume=args.resume))
     data = collect_bc(args.hands, seed=args.seed, spec=spec)
     holdout = collect_bc(
         max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
@@ -442,6 +508,7 @@ def cmd_rl(args) -> Net:
     print(f"   得分条件 = {rewards.MODE_CN.get(spec.reward, spec.reward)}")
     net = build_net(args, resume=True)
     net.lr = args.rl_lr  # 强化学习用更小的步长，别把克隆来的牌效打散
+    args.out = str(guard_out_path(args, resume=True))
     # 对手池：同人数的**其它风格**模型（比如训「防守」时让「速攻」「大牌」上桌）
     pool: list[Net] = []
     if args.pool_ratio > 0:
@@ -540,6 +607,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--matches", type=int, default=300, help="每轮自对弈的场数")
     ap.add_argument("--iters", type=int, default=20, help="自对弈轮数")
     ap.add_argument("--epochs", type=int, default=6, help="行为克隆的 epoch 数")
+    ap.add_argument("--patience", type=int, default=3,
+                    help="留出集连续多少轮没进步就早停（0 = 不早停，始终跑满 --epochs）")
     ap.add_argument("--ppo-epochs", type=int, default=3, help="每轮 PPO 的 epoch 数")
     ap.add_argument("--batch", type=int, default=256, help="minibatch 大小")
     ap.add_argument("--lr", type=float, default=1e-3, help="行为克隆的学习率")
@@ -554,6 +623,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", type=str, default=str(WEIGHTS_DIR / "policy.npz"))
     ap.add_argument("--log", type=str, default=str(WEIGHTS_DIR / "train_log.json"))
     ap.add_argument("--resume", action="store_true", help="从已有权重继续")
+    ap.add_argument("--force", action="store_true",
+                    help="目标权重已存在时允许直接覆盖（不加就改写成 <name>.new.npz）")
     args = ap.parse_args(argv)
 
     if args.list_models:
