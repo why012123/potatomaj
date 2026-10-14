@@ -94,6 +94,18 @@ class ParseError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# TEMPORARY debug instrumentation (opt-in; removed before the final commit)
+# Set ``DEBUG = {}`` and call :func:`parse_row`; the dict is filled with a
+# per-event trace of the replay state so the first divergence is visible.
+# ---------------------------------------------------------------------------
+DEBUG: dict | None = None
+
+
+def _dbg_sizes(hand_of) -> list[int]:
+    return [len(h) for h in hand_of]
+
+
+# ---------------------------------------------------------------------------
 # MJAI writing
 #
 # The task says to reuse ``aimodel/mjai.py``'s writer. That module is not
@@ -222,6 +234,13 @@ def parse_row(row: str) -> list[dict]:
     reach_declared = [False] * 4
     dora_count = 0
 
+    dbg: list | None = None
+    if DEBUG is not None:
+        DEBUG.clear()
+        dbg = DEBUG.setdefault("log", [])
+        DEBUG["sizes0"] = _dbg_sizes(hand_of)
+        dbg.append(("init", None, None, _dbg_sizes(hand_of)))
+
     for tag, blob in _TAG_RE.findall(body):
         a = _attrs(blob)
 
@@ -231,6 +250,8 @@ def parse_row(row: str) -> list[dict]:
             last_tsumo[seat] = tile
             # the drawn tile joins the hand; the next discard removes it again
             hand_of[seat].append(tile)
+            if dbg is not None:
+                dbg.append(("draw", seat, _tile_name(tile), _dbg_sizes(hand_of)))
             events.append({"type": "tsumo", "actor": seat, "pai": _tile_name(tile)})
             continue
 
@@ -238,6 +259,12 @@ def parse_row(row: str) -> list[dict]:
             seat = DAHAI_SEAT[tag]
             tile = _bare_tile(blob, tag, s)
             tsumogiri = last_tsumo[seat] == tile
+            if dbg is not None:
+                n_before = hand_of[seat].count(tile)
+                dbg.append(("discard", seat, _tile_name(tile),
+                            {"copies": n_before, "sizes": _dbg_sizes(hand_of),
+                             "MISSING": n_before == 0,
+                             "hand": sorted(hand_of[seat])}))
             # the tile leaves the hand; red-five identity comes from the raw id
             _remove_tile(hand_of[seat], tile)
             pond[seat].append(tile)
@@ -257,6 +284,14 @@ def parse_row(row: str) -> list[dict]:
             ev, consumed = _decode_call(mv, seat, last_dahai, hand_of, melds_of,
                                         discards_of=pond)
             events.append(ev)
+            if dbg is not None:
+                dbg.append(("call", seat, f"m={mv} {ev['type']} {ev.get('pai')}",
+                            {"consumed": [_tile_name(t) for t in consumed],
+                             "missing_consumed": [_tile_name(t) for t in consumed
+                                                  if t not in hand_of[seat]],
+                             "sizes": _dbg_sizes(hand_of),
+                             "hand": sorted(hand_of[seat]),
+                             "last_dahai": last_dahai}))
             # ``consumed`` = every tile this call takes OUT OF THE CALLER'S HAND
             # (for ankan that is all four; the taken discard is not included).
             for t in consumed:
@@ -296,10 +331,15 @@ def parse_row(row: str) -> list[dict]:
 
         if tag == "AGARI":
             events.append(_decode_agari(a, hand_of, melds_of, oya))
+            # A hand must be CLOSED with end_kyoku: mjai.iter_kyoku only yields a
+            # kyoku when it sees one, so without this logcheck silently compares
+            # almost nothing (measured: 497 hands parsed -> only 8 compared).
+            events.append({"type": "end_kyoku", "reason": "hora"})
             continue
 
         if tag in RYUUKYOKU_TAGS:
             events.append(_decode_ryukyoku(a, hand_of, melds_of, ten))
+            events.append({"type": "end_kyoku", "reason": "ryukyoku"})
             continue
 
         if tag in ("BYE", "UN"):
