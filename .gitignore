@@ -63,3 +63,9 @@ data/tenhou*/
 samples/*.json
 samples/*.mjai
 
+# ── mjlog.py 的 dump 落点 ──────────────────────────────────────
+# `mjlog.py --out` 默认写到这里，内容是**和 GL1.xlsm 同源的天鳳牌谱** ✗
+# 仓库是 public → 一次 `git add -A` 就会推上去 ✓
+# 这两条在合并里丢过一次（被 aimodel/tests/test_repo_hygiene.py 当场抓到 ✓）
+mjai_dump/
+aimodel/mjai_dump/
