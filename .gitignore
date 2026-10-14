@@ -46,3 +46,20 @@ run-electron.sh
 # 识图那套已被协议解码替代，这些是它的遗留物（本地保留）
 tools/evaluate.py
 samples/
+
+# ── 天鳳牌谱数据（仅本机使用：不上传 / 不提交 / 不分发）────────
+# GL1.xlsm 是同学提供的 40000 局天鳳四麻牌谱，授权仅限本项目小范围开发
+# （验证规则、训练模型）。原始文件、中间 dump、以及由它抽出的训练数据
+# 一律不得入库，也不得对外分发。
+#
+# 注意：下面每一条都必须单独占一行 —— .gitignore 不支持行尾注释，
+# 加了注释整行就会被当成一个模式而永远匹配不上（本文件上面已经踩过一次）。
+GL1.xlsm
+*.xlsm
+_data/
+data/
+data/tenhou*.npz
+data/tenhou*/
+samples/*.json
+samples/*.mjai
+
