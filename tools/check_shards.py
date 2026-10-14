@@ -69,6 +69,10 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="检查 shard 目录有没有重复内容")
     ap.add_argument("path", help="shard 目录（或单个 .npz）")
     ap.add_argument("--quiet", action="store_true", help="只在有问题时输出")
+    ap.add_argument("--shards-per-batch", type=int, default=0, metavar="N",
+                    help="每批应有多少个 shard；给了就按批次检查完整性，"
+                         "**不完整的批次不计入总数**")
+    ap.add_argument("--batch-glob", default="*", help="批次目录的匹配模式（默认任意子目录）")
     args = ap.parse_args(argv)
 
     root = Path(args.path)
@@ -76,6 +80,22 @@ def main(argv: list[str] | None = None) -> None:
     if not files:
         print(f"没找到 .npz：{root}")
         raise SystemExit(1)
+
+    # ── 批次完整性：**跑完的 worker 先落盘、没跑完的没有** ——
+    #    所以被中途杀掉的批次会留下**部分 shard**（不是「全有或全无」✗）。
+    #    规则：只有凑满 --shards-per-batch 个 shard 的批次才算数，其余整批丢弃。
+    dropped: list[tuple[str, int]] = []
+    if args.shards_per_batch > 0 and root.is_dir():
+        keep: list[Path] = []
+        by_dir: dict[Path, list[Path]] = defaultdict(list)
+        for f in files:
+            by_dir[f.parent].append(f)
+        for d, fs in sorted(by_dir.items()):
+            if len(fs) == args.shards_per_batch:
+                keep.extend(fs)
+            else:
+                dropped.append((str(d.relative_to(root)), len(fs)))
+        files = sorted(keep)
 
     groups: dict[str, list[Path]] = defaultdict(list)
     meta: dict[str, tuple[int, int]] = {}
@@ -99,6 +119,13 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     print(f"目录：{root}")
+    if dropped:
+        print(f"  ⚠️ 丢弃 {len(dropped)} 个**不完整批次**"
+              f"（应为 {args.shards_per_batch} 个 shard/批）：")
+        for name, n in dropped[:8]:
+            print(f"      {name}：只有 {n} 个 shard")
+        print("     → 中途被杀会让「跑完的 worker 先落盘、没跑完的没有」✗")
+        print("       所以批次**不是**「全有或全无」，必须按数量判定完整性")
     print(f"  shard 文件      {total_files}")
     print(f"  **不同内容**    {uniq_files}" + ("   ← 有重复 ✗" if dup_groups else " ✓"))
     print(f"  决策条数（去重）{total_rows:,}")
@@ -115,7 +142,10 @@ def main(argv: list[str] | None = None) -> None:
         print("  → 常见原因：**每批只换了 --tag、没换 --seed**（seed 默认 0）✗")
         print("     正确用法：`--seed $((i * 1000003))`，每批递增")
         raise SystemExit(1)
-    print("  ✅ 没有重复")
+    if dropped:
+        print("  ✅ 内容没有重复（但有不完整批次已丢弃，见上）")
+        raise SystemExit(2)
+    print("  ✅ 没有重复，批次完整")
 
 
 if __name__ == "__main__":
