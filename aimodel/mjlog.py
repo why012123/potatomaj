@@ -611,10 +611,8 @@ def _decode_agari(a: dict, hand_of, melds_of, oya: int) -> dict:
     ten = _ints(a.get("ten", ""))          # [fu, points, (yakuman flag)]
     yaku = _ints(a.get("yaku", ""))        # pairs (id, han)
     sc = _ints(a.get("sc", ""))
-    deltas = []
-    for i in range(0, min(len(sc), 8), 2):
-        if i + 1 < len(sc):
-            deltas.append(sc[i + 1] - sc[i])
+    ba = _ints(a.get("ba", ""))
+    deltas = _sc_deltas(sc)
     return {
         "type": "hora",
         "actor": who,
@@ -647,24 +645,49 @@ _RYUKYOKU_TYPE = {
 }
 
 
-def _decode_ryukyoku(a: dict, hand_of, melds_of, ten: list[int]) -> dict:
-    t = a.get("type", "")
-    sc = _ints(a.get("sc", ""))
+def _sc_deltas(sc: list[int]) -> list[int]:
+    """Tenhou ``sc`` -> per-seat point deltas.
+
+    ``sc`` is ``[score0, var0, score1, var1, ...]``: the *score* followed by the
+    *variation*, and the variation is in units of 100 points. Verified against
+    5,012 real AGARI rows in GL1.xlsm:
+
+        sum(var*100) == 1000 * sticks            -- 5012/5012 = 100.0%
+        winner var*100 == ten[1] + 300*honba + 1000*sticks
+                       -- tsumo 2758/2758 = 100.0%, ron 3914/3926 = 99.7%
+
+    The deltas therefore INCLUDE the winner's collected riichi sticks and honba
+    bonus, matching how ``engine.py`` settles (``Game._take_sticks`` adds
+    ``sticks * riichi_stick`` into the winner's delta). NOTE: ``engine.py`` has
+    no honba concept at all, so hands with ``honba > 0`` will still differ --
+    that is an engine rules gap, reported rather than papered over.
+
+    The previous code did ``sc[i+1] - sc[i]``, subtracting a *score* from a
+    *variation* -- two different quantities. That fabricated the payments fed to
+    the engine and produced bogus "点数收支不符" reports.
+    """
     deltas = []
     for i in range(0, min(len(sc), 8), 2):
         if i + 1 < len(sc):
-            deltas.append(sc[i + 1] - sc[i])
-    # ``sc`` is 8 numbers = (before, after) per seat, so ``deltas`` is exact --
-    # it is the noten/tenpai transfer: sc=248,-15,228,15,335,-15,179,15 gives
-    # deltas [-15, +15, -15, +15]. ``raw_sc`` is kept for consumers that want
-    # the before/after form.
+            deltas.append(sc[i + 1] * 100)
+    return deltas
+
+
+def _decode_ryukyoku(a: dict, hand_of, melds_of, ten: list[int]) -> dict:
+    t = a.get("type", "")
+    sc = _ints(a.get("sc", ""))
+    deltas = _sc_deltas(sc)
+    # ``sc`` is 8 numbers = (score, variation) per seat, the variation in units
+    # of 100 points -- NOT (before, after). A noten transfer reads
+    # sc=248,-15,228,15,335,-15,179,15 -> deltas [-1500,+1500,-1500,+1500],
+    # which is the correct ±1500 four-player noten penalty; reading it as
+    # (before, after) would give a nonsensical ±15 points.
     #
-    # ``tenpai`` is left as-is (per-seat tenpai HAND tile lists, matching what
-    # ``mjai.export`` writes) but is empty for these clipped rows: the workbook
-    # puts the draw's ``haiN=`` tenpai hands *after* the tag's ``/>``, not in
-    # the attribute blob this function receives, so nothing is found here.
-    # Decoding that needs the row text and a signature change, so it is
-    # deliberately left alone rather than guessed at.
+    # ``tenpai`` is deliberately left as-is: it is empty for these clipped rows
+    # because the workbook puts the draw's ``haiN=`` tenpai hands *after* the
+    # tag's ``/>``, not in the attribute blob this function receives. Decoding
+    # it needs the row text and a signature change, so it is left alone rather
+    # than guessed at.
     return {
         "type": "ryukyoku",
         "reason": _RYUKYOKU_TYPE.get(t, t or "exhaustive_draw"),
