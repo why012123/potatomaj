@@ -191,6 +191,13 @@ def _kokushi_shanten(counts: Sequence[int]) -> int:
 # 对外接口
 # ---------------------------------------------------------------------------
 
+#: ``(counts 的 tuple, n_melds) -> shanten`` 的记忆化表。
+#: 进张计算会对同一手牌反复问「摸到 X 之后的向听」，而每次
+#: ``_tables()`` 都要重建 4 个花色 tuple + 3 次 combine —— 实测这是
+#: ``action_features`` 里最贵的一块。键是精确输入，所以不会串味。
+_SHANTEN_MEMO: dict[tuple[tuple[int, ...], int], int] = {}
+_SHANTEN_MEMO_MAX = 200_000
+
 
 def shanten(counts: Sequence[int], n_melds: int = 0) -> int:
     """普通形 / 七对子 / 国士 取最优的向听数。
@@ -202,7 +209,17 @@ def shanten(counts: Sequence[int], n_melds: int = 0) -> int:
     这里不真的枚举弃牌，而是直接算块分解：多余的牌本来就可以被丢掉，所以
     「14 张」和「13 张取最优」是同一个式子（在 3000 手随机 14 张牌上验证过）。
     七对子 / 国士只在门清（``n_melds == 0``）时才算。
+
+    **结果按 ``(counts, n_melds)`` 记忆化**（见 ``_SHANTEN_MEMO``）：
+    进张计算会对同一手牌算几十次「摸一张之后的向听」，其中
+    ``_tables()`` 每次都要重建 4 个花色 tuple 再做 3 次 combine，
+    实测占掉 ``action_features`` 的绝大部分时间。
     """
+    key = (tuple(counts), n_melds)
+    hit = _SHANTEN_MEMO.get(key)
+    if hit is not None:
+        return hit
+
     t = _tables(counts)
     best = _best_from_states(
         _combine_cached(_combine_cached(t[0], t[1]), _combine_cached(t[2], t[3])), n_melds
@@ -214,6 +231,12 @@ def shanten(counts: Sequence[int], n_melds: int = 0) -> int:
         v = _kokushi_shanten(counts)
         if v < best:
             best = v
+
+    if len(_SHANTEN_MEMO) >= _SHANTEN_MEMO_MAX:
+        # 简单粗暴的容量控制：满了就整体清空。训练里手牌形状高度重复，
+        # 清空一次很快就能重新填满，比引入 LRU 便宜也更好懂。
+        _SHANTEN_MEMO.clear()
+    _SHANTEN_MEMO[key] = best
     return best
 
 
@@ -239,9 +262,16 @@ def is_tenpai(counts: Sequence[int], n_melds: int = 0) -> bool:
     return shanten(counts, n_melds) == 0
 
 
-def useful_tiles(counts: Sequence[int], n_melds: int = 0, sanma: bool = True) -> list[int]:
-    """摸到之后能让向听数变小的牌型（进张）。"""
-    base = shanten(counts, n_melds)
+def useful_tiles(
+    counts: Sequence[int], n_melds: int = 0, sanma: bool = True, base: int | None = None
+) -> list[int]:
+    """摸到之后能让向听数变小的牌型（进张）。
+
+    ``base`` 是这手牌**已经算好的**向听数；调用方（``action_features``
+    会对每个候选弃牌各调一次）手上本来就有它，传进来可以省一次 ``shanten()``。
+    """
+    if base is None:
+        base = shanten(counts, n_melds)
     if base < 0:
         return []
     types = SANMA_TYPES if sanma else range(N_TYPES)
@@ -263,10 +293,11 @@ def ukeire(
     visible: Sequence[int] | None = None,
     n_melds: int = 0,
     sanma: bool = True,
+    base: int | None = None,
 ) -> dict[int, int]:
     """进张 -> 剩余枚数。``visible`` 是场上已见到的牌（含自己手牌）。"""
     out: dict[int, int] = {}
-    for t in useful_tiles(counts, n_melds, sanma=sanma):
+    for t in useful_tiles(counts, n_melds, sanma=sanma, base=base):
         seen = visible[t] if visible is not None else counts[t]
         left = 4 - seen
         if left > 0:
@@ -279,9 +310,10 @@ def ukeire_count(
     visible: Sequence[int] | None = None,
     n_melds: int = 0,
     sanma: bool = True,
+    base: int | None = None,
 ) -> int:
     """进张总枚数（手牌效率的常用指标）。"""
-    return sum(ukeire(counts, visible, n_melds, sanma).values())
+    return sum(ukeire(counts, visible, n_melds, sanma, base=base).values())
 
 
 def waits(counts: Sequence[int], n_melds: int = 0, sanma: bool = True) -> list[int]:

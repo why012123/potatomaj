@@ -275,8 +275,10 @@ def action_features(view: View) -> np.ndarray:
         s = shanten(rest, n_melds)
         af[t, o["shanten_after"]] = min(max(s, 0), 6) / 6.0
         af[t, o["is_win_after"]] = 1.0 if s == 0 else 0.0
+        # 把已经算好的 s 作为 base 传进去，省掉 useful_tiles 里的重复 shanten。
+        # 数值与「不传 base」完全一致（test_fastshanten 有等价性断言）。
         af[t, o["ukeire_after"]] = (
-            min(ukeire_count(rest, vis, n_melds, sanma=sanma), 40) / 40.0
+            min(ukeire_count(rest, vis, n_melds, sanma=sanma, base=s), 40) / 40.0
         )
         d = tile_danger(view, t, opp_riichi, vis)
         af[t, o["danger"]] = d
