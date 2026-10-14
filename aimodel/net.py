@@ -57,6 +57,12 @@ class Net:
         self.lr = lr
         self.l2 = l2
         self.kinds = list(KINDS)
+        #: 加载时因「旧权重缺这个头」被零初始化补上的决策种类。
+        #: MLAgent 见到它们会走启发式兜底，保证老模型行为不变。
+        self.untrained_heads: set[str] = set()
+        #: ``untrained_heads`` 的别名 —— 平台侧请求里用的名字是这个。
+        #: 语义完全相同：**这些决策必须交给兜底策略，不要让零初始化的头参与**。
+        self.missing_heads: tuple[str, ...] = ()
         #: 逐头熵系数（P1-1）。默认值在第一次 step(ent_coef_adapt=True) 时播种。
         self._ent_coef: dict[str, float] = {}
         #: KL 锚定的参考策略（P1-2）：**不参与求导**的冻结副本。
@@ -429,7 +435,26 @@ class Net:
         np.savez_compressed(path, **arrays)
 
     @classmethod
-    def load(cls, path: str | Path) -> "Net":
+    def load(cls, path: str | Path, *, strict: bool = False) -> "Net":
+        """加载权重。
+
+        ``strict=True``：缺决策头时**直接抛 ValueError** ✗
+            给「我要确保这个权重和我现在的代码完全配套」的调用方用
+            （比如训练脚本加载自己的检查点做续训 ✓）。
+        ``strict=False``（默认）：缺的头**零初始化 + 警告 + 记进
+            :attr:`untrained_heads`**，相关决策交给兜底策略 ✓
+
+        ⚠️ **为什么默认是 False 而不是 True**：
+        全项目有 21 处调用会加载**存量权重**（天梯 / 网页平台 / 对拍 / 权重自检…）✓
+        默认 True 的话，「给网络加一个决策头」会让它们**全部当场失效** ✗
+        —— 实测踩过一次：44 个权重全部加载失败，天梯、Java 牌桌、
+        网页平台一起瘫 ✗
+
+        而且**训练侧其实不需要默认 True**：它加载的是自己刚存的检查点，
+        存的时候就带着当前的 `KINDS` ✓ 永远不会有缺头 ✓
+        真想要「配套性断言」的调用方，显式传 `strict=True` 即可 ✓
+        """
+
         data = np.load(path, allow_pickle=False)
         meta = json.loads(bytes(data["_meta"]).decode())
         saved_action = int(meta.get("action_dim", -1))
@@ -439,17 +464,36 @@ class Net:
                 f"当前代码是 {ACTION_DIM} 维）。改了特征就必须重新训练 —— "
                 f"用 `python -m aimodel.train bc` 重跑一遍。"
             )
-        # 旧权重缺新头：必须显式报错并说清是哪个头，否则那些头会是随机权重，
-        # 模型会「永远学不会吃」还看不出来。
+        # 旧权重缺新头（例如后来加的 chi）。
+        #
+        # ⚠️ 这里**不能直接抛错** —— 一抛错，加一个头就让**全部** 44 个存量权重
+        # 加载失败，天梯 / Java 牌桌 / 网页平台一起瘫（踩过一次）。
+        #
+        # 正确做法：**零初始化补上，并记进 `untrained_heads`**：
+        #   · 零权重的头输出恒为 0，对已有头的输出**没有任何影响**；
+        #   · `MLAgent` 见到 untrained 的头会走**启发式兜底** ——
+        #     于是老模型的行为和加头之前**逐比特一致**（三麻根本走不到 chi；
+        #     四麻继续用兜底规则吃牌，跟以前一样）；
+        #   · 重训之后的权重里有这个头，就不再是 untrained，正常使用。
         saved_kinds = list(meta.get("kinds", ()))
         added = [k for k in KINDS if k not in saved_kinds]
-        if added:
+        if added and strict:
             why = "；".join(f"{k}: {_NEW_HEADS[k]}" for k in added if k in _NEW_HEADS)
             raise ValueError(
                 f"{path}: 旧权重里没有这些决策头：{added}"
                 + (f"（{why}）" if why else "")
-                + "。加头会让参数量变化，旧权重不兼容 —— "
-                "用 `python -m aimodel.train bc` 重新训练。"
+                + "。strict=True 下不允许缺头 —— 要么用 `train bc` 重训，"
+                "要么调用时改用 strict=False（缺的头会零初始化并走兜底策略）。"
+            )
+        if added:
+            why = "；".join(f"{k}: {_NEW_HEADS[k]}" for k in added if k in _NEW_HEADS)
+            import warnings
+            warnings.warn(
+                f"{path}: 旧权重里没有这些决策头：{added}"
+                + (f"（{why}）" if why else "")
+                + "。已零初始化并标记为「未训练」，这些决策会走启发式兜底；"
+                "想让模型自己学这些决策，用 `python -m aimodel.train bc` 重训。",
+                stacklevel=2,
             )
         net = cls(
             meta["dim"],
@@ -463,6 +507,8 @@ class Net:
         # 如果这里沿用原来的步数，前几步会变成 m/(1-0.9^t) ≈ m、v/(1-0.999^t) ≈ v，
         # 相当于把学习率放大 3 倍多 —— 一脚就能把行为克隆学的牌效踹散。
         net.total_steps = int(meta.get("steps", 0))
+        net.untrained_heads = set(added)
+        net.missing_heads = tuple(added)
         net.steps = 0
         missing = []
         for name, p in net.params():
@@ -470,6 +516,12 @@ class Net:
                 p[...] = data[name]
             else:
                 missing.append(name)
+        # 补上的新头必须**显式清零** —— 留着随机初始化的话，万一哪天被走到，
+        # 输出就是噪声（这正是当初写那句报错要防的事）。
+        for k in added:
+            if k in net.Wp:
+                net.Wp[k][...] = 0.0
+                net.bp[k][...] = 0.0
         if missing:
             # 多半是「旧结构 + 新代码」：特征维度或动作塔变了。
             # 这时候缺的那部分会是随机权重，打出来的牌没有意义，必须明说。

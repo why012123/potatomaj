@@ -151,4 +151,75 @@ def existing() -> list[ModelSpec]:
     return [s for s in all_specs() if s.path.exists()]
 
 
-__all__ = ["ModelSpec", "MODELS", "STYLE_CN", "get", "resolve", "all_specs", "existing"]
+def audit_weights(verbose: bool = True) -> dict:
+    """**启动自检**：把所有权重试加载一遍，失败的明确列出来。
+
+    为什么要有这个：给网络加一个决策头（比如 chi）会让**全部存量权重**一次性
+    加载失败。如果没有自检，症状是「玩家点了『选 AI 对战』才发现某个模型瘫了」
+    —— 而那时候已经很难定位了（踩过一次：44 个权重全挂）。
+
+    用法::
+
+        python -m aimodel.variants --audit        # 命令行
+        from aimodel.variants import audit_weights
+        audit_weights()                           # 服务启动时调用
+
+    返回 ``{"ok": [...], "failed": {名字: 错误}, "untrained": {名字: [缺的头]}}``
+    """
+    from .net import Net
+
+    ok: list[str] = []
+    failed: dict[str, str] = {}
+    untrained: dict[str, list[str]] = {}
+    import warnings as _w
+
+    for spec in all_specs():
+        if not spec.path.exists():
+            continue
+        try:
+            # 缺头警告由本函数自己汇总，别让 44 条一样的警告淹掉输出
+            with _w.catch_warnings():
+                _w.simplefilter("ignore", UserWarning)
+                net = Net.load(spec.path)
+        except Exception as e:                      # noqa: BLE001
+            failed[spec.name] = f"{type(e).__name__}: {e}"
+            continue
+        ok.append(spec.name)
+        miss = sorted(getattr(net, "untrained_heads", ()) or ())
+        if miss:
+            untrained[spec.name] = miss
+    if verbose:
+        print(f"权重自检：{len(ok)} 个正常"
+              + (f"，{len(failed)} 个**加载失败**" if failed else "，0 个失败"))
+        for name, err in failed.items():
+            print(f"  ❌ {name}: {err}")
+        if untrained:
+            heads = sorted({h for v in untrained.values() for h in v})
+            print(f"  ⚠️ {len(untrained)} 个权重缺决策头 {heads}"
+                  "（已零初始化，这些决策走启发式兜底；想让它自己学就重训）")
+            for name in list(untrained)[:4]:
+                print(f"      {name}: {untrained[name]}")
+    return {"ok": ok, "failed": failed, "untrained": untrained}
+
+
+__all__ = [
+    "audit_weights","ModelSpec", "MODELS", "STYLE_CN", "get", "resolve", "all_specs", "existing"]
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="模型注册表 / 权重自检")
+    ap.add_argument("--audit", action="store_true", help="把所有权重试加载一遍")
+    ap.add_argument("--list", action="store_true", help="列出全部模型")
+    args = ap.parse_args(argv)
+    if args.audit:
+        r = audit_weights()
+        raise SystemExit(1 if r["failed"] else 0)
+    for spec in all_specs():
+        mark = "✅" if spec.path.exists() else "—"
+        print(f"  {mark} {spec.name:<22} {spec.players}麻  {spec.cn}")
+
+
+if __name__ == "__main__":
+    main()
