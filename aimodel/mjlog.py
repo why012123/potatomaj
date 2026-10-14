@@ -326,7 +326,11 @@ def parse_row(row: str) -> list[dict]:
 
         if tag == "DORA":
             dora_count += 1
-            events.append({"type": "dora", "dora_markers": [_tile_name(t2p(a["hai"]))]})
+            # mjai.export writes {"type": "dora", "dora_marker": <tile>} (singular
+            # string) and logcheck.kyoku_to_wall reads e["dora_marker"], so match
+            # that exactly. a["hai"] is a raw Tenhou id string, so convert first.
+            events.append({"type": "dora",
+                           "dora_marker": _tile_name(t2p(int(a["hai"])))})
             continue
 
         if tag == "AGARI":
