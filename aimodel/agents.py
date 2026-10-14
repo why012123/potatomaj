@@ -172,6 +172,7 @@ class HeuristicAgent(Agent):
         declare_riichi: bool | None = None,
         call_pon: bool = True,
         take_kita: bool | None = None,
+        tie_break_eps: float = 0.0,
     ) -> None:
         self.rng = random.Random(seed)
         self.style = STYLES[style] if isinstance(style, str) else style
@@ -181,6 +182,11 @@ class HeuristicAgent(Agent):
         )
         self.call_pon = call_pon
         self.take_kita = self.style.kita if take_kita is None else take_kita
+        #: 近似等价候选的 tie-break 随机化窗口（P1-1）。
+        #: 0.0 = 关（默认，保持教师确定性，避免搅动对拍基线）。
+        #: 设成比如 1.0 就表示「分数差在 1.0 以内视为等价，随机挑一个」。
+        #: **注意**：`self.rng` 以前从建好就没被用过，这里才真正用上它。
+        self.tie_break_eps = float(tie_break_eps)
         self._vis_cache: tuple | None = None
 
     # -- 工具 ---------------------------------------------------------------
@@ -281,12 +287,13 @@ class HeuristicAgent(Agent):
 
         # 第二遍：只给「并列最优向听」的候选算进张（贵），其余直接淘汰。
         # 弃和时反过来：先看危险度，再看向听。
-        best_i, best_score = cand[0][0], -1e18
+        scored: list[tuple[int, float]] = []
         for i, t, rest, s in cand:
             if folding:
                 score = -self._danger(view, t, opp_riichi) * 1_000_000 - s * 1_000
                 if s == best_s:
                     score += ukeire_count(rest, vis, n_melds, sanma=sanma)
+                scored.append((i, score))
             else:
                 if s > best_s:
                     continue
@@ -303,9 +310,19 @@ class HeuristicAgent(Agent):
                         * self.style.pressure_scale
                     )
                     score -= self._danger(view, t, opp_riichi) * weight
-            if score > best_score:
-                best_i, best_score = i, score
-        return best_i
+                scored.append((i, score))
+
+        if not scored:
+            return cand[0][0]
+        best_score = max(sc for _, sc in scored)
+        # tie-break 随机化（P1-1）：两个候选**向听、进张都一样**时，
+        # 老代码取第一个 -> 教师是确定性的 -> BC 学出「一个确定性策略的三份镜像」。
+        # 默认关（tie_break_eps=0.0）以免搅动别人的对拍基线。
+        if self.tie_break_eps > 0.0:
+            top = [i for i, sc in scored if sc >= best_score - self.tie_break_eps]
+            if len(top) > 1:
+                return int(self.rng.choice(top))
+        return max(scored, key=lambda x: x[1])[0]
 
     def _want_riichi(self, view: View) -> bool:
         n_melds = view.meld_count()

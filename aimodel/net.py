@@ -57,6 +57,8 @@ class Net:
         self.lr = lr
         self.l2 = l2
         self.kinds = list(KINDS)
+        #: 逐头熵系数（P1-1）。默认值在第一次 step(ent_coef_adapt=True) 时播种。
+        self._ent_coef: dict[str, float] = {}
 
         sizes = [dim, *self.hidden]
         self.W: list[np.ndarray] = []
@@ -183,8 +185,26 @@ class Net:
         clip: float = 0.2,
         ent_coef: float = 0.01,
         vf_coef: float = 0.5,
+        ent_target: dict[str, float] | None = None,
+        ent_coef_adapt: bool = False,
+        ent_adapt_rate: float = 0.25,
+        label_smoothing: float = 0.0,
     ) -> dict:
-        """一次 minibatch 更新。``batch`` 由 :mod:`aimodel.train` 组装。"""
+        """一次 minibatch 更新。``batch`` 由 :mod:`aimodel.train` 组装。
+
+        ``ent_target`` / ``ent_coef_adapt``（P1-1）：**分头**自适应熵系数。
+        实测打牌头熵 H=0.291（上限 2.27）、argmax 与采样 87.7% 重合 ——
+        探索已经塌了，而全局 ent_coef 从 0.01 降到 0.002 之后梯度贡献 <1%。
+
+        做法：每个决策头有自己的熵系数 ``self._ent_coef[k]``，按
+        「实际熵 vs 目标熵」做比例反馈：
+
+            coef_k *= exp(rate * (target_k - H_k) / target_k)
+
+        熵低于目标就**调大** coef（逼它多探索），高于目标就调小。
+        二分类头（立直/和了）目标熵天然低，所以**必须分头设目标** ——
+        用一个全局系数会把这些头推坏。
+        """
         X = batch["X"]
         mask = batch["mask"]
         act = batch["action"]
@@ -205,6 +225,8 @@ class Net:
         ent_sum = 0.0
         clip_frac = 0.0
         n_kind = 0
+        #: 逐头熵（P1-1）：把 8 个头的熵分开记，否则看不出是哪个头塌了
+        ent_by_kind: dict[str, float] = {}
 
         for k in self.kinds:
             idx = np.nonzero(kinds == k)[0]
@@ -240,9 +262,34 @@ class Net:
             # 注意符号：dL/dz = coef * (onehot - p)，写反了就会「越训越差」
             dz = -coef[:, None] * p
             dz[np.arange(len(idx)), a] += coef
-            if ent_coef:
-                dz += ent_coef * p * (np.log(np.maximum(p, 1e-12)) + ent[:, None])
-            dz /= n
+            # 软标签 / label smoothing（P1-1）。硬交叉熵 + 确定性教师
+            # = 学出「一个确定性策略的三份镜像」，打牌头熵实测只有 0.291。
+            #
+            # 目标换成 (1-eps)*onehot + eps*(1/K)（K = 该头合法动作数）之后：
+            #   损失 = (1-eps)*CE + eps*mean(log K)
+            # 第二项与参数**无关**（常数），所以精确梯度就是原来的
+            #   dL/dz = coef*(p - onehot)  乘上 (1-eps)
+            #
+            # 别画蛇添足：`-(eps/K)*coef*(1 - K*p)` 看着像均匀项，但它对每行
+            # 求和恒等于 0（softmax 行和对 z 的导数为 0），加上去是错的。
+            keep = 1.0
+            if mode == "bc" and label_smoothing > 0.0:
+                keep = 1.0 - float(min(max(label_smoothing, 0.0), 0.999))
+            # 分头熵系数（P1-1）：每个头有自己的系数，别用一个全局值
+            k_coef = self._ent_coef.get(k, ent_coef) if ent_coef_adapt else ent_coef
+            if k_coef:
+                dz += k_coef * p * (np.log(np.maximum(p, 1e-12)) + ent[:, None])
+            dz = dz * keep / n
+
+            h_k = float(np.mean(ent))
+            ent_by_kind[k] = h_k
+            # 比例反馈：熵低于目标 -> 调大系数（逼它探索），高于目标 -> 调小
+            if ent_coef_adapt and ent_target and k in ent_target and ent_target[k] > 0:
+                ratio = (ent_target[k] - h_k) / ent_target[k]
+                new_c = self._ent_coef.get(k, ent_coef) * float(
+                    np.exp(np.clip(ent_adapt_rate * ratio, -0.5, 0.5))
+                )
+                self._ent_coef[k] = float(np.clip(new_c, 1e-4, 1.0))
 
             grads[f"Wp_{k}"] = feat[idx].T @ dz + self.l2 * self.Wp[k]
             grads[f"bp_{k}"] = dz.sum(axis=0)
@@ -256,7 +303,7 @@ class Net:
                 grads["ba1"] = dz1.sum(axis=(0, 1))
 
             pol_loss += float(-np.mean(np.where(use_un, unclipped, clipped)))
-            ent_sum += float(np.mean(ent))
+            ent_sum += h_k
             clip_frac += float(np.mean(~use_un))
 
         v = np.tanh(feat @ self.Wv + self.bv)[:, 0]
@@ -282,7 +329,9 @@ class Net:
         return {
             "policy_loss": pol_loss / nk,
             "value_loss": value_loss,
+            # 整体熵保留（向后兼容），但**逐头熵**才是能看出「哪个头塌了」的东西
             "entropy": ent_sum / nk,
+            "entropy_by_kind": ent_by_kind,
             "clip_frac": clip_frac / nk,
         }
 

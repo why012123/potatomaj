@@ -37,6 +37,24 @@ from .net import Net
 
 WEIGHTS_DIR = Path(__file__).resolve().parent / "weights"
 
+#: 各决策头的**目标熵**（P1-1）。必须分头设 —— 打牌头有 34 个动作、上限 log34≈3.53，
+#: 而二分类头上限只有 log2≈0.693。用一个全局系数会把立直/和了这些头推坏。
+#:
+#: 取值思路：**二分类头保持低熵**（它们本来就该果断：能和就和、能立就立），
+#: 多分类头给足探索空间（打牌头是策略的主体，也是实测塌得最狠的那个：
+#: H=0.291 / 上限 2.27，argmax 与采样 87.7% 重合）。
+ENT_TARGETS: dict[str, float] = {
+    "discard": 1.2,    # 上限 ln34≈3.53 —— 给足探索，别让它变成确定性策略
+    "call": 0.55,      # 上限 ln3≈1.10
+    "chi": 0.35,       # 上限 ln2≈0.69
+    "tsumo": 0.06,     # 上限 ln2 —— 能和就和，几乎不该探索
+    "ron": 0.06,
+    "riichi": 0.25,    # 立不立直可以有探索
+    "kita": 0.15,
+    "kan": 0.10,
+    "kyuushu": 0.05,
+}
+
 #: 默认模型（不指定 --model 时用它）
 DEFAULT_MODEL = "maj-normal"
 
@@ -125,6 +143,7 @@ def train_bc(
     verbose: bool = True,
     holdout: dict | None = None,
     patience: int = 3,
+    label_smoothing: float = 0.05,
 ) -> tuple[list[dict], Net, dict]:
     """行为克隆。返回 ``(hist, best_net, best_info)``。
 
@@ -167,6 +186,7 @@ def train_bc(
                 clip=0.0,
                 ent_coef=0.001,
                 vf_coef=0.5,
+                label_smoothing=label_smoothing,
             )
             for k in tot:
                 tot[k] += st[k]
@@ -324,6 +344,7 @@ def train_rl(
     ent_coef: float = 0.008,
     vf_coef: float = 0.5,
     verbose: bool = True,
+    ent_coef_adapt: bool = False,
 ) -> list[dict]:
     rng = np.random.default_rng(seed)
     data = dict(data)
@@ -333,6 +354,8 @@ def train_rl(
     for ep in range(epochs):
         idx = rng.permutation(n)
         tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0, "clip_frac": 0.0}
+        ent_by_kind: dict[str, float] = {}
+        ent_n: dict[str, int] = {}
         nb = 0
         for s in range(0, n, batch_size):
             sel = idx[s : s + batch_size]
@@ -353,12 +376,21 @@ def train_rl(
                 clip=clip,
                 ent_coef=ent_coef,
                 vf_coef=vf_coef,
+                ent_target=ENT_TARGETS,
+                ent_coef_adapt=ent_coef_adapt,
             )
             for k in tot:
                 tot[k] += st[k]
+            for k, hv in st.get("entropy_by_kind", {}).items():
+                ent_by_kind[k] = ent_by_kind.get(k, 0.0) + hv
+                ent_n[k] = ent_n.get(k, 0) + 1
             nb += 1
         row = {k: v / max(1, nb) for k, v in tot.items()}
         row["epoch"] = ep + 1
+        row["entropy_by_kind"] = {
+            k: ent_by_kind[k] / max(1, ent_n[k]) for k in ent_by_kind
+        }
+        row["ent_coef_by_kind"] = dict(net._ent_coef)
         hist.append(row)
     if verbose and hist:
         h = hist[-1]
@@ -366,7 +398,42 @@ def train_rl(
             f"    PPO  policy_loss={h['policy_loss']:+.4f}  entropy={h['entropy']:.3f}"
             f"  clip={h['clip_frac']:.1%}  value_loss={h['value_loss']:.4f}"
         )
+        print_entropy_by_kind(h)
     return hist
+
+
+def print_entropy_by_kind(row: dict) -> None:
+    """**逐头**打印熵，并标出离目标最远的头（P1-1）。
+
+    老代码把 8 个头的熵**平均成一个数**（``net.py`` 原 :284），
+    所以「打牌头塌到 H=0.291」这种信息会被其他头摊平、根本看不出来。
+    这里逐头列出：实际熵 / 目标熵 / 该头的自适应系数。
+    """
+    by_kind = row.get("entropy_by_kind") or {}
+    if not by_kind:
+        return
+    coefs = row.get("ent_coef_by_kind") or {}
+    parts = []
+    worst, worst_gap = None, -1.0
+    for k in sorted(by_kind):
+        h = by_kind[k]
+        tgt = ENT_TARGETS.get(k)
+        if tgt:
+            gap = (tgt - h) / tgt      # >0 表示熵偏低（探索不足）
+            if gap > worst_gap:
+                worst, worst_gap = k, gap
+            parts.append(f"{k}={h:.2f}/{tgt:.2f}")
+        else:
+            parts.append(f"{k}={h:.2f}")
+    print("    逐头熵（实际/目标）: " + "  ".join(parts))
+    if coefs:
+        print("    逐头熵系数: " + "  ".join(
+            f"{k}={coefs[k]:.4f}" for k in sorted(coefs)
+        ))
+    if worst is not None and worst_gap > 0.3:
+        print(f"    ⚠️ 探索最不足的是 **{worst}**"
+              f"（{by_kind[worst]:.2f} vs 目标 {ENT_TARGETS[worst]:.2f}"
+              f"，差 {worst_gap:.0%}）—— 这个头在向确定性塌缩")
 
 
 # ---------------------------------------------------------------------------
