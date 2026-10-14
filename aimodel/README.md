@@ -222,12 +222,56 @@ rsync -av 服务器:~/potatomaj/aimodel/weights/*.npz ./aimodel/weights/
 | 16 核 / 32 GB | `--jobs 6`，`--hands 12000`，`--iters 30` |
 | 32 核 / 128 GB | `--jobs 8`（**别再往上加**：8 个模型就是 8 个任务，多了没意义），把 `--hands` 提到 20000 |
 
+### ⚠️ Windows / PowerShell 上的坑（都是实测踩出来的）
+
+**① 命令行传列表参数必须用 `=` 或引号** ✗
+
+```powershell
+python -m aimodel.train bc --hidden 512,512     # ❌ PowerShell 当数组 → python 收到 "512 512"
+python -m aimodel.train bc --hidden=512,512     # ✅
+python -m aimodel.train bc --hidden "512,512"   # ✅
+python -m aimodel.train bc --hidden 512-512     # ❌ 被当成 hashtable 字面量
+```
+
+**② `Start-Process` 不能把 stdout 和 stderr 重定向到同一个文件** ✗
+（PowerShell 5.1 直接报错）→ 用两个不同文件 ✓
+
+**③ 用 `cmd /c start /b ... 2> log` 脱离会话会失败** ✗
+`cmd` 会在 `2>` 的 `|` 上分词 → python 根本没启动 ✓
+改成 `2>&1` 又会被 `Start-Process` 吞掉嵌套引号 ✗
+
+**④ 停 selfplay 时别按 `*selfplay*` 匹配进程** ✗✗
+
+multiprocessing 的子进程命令行是
+`from multiprocessing.spawn import spawn_main; spawn_main(parent_pid=...)`
+—— **里面没有 "selfplay" 这个词** ✗ 按名字匹配一个都杀不到 ✓
+父进程死后这些子进程会被重挂，**继续吃内存、甚至把你删掉的目录重新写出来** ✗
+
+```powershell
+# 正确做法
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+  Where-Object { $_.CommandLine -like '*multiprocessing-fork*' -or
+                 $_.CommandLine -like '*multiprocessing.spawn*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+实测：杀掉 9 个孤儿后可用内存从 **6.8 GB 回到 21.9 GB** ✓
+
+**⑤ 不要同时开多份重活** ✗
+
+实测：selfplay 两批 + 一个训练基准同时跑 → **一批卡死 1 小时、0 个 shard 写出**
+（正常单批 13 分钟）、留下 **17 个僵尸进程** ✓
+**并行纪律：最多 2 个重活进程** ✓
+
 ### ⚠️ 并行数和 `--matches` 要一起看 —— 产数据的内存**随 matches 线性增长**
 
-| 场景 | 内存 | 上限 |
+| 场景 | 单进程实测 | 上限（**内存硬上限 16 GB**） |
 |---|---|---|
-| **训练**（克隆阶段样本常驻） | 四麻 15000 局时约 **5 GB/进程** | 32GB 机器 `--jobs 4` |
-| **selfplay 产数据** | **≈ workers × matches × 3 MB** | 见下 |
+| **训练**（577k 参数 + 约 96 万条样本 + 优化器） | 约 **5 GB** | **最多 2 个** ✓（3 个贴线 ⚠️，4 个超限 ✗） |
+| **selfplay worker** | 约 **1.8 GB** | **≤ 8 worker**（8×1.8 ≈ 14 GB）✓ |
+| selfplay（大批量） | **≈ workers × matches × 3 MB** | 见下 |
+
+> **16 GB 是用户指定的硬上限**（不是机器的 32 GB）—— 机器上还有网页平台等服务在跑 ✓
 
 **踩过两次，方向相反，都值得记**：
 
