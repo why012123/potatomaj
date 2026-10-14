@@ -60,6 +60,9 @@ class Net:
         #: 加载时因「旧权重缺这个头」被零初始化补上的决策种类。
         #: MLAgent 见到它们会走启发式兜底，保证老模型行为不变。
         self.untrained_heads: set[str] = set()
+        #: ``untrained_heads`` 的别名 —— 平台侧请求里用的名字是这个。
+        #: 语义完全相同：**这些决策必须交给兜底策略，不要让零初始化的头参与**。
+        self.missing_heads: tuple[str, ...] = ()
         #: 逐头熵系数（P1-1）。默认值在第一次 step(ent_coef_adapt=True) 时播种。
         self._ent_coef: dict[str, float] = {}
         #: KL 锚定的参考策略（P1-2）：**不参与求导**的冻结副本。
@@ -432,7 +435,26 @@ class Net:
         np.savez_compressed(path, **arrays)
 
     @classmethod
-    def load(cls, path: str | Path) -> "Net":
+    def load(cls, path: str | Path, *, strict: bool = False) -> "Net":
+        """加载权重。
+
+        ``strict=True``：缺决策头时**直接抛 ValueError** ✗
+            给「我要确保这个权重和我现在的代码完全配套」的调用方用
+            （比如训练脚本加载自己的检查点做续训 ✓）。
+        ``strict=False``（默认）：缺的头**零初始化 + 警告 + 记进
+            :attr:`untrained_heads`**，相关决策交给兜底策略 ✓
+
+        ⚠️ **为什么默认是 False 而不是 True**：
+        全项目有 21 处调用会加载**存量权重**（天梯 / 网页平台 / 对拍 / 权重自检…）✓
+        默认 True 的话，「给网络加一个决策头」会让它们**全部当场失效** ✗
+        —— 实测踩过一次：44 个权重全部加载失败，天梯、Java 牌桌、
+        网页平台一起瘫 ✗
+
+        而且**训练侧其实不需要默认 True**：它加载的是自己刚存的检查点，
+        存的时候就带着当前的 `KINDS` ✓ 永远不会有缺头 ✓
+        真想要「配套性断言」的调用方，显式传 `strict=True` 即可 ✓
+        """
+
         data = np.load(path, allow_pickle=False)
         meta = json.loads(bytes(data["_meta"]).decode())
         saved_action = int(meta.get("action_dim", -1))
@@ -455,6 +477,14 @@ class Net:
         #   · 重训之后的权重里有这个头，就不再是 untrained，正常使用。
         saved_kinds = list(meta.get("kinds", ()))
         added = [k for k in KINDS if k not in saved_kinds]
+        if added and strict:
+            why = "；".join(f"{k}: {_NEW_HEADS[k]}" for k in added if k in _NEW_HEADS)
+            raise ValueError(
+                f"{path}: 旧权重里没有这些决策头：{added}"
+                + (f"（{why}）" if why else "")
+                + "。strict=True 下不允许缺头 —— 要么用 `train bc` 重训，"
+                "要么调用时改用 strict=False（缺的头会零初始化并走兜底策略）。"
+            )
         if added:
             why = "；".join(f"{k}: {_NEW_HEADS[k]}" for k in added if k in _NEW_HEADS)
             import warnings
@@ -478,6 +508,7 @@ class Net:
         # 相当于把学习率放大 3 倍多 —— 一脚就能把行为克隆学的牌效踹散。
         net.total_steps = int(meta.get("steps", 0))
         net.untrained_heads = set(added)
+        net.missing_heads = tuple(added)
         net.steps = 0
         missing = []
         for name, p in net.params():
