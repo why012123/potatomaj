@@ -16,6 +16,23 @@
 #  输出为空 = 可以安全对齐；有任何一条 ⚠️ = 先抢救再对齐。
 # ═══════════════════════════════════════════════════════════
 set -uo pipefail
+
+# ⚠️ Windows 上 MinGit 不在 `sh` 的 PATH 里 ✗ → 脚本会在第一句就报
+#    `git: command not found`，看起来像「有风险」，其实是**工具链问题** ✓
+#    远端踩过这个：他跑了脚本、看到报错、以为有风险，改用人工核对 ✓
+#    所以这里先探测，并给一条能直接用的替代命令 ✓
+if ! command -v git >/dev/null 2>&1; then
+    echo "❌ 这个 shell 里找不到 git（Windows 上常见：MinGit 不在 sh 的 PATH 中）"
+    echo "   这**不是**仓库有风险，是工具链问题 ✓"
+    echo
+    echo "   替代做法（在 PowerShell 里跑这几条即可达到同样目的）："
+    echo "     git status --short                                  # 未提交的改动"
+    echo "     git diff --name-status HEAD origin/main | Select-String '^D'   # 你有而上游没有"
+    echo "     git ls-files --others --exclude-standard            # 未跟踪文件（最危险）"
+    echo "     git stash list                                      # stash"
+    exit 2
+fi
+
 UPSTREAM="${1:-origin/main}"
 DANGER=0
 
