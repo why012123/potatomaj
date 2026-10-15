@@ -247,7 +247,29 @@ input, select { font: inherit; }
 
 /* ------------------------------------------------------------- 牌桌 -- */
 
-.table { position: absolute; inset: 0; overflow: hidden; }
+/*
+ * 牌的落点**全部写死**，只有自家手牌会动。
+ *
+ * 用户的要求：牌河里第一张牌的位置钉死，后面的往右一张张加，一行 6 张；
+ * 副露钉在每家自己的右手边，第二组磊在第一组上方；画面里**只有手牌能动**。
+ *
+ * 之前的实现违反这一条：副露 / 牌河 / 整家的位置都是 JS 先量手牌跨度、
+ * 再算偏移（`--melds-lead` / `--pond-lead` / `--pond-gap`），手牌一张数变化
+ * 所有东西跟着跳 —— 看起来就是「牌一直在乱动」。现在这些量全部改成
+ * **跟手牌无关的固定值**。
+ */
+.table {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  /*
+   * 牌桌的**安全区**：手牌、副露、牌河、名牌都落在这个范围里。
+   * 右侧栏是盖在牌桌上的（`position: fixed`），所以右边要多留出侧栏的宽度，
+   * 否则下家（右侧那家）的手牌和牌河会被压住看不见。
+   */
+  --side-bar: clamp(240px, 17vw, 320px);
+  --safe-right: calc(var(--side-bar) + var(--tile-w) * 0.6);
+}
 
 .table__felt {
   position: absolute;
@@ -280,6 +302,20 @@ input, select { font: inherit; }
   top: 50%;
   transform: translate(-50%, -50%);
   z-index: 4;
+}
+
+/*
+ * 每家占的那条边：**座位盒子的水平范围是算死的** ——
+ * 左右各让开「安全区」（右侧栏 + 一个牌厚），而不是让盒子 `inset: 0`
+ * 再靠 JS 去挪。这是「牌不乱动」的地基：盒子位置固定了，
+ * 牌河里第一张牌、副露第一组才有一个稳定的参照物。
+ *
+ * 只用 `left` / `right` 两个属性（**不写 inset**）：上下方向各有各的
+ * 锚法（下家 bottom、上家 top、侧家 top:50%），交给 `.edge--*` 去定。
+ */
+.seat {
+  left: var(--safe-right);
+  right: var(--safe-right);
 }
 
 .centerbox {
@@ -448,15 +484,29 @@ input, select { font: inherit; }
   height: var(--edge-h, calc(var(--tile-h) + var(--hand-pad) * 2));
 }
 
-/* 下 / 上家也要带 translate：它们的 `--fix-x` / `--fix-y` 是 JS 写进去的
-   居中修正，**CSS 不读这两个变量，修正就等于白算**（踩过：下家和上家的手牌
-   一直贴在桌子左边，怎么调 JS 都没用）。 */
-.edge--bottom { left: 0; bottom: 0; transform: translate(var(--fix-x, 0px), var(--fix-y, 0px)); }
+/*
+ * 下 / 上家：盒子**横向钉在座位中间**（`left: 50%` + `translateX(-50%)`），
+ * 不再靠 JS 把 `--fix-x` 补到「手牌居中」上。
+ *
+ * 为什么必须这样（这是「牌一直在乱动」的最后一环）：`--edge-w` 现在是固定的
+ * （按最大手牌算），但如果盒子还是从 `left: 0` 起算、靠 JS 去补一个
+ * 「让手牌居中」的位移，那个位移量是**根据手牌跨度算的** —— 手牌一换张数，
+ * 整条边（连同牌河、副露）就横移十几像素。实测：手牌 16 张时 edgeX=562、
+ * 13 张时 edgeX=546，牌河跟着在 976 / 961 之间来回跳。
+ *
+ * 现在盒子位置只由「座位盒子宽度」决定（座位盒子由 `.seat` 的安全区定死），
+ * 手牌在盒子里自己居中（`--hand-center`）。**盒子和牌河全程不动，只有手牌动。**
+ */
+.edge--bottom {
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+}
 /* 顶家整体转 180°：`.edge__hand` 因此要贴自己的下边缘 —— 转过来才落到屏幕上方 */
 .edge--top {
-  left: 0;
+  left: 50%;
   top: 0;
-  transform: translate(var(--fix-x, 0px), var(--fix-y, 0px)) rotate(180deg);
+  transform: translateX(-50%) rotate(180deg);
 }
 
 /*
@@ -512,60 +562,78 @@ input, select { font: inherit; }
   top: auto;
   right: auto;
 }
-/* 副露：**钉在盒子右下角**，不再紧挨手牌。
-   原来它跟着手牌右端走，副露之后手牌变短、位置又居中，两者就会叠在一起
-   （用户报的「副露挡住手牌」）。钉到角上之后手牌永远是干净的。 */
-.edge--bottom .edge__melds { left: auto; right: var(--melds-lead, 0px); }
-/* 顶家整体转了 180°：局部 x 反过来，所以「右下角」在它那边是左 */
-.edge--top .edge__melds { left: var(--melds-lead, 0px); right: auto; }
-/* 侧家：手牌贴墙（局部 x = 0..牌厚），副露在局部 x = 牌厚.. 即朝桌心一侧 */
+/* 副露：**钉在每家自己的右手边**（下家 = 盒子右端、上家 = 局部左端，
+   因为顶家整体转了 180°）。
+   第一组贴着手牌那一侧，**后面的往上磊**（`column-reverse`：新的一组装在
+   上面），所以副露永远只往一个方向长，不会忽然跳位置。
+   位置是固定值，**跟手牌张数无关** —— 手牌怎么变，副露都不动。 */
+.edge--bottom .edge__melds {
+  left: auto;
+  right: var(--melds-lead, 0px);
+  bottom: var(--side-slack, 0px);
+  top: auto;
+  flex-direction: column-reverse;
+  align-items: flex-end;
+}
+/* 顶家整体转了 180°：局部 x 反过来，所以「右手边」在它那边是左 */
+.edge--top .edge__melds {
+  left: var(--melds-lead, 0px);
+  right: auto;
+  bottom: var(--side-slack, 0px);
+  top: auto;
+  flex-direction: column-reverse;
+  align-items: flex-start;
+}
+/* 侧家：手牌贴墙（局部 x = 0..牌厚），副露在局部 x = 牌厚.. 即朝桌心一侧；
+   同样往「第二个在上」的方向磊。 */
 .edge--side .edge__melds {
   left: var(--hand-thick, 0px);
   bottom: var(--side-slack, 0px);
-  flex-direction: column;
+  flex-direction: column-reverse;
   align-items: flex-start;
 }
 
-/* 牌河：每行 6 张、最多 3 行。
-   竖直方向的偏移是 table.ts 算好的像素值（`--pond-gap`）——
-   别在这里写 `calc(100% - var(--x))`：百分比和自定义属性混着写，在旋转过的
-   元素上会被静默算成 0（踩过，牌河直接贴到桌沿上）。 */
+/* 牌河：**第一张牌的位置钉死，后面的往右一张张加**，一行 6 张、最多 3 行
+   （第 6 张之后换行，行内继续往右）。
+   位置是固定 px，**跟手牌张数完全无关** —— 手牌怎么变，牌河都不动。
+   竖直方向的偏移用 JS 给的 px（`--pond-gap`）；别在这里写
+   `calc(100% - var(--x))`：百分比和自定义属性混着写，在旋转过的元素上会被
+   静默算成 0（踩过，牌河直接贴到桌沿上）。 */
 .edge__pond {
   position: absolute;
   display: grid;
-  grid-template-columns: repeat(6, auto);
+  /* 6 列 × 3 行的**固定格子**：格子先占好，牌一张张往里填。
+     这样第 1 张永远在左上角，第 7 张永远在第二行第一列 —— 不会因为
+     已打出的张数变化而整块重排。 */
+  grid-template-columns: repeat(6, var(--tw, var(--tile-w)));
+  grid-template-rows: repeat(3, calc(var(--tile-w) / 0.96));
   gap: calc(var(--tile-w) * 0.06);
   align-content: start;
   justify-content: start;
 }
-/* 下 / 上家：牌河**水平居中**（落在桌心一带），不再贴着右侧。
-   天凤 / 雀魂的四条牌河都是围着中央信息区摆的；贴右摆会看起来全挤在一边。
-   用 `left: 50%` + `translateX(-50%)` 做居中 —— 只在中性方向上用百分比，
-   位移量仍是 JS 给的 px（`--pond-gap`），不会碰上「百分比被算成 0」那个坑。 */
-.edge--bottom .edge__pond {
-  left: 50%;
-  right: auto;
-  transform: translateX(-50%);
-  bottom: var(--pond-gap, 0px);
-  top: auto;
-}
-/* 顶家整体转 180°：局部 x / y 都翻了过来，所以它的偏移要用「另一边」量
-   （`bottom`），否则牌河会跑到桌子外面去（`top` 会变成往上走）。 */
+/* 下 / 上家：牌河**钉在盒子中线上**（固定，不随手牌动）。
+   `left: 50%` 只用来取中点，位移量是 0 —— 没有 translate，
+   所以第一张牌的落点由盒子决定，盒子又由 `.seat` 的安全区决定。 */
+.edge--bottom .edge__pond,
 .edge--top .edge__pond {
   left: 50%;
   right: auto;
-  transform: translateX(-50%);
   bottom: var(--pond-gap, 0px);
   top: auto;
 }
-/* 侧家：牌河由「手牌靠桌心那一侧」往桌心叠，跨过副露那一条带子 ——
-   两个偏移都是 JS 算好的 px（见 table.ts 的 fitHandSpan）。 */
+/* 侧家：牌河由「手牌靠桌心那一侧」往桌心叠，跨过副露那一条带子。
+   两个偏移都是 JS 算好的 px（见 table.ts 的 fitHandSpan）。
+   ★ 格子和下 / 上家**不一样**：侧家整家转了 ±90°，所以「一行的 6 张」
+   在本地的坐标系里是**一列的 6 张** —— 本地 2 列 × 6 行，转过来正好是
+   屏幕上的 2 行 × 6 列（用户指出的那一点：左右两家的「行」是我们视图的「列」）。
+   用 6 列的话，转过来会变成 6 行竖着排下来，一条长蛇。 */
 .edge--side .edge__pond {
   left: var(--pond-lead, 0px);
   right: auto;
   bottom: var(--pond-gap, 0px);
   top: auto;
-  grid-template-columns: repeat(3, auto);
+  grid-template-columns: repeat(2, var(--tw, var(--tile-w)));
+  grid-template-rows: repeat(6, calc(var(--tile-w) / 0.96));
 }
 
 /* ------------------------------------------------------------- 名牌 -- */
@@ -738,19 +806,37 @@ input, select { font: inherit; }
 
 /* --------------------------------------------------------- 结算面板 -- */
 
+/*
+ * 结算 / 结果弹窗。
+ *
+ * 用户的要求：**可隐藏、不能挡住右边的手牌和牌河**。所以：
+ *   - 遮罩不再是「整屏压黑」，改成**只把中央一块压暗**（四周透明），
+ *     下家（右侧那家）的手牌和牌河都还看得见；
+ *   - 面板本身有「×」（`panel__x`）和「收起」两条路，esc 也能关；
+ *   - 面板宽度收到 720px，靠中央信息区那一带，不铺满整屏。
+ * `pointer-events: none` 在遮罩上：点空白处穿到牌桌上，不误挡操作。
+ */
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(3, 10, 7, 0.72);
+  /* 只在中央压一小块暗，四边留白 —— 这样右侧手牌 / 牌河不会被糊住 */
+  background: radial-gradient(
+    ellipse 46% 52% at 50% 50%,
+    rgba(3, 10, 7, 0.82) 0%,
+    rgba(3, 10, 7, 0.72) 58%,
+    rgba(3, 10, 7, 0) 100%
+  );
   display: grid;
   place-items: center;
   z-index: 50;
   padding: 16px;
+  pointer-events: none;
 }
 .overlay[hidden] { display: none; }
 .panel {
-  width: min(1040px, 96vw);
-  max-height: 92vh;
+  pointer-events: auto;
+  width: min(720px, 68vw);
+  max-height: 88vh;
   display: grid;
   grid-template-rows: auto 1fr auto;
   background: linear-gradient(180deg, #10241b, #08150f);
@@ -935,7 +1021,8 @@ input, select { font: inherit; }
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--anim), transform var(--anim);
-  max-width: min(420px, 40vw);
+  /* 窄一点、最多两行：它飘在牌桌上方，太宽会盖住左侧那家的手牌 */
+  max-width: min(30ch, 26vw);
 }
 .toast.is-on { opacity: 1; transform: translateY(0); }
 .toast.is-warn { border-color: #d9a03f; }

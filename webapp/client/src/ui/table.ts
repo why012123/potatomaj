@@ -441,14 +441,52 @@ export class TableView {
    * 但牌河里可能有好几张同牌型的牌，所以取**最后一张**等于它的 ——
    * 那才是他立直时打出的那一张。`lastIndexOf` 正好是这个语义。
    */
+  /**
+   * 牌河重画。
+   *
+   * **第一张牌的位置是钉死的**（由 CSS 的固定 6×3 格子 + 座位盒子决定，
+   * 跟手牌张数无关），后面的牌往右一张张填，满 6 张换行。
+   *
+   * 两个「不乱动」的细节：
+   *
+   * 1. 新牌**只追加**（`appendChild`），不重排已有节点 —— 重排会让浏览器
+   *    给每张牌重新跑一遍布局/动画，看起来像整条牌河在抖。
+   *    只有「不是多一张」的情况（断线重连、重开一局、立直牌换了位置）
+   *    才整体重画。
+   * 2. 牌河的**格子是固定 6 列的 grid**，所以第 7 张一定落在第二行第一列 ——
+   *    不会因为总张数变化而重排。
+   */
   private rebuildPond(v: SeatView, s: SeatState, size: "md" | "lg", animate: boolean): void {
     const before = this.prevPond.get(s.seat) ?? 0;
     const pond = s.pond;
     const riichiAt = riichiIndex(s);
-    // 只有「多了恰好一张」才做动画：一帧里塞进两张（断线重连）就直接画。
-    const animFrom = animate && pond.length === before + 1 ? before : -1;
+    // 只有「多了恰好一张」才做增量：一帧里塞进两张（断线重连）就整体重画。
+    const grew = animate && pond.length === before + 1;
+    const sig = s.pond.join(",") + "|" + s.pond_red.join("") + "|" + (s.riichi_tile ?? "");
+
+    if (grew && v.pond.dataset["sig"] !== "" && v.pond.children.length === before) {
+      // 增量：把新的一张接到末尾，已有的一律不动
+      const i = pond.length - 1;
+      const red = s.pond_red[i] === 1;
+      v.pond.appendChild(
+        tileEl({
+          id: pond[i] as string,
+          size,
+          rotate: i === riichiAt,
+          cls: [`is-new`, red ? "is-red" : "", i >= 18 ? "is-overflow" : ""]
+            .filter(Boolean)
+            .join(" "),
+          title: i === riichiAt ? `立直宣言牌 ${pond[i]}` : (pond[i] as string),
+        }),
+      );
+      v.pond.dataset["sig"] = sig;
+      v.pond.dataset["count"] = String(pond.length);
+      this.prevPond.set(s.seat, pond.length);
+      return;
+    }
 
     v.pond.replaceChildren();
+    v.pond.dataset["sig"] = sig;
     v.pond.dataset["count"] = String(pond.length);
     pond.forEach((t, i) => {
       const red = s.pond_red[i] === 1;
@@ -460,7 +498,6 @@ export class TableView {
           cls: [
             i >= 18 ? "is-overflow" : "",
             red ? "is-red" : "",
-            i === animFrom ? "is-new" : "",
           ]
             .filter(Boolean)
             .join(" "),
@@ -638,22 +675,36 @@ export class TableView {
     const span = tileW * n + gap * (n - 1);
     const side = v.dir === "left" || v.dir === "right";
     const slack = Math.max(2, tileH * 0.1);
+    // 牌厚（含两侧留白）。盒子尺寸见下面 —— **按最大手牌算，不按当前张数**。
     const thick = tileH + slack * 2;
-
-    // 盒子尺寸：一边是「手牌跨度」，另一边是「牌厚 + 留白」。**不能比手牌窄** ——
-    // 手牌要在盒子里居中，盒子比手牌窄就会把它顶出去（下家只剩几张牌的时候
-    // 最容易碰上）。短边用 max，多出来的空间由居中偏移吃掉，这样牌河 / 副露
-    // 相对手牌的位置不随手牌张数抖动。
-    const across = Math.max(span, thick);
-    v.boxW = side ? thick : across;
-    v.boxH = side ? across : thick;
+    /*
+     * ★ **盒子尺寸按「最大的手牌」算，不按当前张数。**
+     *
+     * 用户的要求是「画面里只有手牌能动，其他牌位置定死」。原来
+     * `across = max(span, thick)` 是**随手牌张数变**的：14 张时 883px、
+     * 13 张时 717px。而牌河是 `left: 50%` 钉在盒子中线上的 ——
+     * 盒子一缩，牌河跟着横移 15px（实测：`--edge-w` 883.72 → 717.58，
+     * 牌河第一张从 x=976 跳到 x=961）。打完一张牌整条牌河就抖一下，
+     * 看起来就是「牌一直在乱动」。
+     *
+     * 现在盒子永远按 14 张的宽度算（手牌最多就是这个数），盒子的位置和尺寸
+     * 全程不变；变的是 `--hand-center`（手牌在这个固定盒子里自己居中）。
+     * 于是**牌河第一张的落点成了一根不动的桩子**，只有手牌在动。
+     */
+    const maxSpan = tileW * (side ? 14 : 15) + gap * (side ? 13 : 14);
+    const boxAcross = Math.max(maxSpan, thick);
+    v.boxW = side ? thick : boxAcross;
+    v.boxH = side ? boxAcross : thick;
     v.edge.style.setProperty("--edge-w", `${v.boxW.toFixed(2)}px`);
     v.edge.style.setProperty("--edge-h", `${v.boxH.toFixed(2)}px`);
     v.edge.style.setProperty("--side-slack", `${slack.toFixed(2)}px`);
     v.edge.style.setProperty("--hand-span", `${span.toFixed(2)}px`);
     v.edge.style.setProperty("--hand-thick", `${thick.toFixed(2)}px`);
-    // 手牌居中偏移 =「盒子长边 - 手牌跨度」的一半
-    v.edge.style.setProperty("--hand-center", `${((across - span) / 2).toFixed(2)}px`);
+    // 手牌居中偏移 =「固定盒子长边 - 当前手牌跨度」的一半
+    v.edge.style.setProperty(
+      "--hand-center",
+      `${((boxAcross - span) / 2).toFixed(2)}px`,
+    );
     if (side) {
       // ---- 侧家 ----
       // 手牌在局部 x = slack .. slack + 牌厚（贴着墙那一边）。
@@ -667,24 +718,20 @@ export class TableView {
       /*
        * ---- 下 / 上家 ----
        *
-       * 改了两处（用户提的）：
+       * ★ **这里给的都是「跟手牌无关的固定值」**。
        *
-       * 1. **副露挪到右下角**，不再紧挨手牌右端。原来 `--melds-lead` 是
-       *    「手牌右端 - slack」，副露就从手牌右边挤出来，手牌一多（副露之后
-       *    手牌变短、位置又居中）副露会**压在手牌上**。
-       *    现在用 `right: 0` 把它钉在盒子右下角，和手牌彻底分开。
+       * 用户的要求是「画面里只有手牌能动，别的牌位置定死」。所以副露和牌河
+       * 不能再参与 `across - span` 这种**随手牌张数变**的算式了 ——
+       * 手牌一多一少，副露和牌河就跟着跳，看起来就是「牌一直在乱动」。
        *
-       * 2. **牌河往桌子中间挪**。原来是 `right: --pond-lead`，牌河整体贴着
-       *    「手牌右端」摆，看起来全挤在右边。现在改成**水平居中**
-       *    （`left: 50%` + `translateX(-50%)`），牌河就落在桌心一带 ——
-       *    天凤 / 雀雀都是这样，四条牌河围着中央信息区。
+       * 现在：
+       *   - 副露钉在盒子右端（`--melds-lead` = slack），后面的往上磊
+       *   - 牌河钉在盒子中线上（`left: 50%`，没有 translate），
+       *     第一张永远在同一个格子，后面的往右填、满 6 张换行
+       * 只有手牌自己会随张数重新居中。
        */
       v.edge.style.setProperty("--melds-lead", `${slack.toFixed(2)}px`);
       v.edge.style.setProperty("--pond-gap", `${(thick + tileH * 0.5).toFixed(2)}px`);
-      v.edge.style.setProperty(
-        "--pond-drop",
-        `${(thick + tileH * 0.5).toFixed(2)}px`,
-      );
     }
   }
 
