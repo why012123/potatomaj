@@ -600,6 +600,49 @@ def acquire_out_lock(out: Path) -> Path | None:
 
     lock = out.with_suffix(out.suffix + ".lock")
 
+    def _pid_alive(pid: int) -> bool:
+        """这个 pid 还活着吗？**跨平台**。
+
+        ⚠️ 为什么不能只用 `os.kill(pid, 0)`（server 在 Windows 上实测踩到的真 bug）：
+        Linux/macOS 上 `os.kill(pid, 0)` 是「只探测、不发信号」✓ 抛
+        `ProcessLookupError`（进程没了）/ `PermissionError`（是别人的进程）✓
+        **但 Windows 不支持信号 0** ✗ —— 它抛的是 **`OSError(WinError 87)`** ✗
+        而调用方原来只接了那两个异常 -> **异常冒出去，整个 `cmd_rl` 崩** ✗✗
+
+        后果特别重：`cmd_rl` **无条件**调 `acquire_out_lock` ✓ 而「陈旧锁」在
+        一次崩溃/被杀之后**必然出现** ✓ -> **等于「崩一次之后这台机器再也起不了 RL」** ✗
+        """
+        if _os.name == "nt":
+            # 正确的 Windows 判据：OpenProcess 拿不到句柄 = 进程没了；
+            # 拿得到就看退出码是不是 STILL_ACTIVE(259) ✓
+            try:
+                import ctypes
+
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                h = ctypes.windll.kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+                )
+                if not h:
+                    return False            # 打不开 -> 进程不存在（或已退出）✓
+                try:
+                    code = ctypes.c_ulong()
+                    ok = ctypes.windll.kernel32.GetExitCodeProcess(
+                        h, ctypes.byref(code)
+                    )
+                    return bool(ok) and code.value == 259   # STILL_ACTIVE
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(h)
+            except Exception:  # noqa: BLE001
+                # 判不了就**当作活着** ✓ 保守：宁可拒绝写，也不误删别人的锁 ✗
+                return True
+        try:                        # Unix：信号 0 = 只探测存活，不真发信号 ✓
+            _os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:     # 存在但不是我的进程 ✓ 也算活着 ✓
+            return True
+
     def _owner_alive() -> bool:
         try:
             pid = int(lock.read_text().strip() or 0)
@@ -607,13 +650,7 @@ def acquire_out_lock(out: Path) -> Path | None:
             return False
         if pid <= 0:
             return False
-        try:                        # 信号 0 = 只探测存活，不真发信号 ✓
-            _os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:     # 存在但不是我的进程 ✓ 也算活着 ✓
-            return True
+        return _pid_alive(pid)
 
     try:
         fd = _os.open(lock, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
