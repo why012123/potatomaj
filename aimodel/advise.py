@@ -188,16 +188,63 @@ def _visible(view: View) -> list[int]:
     return visible_counts(view)
 
 
+
+def default_weights() -> str:
+    """默认权重：**走注册表取最新的三麻模型** ✓
+
+    ⚠️ 以前写死 `weights/policy.npz` ✗ 而那个文件实测是 `maj-normalv1.npz` 的
+    逐字节副本（**v1**，连 v1.1 都不是）✗ 用它会给出一个过时模型的建议，
+    而且从界面上完全看不出来 ✓
+    """
+    try:
+        from . import variants
+
+        sanma = [s for s in variants.all_specs() if s.players == 3 and s.path.exists()]
+        if sanma:
+            # 版本号大的优先；同版本按名字定序，保证可复现
+            best = max(sanma, key=lambda s: (s.version, s.name))
+            return str(best.path)
+    except Exception:                                   # noqa: BLE001
+        pass
+    return str(WEIGHTS / "policy.npz")
+
 def load_from_image(path: Path) -> dict:
-    """调用外层识图模块，拿回结构化结果。"""
+    """调用外层识图模块，拿回结构化结果。
+
+    ⚠️ **这条路已经废弃了** ✗ —— 截图识别的整条链路被有意删掉，
+    改成了协议解码（`electron/lib/actions.js`，见 `potatomaj/__main__.py` 的说明）✓
+    原因是协议解码比截图识别可靠得多 ✓
+
+    这里保留它只是为了**兼容老用法**，并且给一个清楚的报错 ✗
+    而不是抛一个看不出所以然的 `ImportError` / `FileNotFoundError` ✓
+
+    现在推荐的三条输入路径：
+      ``--hand "123m456p77z5s"``   手写牌型（最常用）
+      ``--json x.json``            别处解码好的结构化结果
+      （或直接调 :func:`build_view` / :func:`suggest` 自己拼 View）
+    """
     sys.path.insert(0, str(WEIGHTS.parents[1]))
-    from potatomaj.classify import TemplateLibrary
-    from potatomaj.recognize import recognize
+    try:
+        from potatomaj.classify import TemplateLibrary
+        from potatomaj.recognize import recognize
+    except ImportError as e:
+        raise SystemExit(
+            f"❌ 截图识别链路不可用（{e}）\n"
+            "   这条路已经被有意废弃 —— 现在走协议解码 ✓\n"
+            "   请改用：--hand \"牌型\"  或  --json <文件>\n"
+            "   （原因见 potatomaj/__main__.py 的说明）"
+        ) from None
 
     templates = WEIGHTS.parents[1] / "templates"
+    if not templates.is_dir():
+        raise SystemExit(
+            f"❌ 模板库不存在：{templates}\n"
+            "   截图识别那条路已废弃，模板库也没跟着留 ✗\n"
+            "   请改用：--hand \"牌型\"  或  --json <文件>"
+        )
     lib = TemplateLibrary(str(templates))
     if len(lib) == 0:
-        raise SystemExit(f"模板库为空: {templates}")
+        raise SystemExit(f"❌ 模板库为空：{templates}（请改用 --hand / --json）")
     return recognize(path, lib).to_dict()
 
 
@@ -216,7 +263,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--pond", action="append", default=[], help="牌河（可重复，最多 3 组）")
     ap.add_argument("--dora", action="append", default=[], help="宝牌指示牌（可重复）")
     ap.add_argument("--turn", type=int, default=6, help="假设的巡目")
-    ap.add_argument("--weights", type=str, default=str(WEIGHTS / "policy.npz"))
+    ap.add_argument("--weights", type=str, default=default_weights())
     args = ap.parse_args(argv)
 
     net = Net.load(args.weights) if Path(args.weights).exists() else None

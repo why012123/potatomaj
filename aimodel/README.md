@@ -222,6 +222,59 @@ rsync -av 服务器:~/potatomaj/aimodel/weights/*.npz ./aimodel/weights/
 | 16 核 / 32 GB | `--jobs 6`，`--hands 12000`，`--iters 30` |
 | 32 核 / 128 GB | `--jobs 8`（**别再往上加**：8 个模型就是 8 个任务，多了没意义），把 `--hands` 提到 20000 |
 
+### ★ 长任务跑不完怎么办：`aimodel/shortjob.py`
+
+这台机器上**会话里的进程 15 秒~3.5 分钟会被回收** ✗ 而一轮训练要几十分钟到几小时 ✓
+
+**先试过「脱离会话」，5 种全部失败** ✗：
+
+| 方式 | 实测 |
+|---|---|
+| `cmd /c start /b cmd /c "... 2> log"` | cmd 在 `2>` 的 `|` 上分词，python 根本没启动 |
+| `Start-Process` 双流重定向到同一文件 | PS 5.1 拒绝，启动前就失败 |
+| `Popen` + `DETACHED_PROCESS\|BREAKAWAY` | **76 秒后死** |
+| 计划任务 + `.bat` | **50 秒死**（但 `Last Result: 0` ✗） |
+| 计划任务 + `wscript.exe` | **120 秒后死** |
+
+**计划任务那条最容易骗人** ✗ 任务自己报成功退出（0），但
+`.venv\Scripts\python.exe` 是个 **launcher** ✓ 真解释器是它的**子进程** ✓
+任务一结束，Task Scheduler **把整棵进程树拆掉** ✓ `start /b` 也逃不出去 ✓
+
+**结论：不要跟它斗，把工作切进杀窗口里** ✓
+
+```bash
+python -m aimodel.shortjob --help
+```
+
+设计：
+- **每片 ≤ 10 秒**（配置项），默认 100 手/片
+- **原子落盘**：写 `.tmp` → `os.replace` ✗ 被杀不留半截文件
+- **`done.txt` 账本**：每行 `<片ID> <行数> <sha256>`，是**唯一真相** ✓
+- 重启读账本跳过已完成的片 ✓ 靠内容哈希校验，不靠猜
+
+实测（远端）：
+```
+plan:  100 hands/slice (~8.6s each)   150 slices   21.5 min
+slice time  mean 8.5s  p95 8.8s  max 8.9s   (budget 10s)     ← p95 < 10s ✓
+
+硬杀验证：
+  杀后账本： 5 片（0-4，各带 sha256）
+  重跑    ： made 0  skipped(already done) 4  of 4            ← 零重复计算 ✓
+```
+在飞的那片丢了，**且没留任何半截文件** ✓
+
+**⚠️ 已知的等价性隐患**：Adam 的 m/v 不存档 ✗ 续跑会重置优化器状态 ✓
+对 BC 收敛有没有影响**还没测** ✓ 测法见下（不用等全量跑完）✓
+
+**等价性的省事测法**（20 片就够，约 6 分钟）：
+```bash
+# A) 切片跑：20 片 × 100 手
+python -m aimodel.shortjob --hands 2000 --slice-hands 100 --out a.npz
+# B) 一次跑完：同样的 2000 手、同样的 epoch 数
+python -m aimodel.train bc --hands 2000 --out b.npz
+# 比留出集一致率：差值 > 0.5 个点就说明 Adam 重置有影响，写进文档
+```
+
 ### ⚠️ Windows / PowerShell 上的坑（都是实测踩出来的）
 
 **① 命令行传列表参数必须用 `=` 或引号** ✗
