@@ -144,6 +144,8 @@ def train_bc(
     holdout: dict | None = None,
     patience: int = 3,
     label_smoothing: float = 0.05,
+    ref_holdout: dict | None = None,
+    ref_name: str = "参照",
 ) -> tuple[list[dict], Net, dict]:
     """行为克隆。返回 ``(hist, best_net, best_info)``。
 
@@ -223,6 +225,13 @@ def train_bc(
         # 累计计数在**打分之后、存最优之前**加 —— 这样存下来的最优权重
         # 带的是「它实际训过多少轮」✓
         net.epochs_done += 1
+        # 参照指标：只打印、**不参与选择** ✗
+        # 为什么要它：用户换标签（人类数据）之后，「教师留出率」会掉 ✗
+        # 但那不代表变差 ✓ 所以选择用**同源留出集**，教师那个只当对照 ✓
+        if ref_holdout is not None:
+            row_ref = agreement(net, ref_holdout)
+        else:
+            row_ref = None
         improved = hold > best_hold
         if improved:
             # net.copy() 是深拷贝（含 steps / total_steps），所以拿回来能直接存
@@ -265,6 +274,9 @@ def train_bc(
                 "原权重原样保留 ✓（不是「第 0 轮最优」，是**这一轮训练白跑了** ✓）"
             )
         else:
+            if ref_holdout is not None:
+                print(f"      （对照：{ref_name} 一致率 {agreement(best_net, ref_holdout):.1%}"
+                      " —— 换标签后会掉，属正常 ✓ 不参与选择 ✗）")
             print(
                 f"    ★ 最优留出率 {best_hold:.1%} 出现在 **第 {best_epoch} 轮**"
                 f"（共跑 {len(hist)} 轮）—— 存的是这一轮，不是最后一轮"
@@ -692,13 +704,46 @@ def cmd_bc(args) -> Net:
     else:
         data = collect_bc(args.hands, seed=args.seed, spec=spec)
 
-    holdout = collect_bc(
-        max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
-    )
-    print(f"  留出集：{len(holdout['X'])} 条决策（种子不同，用来判断有没有过拟合）")
+    # ★ 留出集必须和训练数据**同源** ✗
+    #
+    # 踩过的坑：原来不管数据从哪来，留出集一律 `collect_bc`（**教师现打**）✓
+    # 那在「克隆教师」时没问题 ✓ 但**换标签之后就是致命的** ✗：
+    #
+    #   实测（人类牌谱 BC）：人类数据和教师的出牌只一致约 63% ✓
+    #     · 未训练模型：教师留出 90.0%，同源一致率 **45.3%**
+    #     · 训 1 轮后：教师留出 **61.3%**（掉了 ✗），同源一致率 **63.6%**（涨了 ✓）
+    #   → 模型其实**在进步** ✓ 但教师留出集一路下降 ✗
+    #   → 早停/选优会因此判定「越训越差」并拒绝保存 ✗✗
+    #
+    # 所以：**选择用同源留出集** ✓ 教师留出集降级成**只打印的对照** ✓
+    # （对照仍有价值：它让新模型和老模型的数字**可比** ✓）
+    if src:
+        _n = len(data["X"])
+        _rng = np.random.default_rng(args.seed + 555_555)
+        _idx = _rng.permutation(_n)
+        _nh = max(2000, _n // 20)
+        holdout = {k: data[k][_idx[:_nh]] for k in data}
+        data = {k: data[k][_idx[_nh:]] for k in data}
+        print(f"  留出集：{len(holdout['X'])} 条（**从同一份数据里切** ✓ 同源 ✓）")
+        print(f"  训练集：{len(data['X'])} 条")
+        ref_holdout = collect_bc(
+            max(60, args.hands // 20), seed=args.seed + 555_555,
+            verbose=False, spec=spec,
+        )
+        ref_name = "教师"
+        print(f"  对照留出集（教师生成 {len(ref_holdout['X'])} 条）："
+              "**只打印 ✓ 不参与选择 ✗**（换标签后它会掉，属正常 ✓）")
+    else:
+        holdout = collect_bc(
+            max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
+        )
+        ref_holdout = None
+        ref_name = "参照"
+        print(f"  留出集：{len(holdout['X'])} 条决策（种子不同，用来判断有没有过拟合）")
     hist, best_net, bc_info = train_bc(
         net, data, epochs=args.epochs, batch_size=args.batch, seed=args.seed,
         holdout=holdout, patience=args.patience,
+        ref_holdout=ref_holdout, ref_name=ref_name,
     )
     # 存**留出最优**那一轮，不是最后一轮。老代码无条件 net.save()，
     # 存下来的是过拟合最重的那份（实测训练 87.6%->93.4% 时留出 75.9%->74.9%）。
