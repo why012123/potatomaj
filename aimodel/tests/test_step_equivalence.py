@@ -69,7 +69,7 @@ STEPS = 3
 #:   ① 先看 `kl` 是否从 0.0 变成非 0 ✗
 #:      变了 -> KL 分支被激活 ✓ 那是「修好了」不是「改错了」✓
 #:      没变 -> 才去查搬运错误 ✓
-GOLDEN = "ee6024dc7f6fa27c727312eb13f81a8c5fadc20414e6b683bd4368b1327718be"
+GOLDEN = "ef345dbce254125ccdebd81a139e1e07e424b98660161a4cbf5df01d9daf0927"
 
 
 def make_data(seed: int = 7) -> dict:
@@ -98,15 +98,35 @@ def make_data(seed: int = 7) -> dict:
     }
 
 
+#: 取校验和之前的**量化位数** ✗ —— 这是为了让校验和**跨机器可移植** ✓
+#:
+#: ⚠️ 为什么必须量化（2026-10-16 血泪）：
+#:   原来的实现是「对 float64 权重取 sha256」✗ 那是**逐位**判据 ✓
+#:   而权重来自 BLAS 矩阵乘 ✓ **BLAS 的归约顺序不是跨实现确定的** ✗
+#:   -> 同一个实现、同一份数据、同一个 seed，**macOS(Accelerate) 与
+#:      Windows(OpenBLAS) 会算出不同的最后几位** ✓
+#:   -> 校验和必然不同 ✗ 于是这个「安全网」**只在录制它的那台机器上有效** ✗✗
+#:   实测：server 在它的 4060 上 23 个测试全过 ✓
+#:        同一 commit 在 mac 上是红的 ✗（`b59ab311…` vs 金值 `ee6024dc…`）
+#:
+#: 修法：取哈希前先 `np.round(arr, QUANT_DIGITS)` ✓
+#:   -> 吸收 ~1e-9 量级的 BLAS 噪声 ✓
+#:   -> 仍能抓到真正的重构错误 ✗（末尾敏感性自检扰动 1e-3 ✓ 比噪声大 6 个数量级 ✓）
+#:   -> 代价：金值必须在**量化方案**下重录一次 ✓（旧金值是逐位方案，已失效 ✓）
+QUANT_DIGITS = 9
+
+
 def weight_checksum(net: Net) -> str:
     """确定性校验和：按**参数名排序**后逐数组喂进 sha256 ✓
 
     ⚠️ 必须对「某个头漏乘梯度」敏感 ✗ —— 见末尾的敏感性自检 ✓
+    ⚠️ 先 `np.round(..., QUANT_DIGITS)` 再取哈希 ✓ 理由见上面那段注释 ✗
     """
     h = hashlib.sha256()
     for name, arr in sorted(net.params(), key=lambda kv: kv[0]):
         h.update(name.encode())
-        h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
+        a = np.ascontiguousarray(arr, dtype=np.float64)
+        h.update(np.ascontiguousarray(np.round(a, QUANT_DIGITS)).tobytes())
     return h.hexdigest()
 
 
