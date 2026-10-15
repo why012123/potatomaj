@@ -49,6 +49,7 @@ class Action(str, Enum):
     HOLD = "hold"        # 守着（不降也不回退）
     DESCEND = "descend"  # 降一档锚定（放开一点）
     REHEAT = "reheat"    # 检测到坍缩 -> 回退一档并回滚权重
+    ABORT = "abort"      # **救不回来了** -> 回滚并停止本次 RL（不是空转）
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,21 @@ class AnnealState:
 
 
 def _floor_for(kind: str, ref_ent: float, cfg: AnnealConfig) -> float:
-    """某个头的熵下限。"""
+    """某个头的熵下限。
+
+    ⚠️ **起点熵本身就极低的头，返回 0.0 = 不设下限 = 不参与坍缩判定**。
+
+    这是 Mac 抓出来的一个真 bug（会让验收跑不起来）：
+    `tsumo` / `ron` 这类头天然就接近确定性（起点熵 0.00），
+    而 `max(0.0 * 0.5, floor_abs_min) = 0.02 > 0` 会让它们**每一轮都判坍缩**
+    -> 无限 REHEAT ✗
+
+    判据：`ref_ent <= floor_abs_min` 说明这个头**从一开始就没有"余量"可言**，
+    「策略还有没有多样性」这个问题对它**没有意义** ✓
+    所以不能拿它当坍缩信号 ✓
+    """
+    if ref_ent <= cfg.floor_abs_min:
+        return 0.0
     return max(ref_ent * cfg.floor_ratio, cfg.floor_abs_min)
 
 
@@ -100,14 +115,20 @@ def _margin_for(kind: str, ref_ent: float, cfg: AnnealConfig) -> float:
 def collapsed_heads(
     state: AnnealState, ent_by_kind: Mapping[str, float], cfg: AnnealConfig | None = None
 ) -> list[str]:
-    """哪些头的熵掉到下限以下了（空 = 没坍缩）。"""
+    """哪些头的熵掉到下限以下了（空 = 没坍缩）。
+
+    **不设下限的头（起点就接近确定性）永远不参与判定** —— 见 `_floor_for`。
+    """
     cfg = cfg or AnnealConfig()
     out = []
     for k, ref in state.ref_entropy.items():
         cur = ent_by_kind.get(k)
         if cur is None:
             continue  # 这一轮没这个头的数据 -> 不判它（宁可漏判也不误判）
-        if cur < _floor_for(k, ref, cfg):
+        fl = _floor_for(k, ref, cfg)
+        if fl <= 0.0:
+            continue  # 起点就没有余量的头 -> 不参与
+        if cur < fl:
             out.append(k)
     return out
 
@@ -144,6 +165,23 @@ def kl_anneal_step(
 
     # --- 1. 先判坍缩（优先于一切）---
     if bad:
+        # --- 1a. 已经退到上限还在坍缩 -> **救不回来了，放弃** ---
+        # Mac 抓出来的第二个 bug：没有这一支的话，
+        # `min(kl_coef * 2, kl_coef0)` 会停在 kl_coef0，于是**每轮都 REHEAT、无限空转** ✗
+        # 后果：一次「模型坏了」的运行会跑满 20 轮，
+        # 而我们**分不清「跑满但没效果」和「第 3 轮就坏了、后面 17 轮空转」** ✗✗
+        if state.kl_coef >= cfg.kl_coef0:
+            new = replace(
+                state,
+                consecutive_collapse=state.consecutive_collapse + 1,
+                history=state.history + [{
+                    "action": Action.ABORT.value, "kl_coef": state.kl_coef,
+                    "collapsed": bad, "measured_kl": measured_kl,
+                    "reason": "已在锚定上限仍坍缩 -> 放弃本次 RL（回滚）",
+                }],
+            )
+            return new, Action.ABORT
+
         n = state.consecutive_collapse + 1
         if n >= cfg.reheat_double_after:
             # 连续坍缩 -> 允许翻倍（说明回退一档还不够）
@@ -284,11 +322,45 @@ def selftest() -> int:
     _expect(all("action" in h and "kl_coef" in h for h in st9.history),
             "每条历史都该有 action 与 kl_coef", failed)
 
+    # ---- 以下两组是 Mac 抓出来的真 bug 的回归测试 ----
+
+    print("\n-- 10) 【bug① 回归】起点熵就极低的头（tsumo/ron）不参与坍缩判定 --")
+    # 真实现状：tsumo 起点 0.00、ron 第 14 轮起 0.00（天然接近确定性）
+    # 修之前：floor = max(0*0.5, 0.02) = 0.02 > 0 -> 每轮都判 REHEAT -> **无限循环** ✗
+    mixed = {"tsumo": 0.0, "ron": 0.0, "call": 0.40}
+    st10 = AnnealState(kl_coef=0.1, ref_entropy=dict(mixed))
+    st10, act10 = kl_anneal_step(st10, ent_by_kind=dict(mixed), measured_kl=0.0, cfg=cfg)
+    _expect(act10 is not Action.REHEAT,
+            f"起点就 0 熵的头不该触发 REHEAT，得到 {act10}（这就是 bug①）", failed)
+    _expect(collapsed_heads(st10, dict(mixed), cfg) == [],
+            "起点 0 熵的头不该出现在 collapsed_heads 里", failed)
+    # 但**有** 余量的头仍要正常判定：call 掉到 0.40 的一半以下应被抓到
+    st10b = AnnealState(kl_coef=0.1, ref_entropy=dict(mixed))
+    _expect(collapsed_heads(st10b, {"tsumo": 0.0, "ron": 0.0, "call": 0.10}, cfg) == ["call"],
+            "call 掉到 0.10（< 下限 0.20）应当被抓到", failed)
+
+    print("\n-- 11) 【bug② 回归】退到上限仍坍缩 -> ABORT（不是无限 REHEAT）--")
+    # 修之前：kl_coef 已在 kl_coef0，min(*2, kl_coef0) 还是 kl_coef0 -> 永远 REHEAT ✗
+    st11 = AnnealState(kl_coef=cfg.kl_coef0, ref_entropy=dict(ref),
+                       prev_kl_coef=cfg.kl_coef0, consecutive_collapse=9)
+    st11, act11 = kl_anneal_step(st11, ent_by_kind=low, measured_kl=0.0, cfg=cfg)
+    _expect(act11 is Action.ABORT,
+            f"已在上限仍坍缩应当 ABORT，得到 {act11}（这就是 bug②）", failed)
+    _expect(st11.kl_coef == cfg.kl_coef0,
+            f"ABORT 时不该改 kl_coef，得到 {st11.kl_coef}", failed)
+    _expect(st11.history and st11.history[-1]["action"] == Action.ABORT.value,
+            "ABORT 应当记进 history（便于复盘）", failed)
+    # 未到上限时应仍是 REHEAT（别把 ABORT 做成一碰就退）
+    st11b = AnnealState(kl_coef=0.05, ref_entropy=dict(ref), prev_kl_coef=0.1)
+    _, act11b = kl_anneal_step(st11b, ent_by_kind=low, measured_kl=0.0, cfg=cfg)
+    _expect(act11b is Action.REHEAT,
+            f"未到上限的坍缩仍应 REHEAT，得到 {act11b}", failed)
+
     print()
     if failed:
         print(f"❌ {len(failed)} 条失败")
         return 1
-    print("✅ 全部通过（9 组）")
+    print("✅ 全部通过（11 组）")
     return 0
 
 
