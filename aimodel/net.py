@@ -423,16 +423,31 @@ class Net:
     # -- Adam ---------------------------------------------------------------
     def _apply(self, grads: dict, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8) -> None:
         t = self.steps
+        # 偏置修正的分母是**标量** ✓ 提到循环外（原来每参数每步都算一次 `beta1 ** t`）✓
+        c1 = 1.0 - beta1 ** t
+        c2 = 1.0 - beta2 ** t
         for name, p in self.params():
             g = grads.get(name)
             if g is None:
                 continue
-            m, v = self._adam.get(name, (np.zeros_like(p), np.zeros_like(p)))
+            # ⚠️ 这里原来写的是：
+            #     m, v = self._adam.get(name, (np.zeros_like(p), np.zeros_like(p)))
+            #   **`dict.get(k, default)` 会先求值 default** ✗
+            #   -> 即使键已存在（稳态下**总是存在**），每步每参数都白分配两个
+            #      全尺寸数组 ✓ 28 个参数 × 2 = **56 次分配/步** ✗
+            #   profile 实测：`zeros_like` 1425 次 / 25 batch = **57 次/步** ✓ 对得上 ✓
+            #   删掉这个 eager default **不改变任何数值**（那些数组本来就丢掉了）✓
+            mv = self._adam.get(name)
+            if mv is None:
+                m = np.zeros_like(p)
+                v = np.zeros_like(p)
+            else:
+                m, v = mv
             m = beta1 * m + (1 - beta1) * g
             v = beta2 * v + (1 - beta2) * (g * g)
             self._adam[name] = (m, v)
-            mh = m / (1 - beta1 ** t)
-            vh = v / (1 - beta2 ** t)
+            mh = m / c1
+            vh = v / c2
             p -= (self.lr * mh / (np.sqrt(vh) + eps)).astype(p.dtype)
 
     # -- 存档 ---------------------------------------------------------------
