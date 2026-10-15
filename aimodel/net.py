@@ -407,6 +407,15 @@ class Net:
             # 整体熵保留（向后兼容），但**逐头熵**才是能看出「哪个头塌了」的东西
             "entropy": ent_sum / nk,
             "entropy_by_kind": ent_by_kind,
+            # ⚠️ 这个默认值 0.0 是个**静默耦合**（mac 审 kl-anneal 接线时点出来的）：
+            #    `tools/kl_anneal.py` 的 DESCEND 条件是 `measured_kl < kl_lo(0.05)`，
+            #    而 **0.0 < 0.05** -> 一旦 `kl_n == 0`（这一轮没算 KL），
+            #    退火会**每轮误判「有余量」并降档** ✗
+            #    现状安全：`--kl-floor` 默认 0.01 且**永不归零** -> kl_coef >= 0.01
+            #    -> kl_n > 0 ✓
+            #    **但若以后允许 kl_coef == 0，这条就变成真 bug** ✓
+            #    -> 那时应当要么让 kl_anneal 显式区分「没算 KL」与「KL 真的很小」，
+            #       要么在这里返回 None 并让调用方处理 ✓
             "kl": (kl_sum / kl_n) if kl_n else 0.0,
             "clip_frac": clip_frac / nk,
         }
