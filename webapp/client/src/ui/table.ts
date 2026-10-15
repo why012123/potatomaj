@@ -264,7 +264,8 @@ export class TableView {
    * 拿到的还是改动之前的值。所以修正必须跨帧迭代：一帧一轮，量到稳定为止。
    * 用一个标记去重，不重复排队。
    */
-  private scheduleRefit(): void {
+  /** 请求下一帧再跑一轮布局修正（外部也可以调：侧栏开合后要重排）。 */
+  scheduleRefit(): void {
     if (this.refitPending) return;
     this.refitPending = true;
     requestAnimationFrame(() => {
@@ -714,6 +715,18 @@ export class TableView {
       // 牌河的上边缘 = 手牌起点 + 让开的距离。手牌在局部 y ∈ [0, span]，
       // 用 `top`（自盒子顶边往下量）最直观，不跟 `bottom` 的百分比打架。
       v.edge.style.setProperty("--pond-gap", `${(tileH * 2.6 + slack).toFixed(2)}px`);
+      /*
+       * 牌河**沿手牌方向**对齐到手牌起点附近。
+       *
+       * 为什么符号要分左右：两家的 `rotate(±90deg)` 方向相反，同一个
+       * `translate` 在屏幕上会往反方向走 —— 写死一个值就是用户看到的
+       * 「左边牌河偏上、右边偏下」。所以这里按方向取正负号，左右对称。
+       * 距离取「手牌跨度的一半 - 两张牌」：牌河是一行 6 张、最多 2 行，
+       * 从这个位置起往手牌末端方向磊，正好落在手上方那一带的中间。
+       */
+      const along = span / 2 - tileW * 2;
+      const dir = v.dir === "left" ? 1 : -1;
+      v.edge.style.setProperty("--pond-shift", `${(dir * along).toFixed(2)}px`);
     } else {
       /*
        * ---- 下 / 上家 ----

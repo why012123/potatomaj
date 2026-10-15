@@ -34,8 +34,11 @@
   /* 150~250ms、ease-out：出牌/鸣牌要有动画，不要瞬移 */
   --anim: 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
 
-  /* 牌尺寸 —— 全场唯一的尺寸源头 */
-  --tile-w: min(4.3vw, 4.9vh, 54px);
+  /* 牌尺寸 —— 全场唯一的尺寸源头。
+     系数是**算出来的**：牌河 6 张 + 副露 + 手牌 14 张要放进宽度里；
+     同时左右两家的手牌是竖着摆的，一张牌的高度不能超过屏高的 1/21。
+     用户反馈「略小」，两个系数各放大一档（4.3→5.0vw，4.9→5.6vh）。 */
+  --tile-w: min(5.0vw, 5.6vh, 62px);
   --tile-h: calc(var(--tile-w) / 0.96);   /* 真牌 26x28mm，略高 */
   --tile-gap: calc(var(--tile-w) * 0.045);
 
@@ -566,10 +569,12 @@ input, select { font: inherit; }
    因为顶家整体转了 180°）。
    第一组贴着手牌那一侧，**后面的往上磊**（`column-reverse`：新的一组装在
    上面），所以副露永远只往一个方向长，不会忽然跳位置。
-   位置是固定值，**跟手牌张数无关** —— 手牌怎么变，副露都不动。 */
+   位置是固定值，**跟手牌张数无关** —— 手牌怎么变，副露都不动。
+   额外再让开约半张牌（`--tile-w * 0.45`）：用户反馈「副露还不够偏」，
+   贴着盒子边缘会和手牌右端挤在一起。这个量也是固定值，不会随手牌变。 */
 .edge--bottom .edge__melds {
   left: auto;
-  right: var(--melds-lead, 0px);
+  right: calc(var(--melds-lead, 0px) + var(--tile-w) * 0.45);
   bottom: var(--side-slack, 0px);
   top: auto;
   flex-direction: column-reverse;
@@ -577,7 +582,7 @@ input, select { font: inherit; }
 }
 /* 顶家整体转了 180°：局部 x 反过来，所以「右手边」在它那边是左 */
 .edge--top .edge__melds {
-  left: var(--melds-lead, 0px);
+  left: calc(var(--melds-lead, 0px) + var(--tile-w) * 0.45);
   right: auto;
   bottom: var(--side-slack, 0px);
   top: auto;
@@ -587,7 +592,7 @@ input, select { font: inherit; }
 /* 侧家：手牌贴墙（局部 x = 0..牌厚），副露在局部 x = 牌厚.. 即朝桌心一侧；
    同样往「第二个在上」的方向磊。 */
 .edge--side .edge__melds {
-  left: var(--hand-thick, 0px);
+  left: calc(var(--hand-thick, 0px) + var(--tile-w) * 0.45);
   bottom: var(--side-slack, 0px);
   flex-direction: column-reverse;
   align-items: flex-start;
@@ -623,17 +628,24 @@ input, select { font: inherit; }
 }
 /* 侧家：牌河由「手牌靠桌心那一侧」往桌心叠，跨过副露那一条带子。
    两个偏移都是 JS 算好的 px（见 table.ts 的 fitHandSpan）。
-   ★ 格子和下 / 上家**不一样**：侧家整家转了 ±90°，所以「一行的 6 张」
-   在本地的坐标系里是**一列的 6 张** —— 本地 2 列 × 6 行，转过来正好是
-   屏幕上的 2 行 × 6 列（用户指出的那一点：左右两家的「行」是我们视图的「列」）。
-   用 6 列的话，转过来会变成 6 行竖着排下来，一条长蛇。 */
+   ★ 格子和下 / 上家一样是 **6 列 × 2 行**（一行 6 张、最多 2 行）。
+   侧家整家转了 ±90°，所以本地的「一行 6 张」在屏幕上是**纵向的 6 张**，
+   本地 2 行在屏幕上是 2 列 —— 也就是「沿手牌方向磊 6 张、朝桌心方向 2 列」，
+   和下 / 上家旋转过来的样子一致。
+   （之前写成 2 列 × 6 行，方向正好反了：顺着桌心方向一排排铺开，
+   看起来既不像牌河、位置也歪。） */
 .edge--side .edge__pond {
   left: var(--pond-lead, 0px);
   right: auto;
   bottom: var(--pond-gap, 0px);
   top: auto;
-  grid-template-columns: repeat(2, var(--tw, var(--tile-w)));
-  grid-template-rows: repeat(6, calc(var(--tile-w) / 0.96));
+  grid-template-columns: repeat(6, var(--tw, var(--tile-w)));
+  grid-template-rows: repeat(2, calc(var(--tile-w) / 0.96));
+  /* 侧家的牌河**沿手牌方向**对齐到手牌起点附近。
+     左右两家的 `rotate(±90deg)` 方向相反，同一个 `translate` 在屏幕上会往
+     反方向走 —— 所以这里读 JS 给的 `--pond-shift`（左家一个方向、右家相反），
+     而不是写死一个符号。不这么做就是用户看到的「左边偏上、右边偏下」。 */
+  translate: 0 var(--pond-shift, 0px);
 }
 
 /* ------------------------------------------------------------- 名牌 -- */
@@ -769,11 +781,18 @@ input, select { font: inherit; }
 .actionbar__timer.is-urgent i { background: linear-gradient(90deg, #ff9b8c, var(--red)); }
 .actionbar__hint { color: var(--muted); font-size: 12px; }
 
+/*
+ * 右侧信息栏：**浮在牌桌上面**（`position: absolute`），所以它可以随时收起，
+ * 收起来之后那一块就还给牌桌 —— 下家的手牌 / 牌河能完整看到。
+ *
+ * 宽度走 `--side-bar`（`.table` 也用同一个变量算安全区），
+ * 收起时把 `--side-bar` 归零，牌桌随即占满整宽。
+ */
 .side {
   position: absolute;
   top: 8px;
   right: 12px;
-  width: min(300px, 24vw);
+  width: var(--side-bar, min(300px, 24vw));
   max-height: calc(100% - 16px);
   display: grid;
   grid-template-rows: auto 1fr auto;
@@ -783,6 +802,8 @@ input, select { font: inherit; }
 }
 .side > * { pointer-events: auto; }
 .side.is-hidden { display: none; }
+/* 收起时：牌桌把右边那一条收回来（`.table` 的 `--side-bar` 归零） */
+.game.is-side-hidden { --side-bar: 0px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); }
 .card h3 { font-size: 13px; color: var(--gold); }
 .logbox { overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.45; color: #cfe3d6; max-height: 30vh; }
@@ -1051,10 +1072,10 @@ input, select { font: inherit; }
 @media (max-width: 980px) {
   .side { display: none; }
 }
-/* 矮屏：牌再小一档，保证四家的手牌 + 牌河都在屏内 */
+/* 矮屏：牌再小一档，保证四家的手牌 + 牌河都在屏内（同样各放大一档） */
 @media (max-height: 800px) {
-  :root { --tile-w: min(4.0vw, 4.6vh, 48px); }
+  :root { --tile-w: min(4.6vw, 5.2vh, 56px); }
 }
 @media (max-height: 680px) {
-  :root { --tile-w: min(3.6vw, 4.2vh, 42px); }
+  :root { --tile-w: min(4.2vw, 4.8vh, 50px); }
 }

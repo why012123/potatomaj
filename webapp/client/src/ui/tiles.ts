@@ -25,9 +25,31 @@ export interface TileOpts {
   title?: string;
   onClick?: (el: HTMLButtonElement) => void;
 }
+/**
+ * 牌面图的**版本戳**。
+ *
+ * `/tiles/*.svg` 是带 `Cache-Control: immutable, max-age=7d` 发的（牌面要求
+ * 清晰、不变，缓存是对的），但这也意味着**素材换了以后老浏览器不会重新拉** ——
+ * 用户就会一直看到旧版（实测踩过：牌面白底 / 新牌背早就上线了，用户那边
+ * 还是老图，怎么看都是「看不到白底」）。
+ *
+ * `main()` 启动时会把服务端 index.html 里注入的 `?v=<构建时间戳>` 抓出来，
+ * 这里拼到每张牌上。抓不到就不加（本地直连 / 老服务端也不会坏）。
+ */
+let tileVersion = "";
+
+/** 从当前页面的 `app.js?v=…` 里取出版本戳（只做一次）。 */
+export function initTileVersion(): void {
+  if (tileVersion) return;
+  const s = document.querySelector<HTMLScriptElement>('script[src*="/app/"]');
+  const m = s ? /[?&]v=(\d+)/.exec(s.getAttribute("src") ?? "") : null;
+  if (m) tileVersion = m[1];
+}
+
 /** 牌面图路径。赤 5 的 id 是 `0m` / `0p` / `0s`，文件名一样。 */
 export function tileSrc(id: TileId | null | undefined): string {
-  return id ? `/tiles/${id}.svg` : "/tiles/back.svg";
+  const name = id ? `/tiles/${id}.svg` : "/tiles/back.svg";
+  return tileVersion ? `${name}?v=${tileVersion}` : name;
 }
 
 /**

@@ -240,7 +240,7 @@ class App {
       <label class="spectbar" id="revealwrap" hidden>
         <input type="checkbox" id="revealbox" /> 全亮牌（仅纯 AI 房）
       </label>
-      <button class="btn btn--sm" id="btn-panel">面板</button>
+      <button class="btn btn--sm" id="btn-panel" title="显示 / 隐藏右侧信息栏（快捷键 Tab）">侧栏</button>
       <button class="btn btn--sm" id="btn-leave">离开房间</button>
     `;
 
@@ -283,7 +283,23 @@ class App {
     game.append(topbar, playfield, bottombar);
 
     topbar.querySelector("#btn-leave")?.addEventListener("click", () => this.leaveToLobby());
-    topbar.querySelector("#btn-panel")?.addEventListener("click", () => side.classList.toggle("is-hidden"));
+    // 右侧信息栏收起 / 展开。收起时把 `--side-bar` 归零 —— 牌桌立刻把
+    // 右边那一条收回来，下家的手牌和牌河就完整可见了。
+    const toggleSide = (): void => {
+      const hidden = side.classList.toggle("is-hidden");
+      game.classList.toggle("is-side-hidden", hidden);
+      const btn = topbar.querySelector("#btn-panel");
+      if (btn) btn.textContent = hidden ? "侧栏 ▸" : "侧栏 ◂";
+      this.table.scheduleRefit();
+    };
+    topbar.querySelector("#btn-panel")?.addEventListener("click", toggleSide);
+    // Tab 也能切（键盘流用起来顺手；Tab 默认会把焦点挪走，所以拦掉）
+    window.addEventListener("keydown", (ev) => {
+      if (ev.key === "Tab" && this.screen === "game") {
+        ev.preventDefault();
+        toggleSide();
+      }
+    });
     this.revealWrap = topbar.querySelector("#revealwrap");
     this.revealBox = topbar.querySelector("#revealbox");
     this.revealBox?.addEventListener("change", () => {
