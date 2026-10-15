@@ -98,36 +98,71 @@ def make_data(seed: int = 7) -> dict:
     }
 
 
-#: 取校验和之前的**量化位数** ✗ —— 这是为了让校验和**跨机器可移植** ✓
+#: 跨机器比较权重的**容差** ✓（绝对 + 相对，取二者较大 ✓）
 #:
-#: ⚠️ 为什么必须量化（2026-10-16 血泪）：
-#:   原来的实现是「对 float64 权重取 sha256」✗ 那是**逐位**判据 ✓
-#:   而权重来自 BLAS 矩阵乘 ✓ **BLAS 的归约顺序不是跨实现确定的** ✗
-#:   -> 同一个实现、同一份数据、同一个 seed，**macOS(Accelerate) 与
-#:      Windows(OpenBLAS) 会算出不同的最后几位** ✓
-#:   -> 校验和必然不同 ✗ 于是这个「安全网」**只在录制它的那台机器上有效** ✗✗
-#:   实测：server 在它的 4060 上 23 个测试全过 ✓
-#:        同一 commit 在 mac 上是红的 ✗（`b59ab311…` vs 金值 `ee6024dc…`）
+#: ⚠️ 为什么不能用「哈希」做跨机器判据（2026-10-16 血泪 ✓ 两轮才修对 ✗）：
 #:
-#: 修法：取哈希前先 `np.round(arr, QUANT_DIGITS)` ✓
-#:   -> 吸收 ~1e-9 量级的 BLAS 噪声 ✓
-#:   -> 仍能抓到真正的重构错误 ✗（末尾敏感性自检扰动 1e-3 ✓ 比噪声大 6 个数量级 ✓）
-#:   -> 代价：金值必须在**量化方案**下重录一次 ✓（旧金值是逐位方案，已失效 ✓）
-QUANT_DIGITS = 9
+#:   第一版：对 float64 权重取 sha256 ✗ —— **逐位**判据 ✓
+#:     -> 权重来自 BLAS ✓ **归约顺序不是跨实现确定的** ✗
+#:     -> 实测：相对 **1e-15** 的扰动就能翻转校验和 ✗（server 亲测 ✓）
+#:        macOS(Accelerate) 与 Windows(OpenBLAS) 的差异正好在这个量级 ✓
+#:     -> 于是这个安全网**只在录制它的那台机器上有效** ✗✗
+#:
+#:   第二版（错的 ✗）：先 `np.round(arr, 9)` 再哈希 ✓ 想靠量化吸收噪声 ✗
+#:     -> **哈希是不连续函数** ✗ 舍入边界处会跳变 ✓
+#:     -> 翻转概率 ≈ N × (噪声/步长) = 577045 × (1e-15/1e-9) ≈ **0.58** ✗
+#:        —— 577k 个参数里**必然有落在边界上的** ✓ 量化只是降概率、没消除 ✓
+#:     -> 要压到 << 1 需要步长 >> 6e-10 ✓ 但那时 1e-8 的真信号也被埋了 ✗
+#:     -> **分辨力与鲁棒性在同一根轴上冲突 -> 这条路本身是错的** ✗
+#:
+#:   第三版（本版 ✓）：**比连续统计量，不比离散哈希** ✓
+#:     -> 存一份**金值权重**（npz ✓ 577k×4B ≈ 2.3 MB ✓ 可入库 ✓）
+#:     -> 比较 `max_abs_diff` ✓ **它是连续的** ✓
+#:        同机重跑 diff = 0 ✓；跨机器 diff ~1e-15 ✓ **都远小于 1e-9 阈值** ✓
+#:        -> 阈值有 6 个数量级余量 ✓ **不存在「边界翻转」问题** ✓
+#:     -> 仍能抓到真正的重构错误 ✓（实测注入 1e-8 必被抓 ✓）
+TOL_ABS = 1e-9
+TOL_REL = 1e-9
+
+#: 金值权重文件（**独立于代码** ✓ 由 `--record` 生成 ✓ 入库以便跨机器比较 ✓）
+GOLDEN_NPZ = Path(__file__).resolve().parent / "_golden_step_weights.npz"
 
 
 def weight_checksum(net: Net) -> str:
-    """确定性校验和：按**参数名排序**后逐数组喂进 sha256 ✓
+    """同机判据用的**诊断指纹** ✓ —— ⚠️ **不要**拿它做跨机器断言 ✗
 
-    ⚠️ 必须对「某个头漏乘梯度」敏感 ✗ —— 见末尾的敏感性自检 ✓
-    ⚠️ 先 `np.round(..., QUANT_DIGITS)` 再取哈希 ✓ 理由见上面那段注释 ✗
+    它仍然有用：同一台机器上前后对照、以及打印出来便于人工比对 ✓
+    跨机器断言必须走 :func:`max_abs_diff_vs_golden` ✓
     """
     h = hashlib.sha256()
     for name, arr in sorted(net.params(), key=lambda kv: kv[0]):
         h.update(name.encode())
-        a = np.ascontiguousarray(arr, dtype=np.float64)
-        h.update(np.ascontiguousarray(np.round(a, QUANT_DIGITS)).tobytes())
+        h.update(np.ascontiguousarray(arr, dtype=np.float64).tobytes())
     return h.hexdigest()
+
+
+def save_golden(net: Net) -> None:
+    """把当前权重存成金值 ✓（`--record` 用 ✓）"""
+    np.savez_compressed(GOLDEN_NPZ, **{n: p for n, p in net.params()})
+
+
+def max_abs_diff_vs_golden(net: Net) -> float:
+    """返回「当前权重 vs 金值权重」的**最大绝对差** ✓ 连续量 ✓ 可跨机器 ✓
+
+    ⚠️ 若金值文件不存在 -> 抛 FileNotFoundError ✓（不静默通过 ✗）
+    """
+    with np.load(GOLDEN_NPZ) as g:
+        worst = 0.0
+        for name, p in net.params():
+            if name not in g.files:
+                raise KeyError(f"金值里缺参数 {name!r} —— 结构变了 ✗ 需重录 ✓")
+            ref = g[name]
+            if ref.shape != p.shape:
+                raise ValueError(f"{name!r} 形状变了 {ref.shape} -> {p.shape} ✗")
+            # 绝对 + 相对，取更宽松的那个 ✓（大权重的相对误差才有意义 ✓）
+            d = np.abs(p - ref) - TOL_REL * np.maximum(np.abs(ref), 1.0)
+            worst = max(worst, float(d.max()) if d.size else 0.0)
+        return worst
 
 
 def run_steps(net: Net, data: dict, steps: int = STEPS) -> None:
@@ -143,30 +178,46 @@ def run_steps(net: Net, data: dict, steps: int = STEPS) -> None:
         )
 
 
-def checksum_of_current_impl() -> str:
+def run_current_impl() -> Net:
+    """跑一遍当前实现，返回训完的 net ✓（校验和与容差比较都用它 ✓）"""
     net = Net(dim=DIM4, hidden=(512, 512), seed=123, lr=3e-4)
     data = make_data()
     run_steps(net, data)
-    return weight_checksum(net)
+    return net
+
+
+def checksum_of_current_impl() -> str:
+    return weight_checksum(run_current_impl())
 
 
 def main(argv: list[str]) -> int:
     if "--record" in argv:
-        print("  （录制模式：把下面这行填进 GOLDEN）")
-        print(f'GOLDEN = "{checksum_of_current_impl()}"')
+        net = run_current_impl()
+        save_golden(net)
+        print(f"  （录制模式：金值权重已写入 {GOLDEN_NPZ}）")
+        print(f"  同机指纹 GOLDEN = \"{weight_checksum(net)}\"")
         return 0
 
-    print("== 1) 改造前后数值必须一致 ==")
-    got = checksum_of_current_impl()
-    print(f"  当前实现: {got}")
-    print(f"  金值    : {GOLDEN}")
-    if GOLDEN == "PENDING":
-        print("  ⚠️ GOLDEN 还没录制 —— 先跑一次 --record 填进去 ✗")
-        FAILED.append("GOLDEN 未录制")
+    print("== 1) 改造前后数值必须一致（**容差比较，跨机器可移植** ✓）==")
+    net = run_current_impl()
+    got = weight_checksum(net)
+    print(f"  同机指纹: {got}   （仅诊断用 ✓ 不做跨机器断言 ✗）")
+    if not GOLDEN_NPZ.exists():
+        print(f"  ⚠️ 金值文件不存在：{GOLDEN_NPZ} ✗")
+        print("     先跑一次 --record 生成 ✗")
+        FAILED.append("金值权重未录制")
     else:
-        check(got == GOLDEN,
-              f"step() 的数值变了！重构必须行为不变 ✗\n"
-              f"      期望 {GOLDEN}\n      实得 {got}")
+        try:
+            d = max_abs_diff_vs_golden(net)
+        except (KeyError, ValueError) as e:
+            check(False, f"金值与当前结构不匹配 ✗ {e}（结构改了要重录 ✓）")
+        else:
+            print(f"  最大容差内偏差: {d:.3e}   （< 0 即通过 ✓ 阈值 {TOL_ABS:.0e}/{TOL_REL:.0e} ✓）")
+            check(d <= 0.0,
+                  f"step() 的数值变了！重构必须行为不变 ✗\n"
+                  f"      最大容差内偏差 {d:.3e} > 0 ✓\n"
+                  f"      提示：跨机器的 BLAS 噪声在 ~1e-15 ✓ 远小于阈值 ✓\n"
+                  f"      若偏差在 1e-9 以上 -> 是真的改错了 ✗ 不是噪声 ✓")
 
     print("\n== 2) 校验和必须**确定性**（同输入两次跑结果相同）==")
     again = checksum_of_current_impl()
