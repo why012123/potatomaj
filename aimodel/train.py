@@ -880,6 +880,29 @@ def cmd_rl(args) -> Net:
     # 崩掉那一轮之后的训练数据是用崩掉的策略采的，会越跑越远。
     # 所以同时留一份内存里的最优备份，跑完回滚回去。
     best_net = net.copy()
+    # KL 退火（`--kl-anneal`，**默认关**）：按「逐头熵 + 实测 KL」逐步放开锚定。
+    # 规则见 `tools/kl_anneal.py`。信号（`entropy_by_kind` / `kl`）由
+    # `train_rl` 每轮的 `hist` 直接给出，不用改 `net` 的任何接口 ✓
+    anneal_st = None
+    kl_coef_now = float(args.kl_coef)
+    _acfg = None
+    if getattr(args, "kl_anneal", False):
+        # 延迟导入：不开退火就不依赖 tools/ ✓
+        # 顶层 import 会让**没装 tools/ 的机器连 aimodel.train 都 import 不了** ✗
+        from tools.kl_anneal import (
+            Action, AnnealConfig, AnnealState, kl_anneal_step,
+        )
+
+        _acfg = AnnealConfig(
+            kl_coef0=float(args.kl_coef),
+            kl_floor=float(getattr(args, "kl_floor", 0.01)),
+            decay=float(getattr(args, "kl_decay", 0.5)),
+        )
+        anneal_st = AnnealState(kl_coef=kl_coef_now, ref_entropy={})
+        print(
+            f"  KL 退火已开：起始 kl_coef={kl_coef_now}  下限={_acfg.kl_floor}"
+            f"  每档 x{_acfg.decay}（首轮先测各头起点熵，从第 2 轮起判）"
+        )
     for it in range(1, args.iters + 1):
         t0 = time.perf_counter()
         data, st = collect_selfplay(
@@ -899,7 +922,7 @@ def cmd_rl(args) -> Net:
             batch_size=args.batch,
             seed=args.seed + it,
             ent_coef=max(0.002, 0.01 * (1 - it / (args.iters + 1))),
-            kl_coef=args.kl_coef,
+            kl_coef=kl_coef_now,
             ref=ref_net,
         )
         ev = quick_eval(
@@ -909,7 +932,58 @@ def cmd_rl(args) -> Net:
         print(
             f"  [{it}/{args.iters}] {len(data['X'])} 决策  {dt:.0f}s  {fmt_eval(ev)}"
         )
+        # --- KL 退火：用本轮实测的 KL 与逐头熵决定下一轮的锚定强度 ---
+        if anneal_st is not None:
+            _last = hist[-1] if hist else {}
+            _ent = _last.get("entropy_by_kind") or {}
+            _kl = float(_last.get("kl", 0.0))
+            if it == 1:
+                # 首轮只**测**各头起点熵，不判降档 —— 那时还没有基线可比 ✓
+                anneal_st.ref_entropy = dict(_ent)
+                print("    退火：首轮只记录各头起点熵 -> "
+                      + " ".join(f"{k}={v:.2f}" for k, v in sorted(_ent.items())))
+            else:
+                anneal_st, _act = kl_anneal_step(
+                    anneal_st, ent_by_kind=_ent, measured_kl=_kl, cfg=_acfg
+                )
+                kl_coef_now = anneal_st.kl_coef
+                _extra = ""
+                if _act is Action.REHEAT:
+                    _extra = f"  坍缩头={anneal_st.history[-1].get('collapsed')}"
+                print(f"    退火：{_act.value}  kl={_kl:.4f} -> kl_coef={kl_coef_now:.4f}{_extra}")
+                if _act is Action.ABORT:
+                    # 已在锚定上限仍坍缩 -> 救不回来了：回滚 + **停止本次 RL**（不是 continue）
+                    print(f"  ⛔ 退火判定 ABORT（第 {it} 轮）：已在上限仍坍缩，"
+                          f"回滚到最优并停止本次 RL")
+                    net = best_net.copy()
+                    net.save(args.out)
+                    log["rl"].append({"iter": it, "aborted": True,
+                                      "reason": anneal_st.history[-1].get("reason")})
+                    save_log(args, log)
+                    return net
+                if _act is Action.REHEAT:
+                    # --- REHEAT 主分支（测试锚定下面这行标记，别删）---
+                    # 真的回滚**内存里的权重** —— 「有机制」≠「被调用了」（第七种形状）
+                    net = best_net.copy()
+                    # REHEAT 后把参考也拉到恢复点。
+                    #
+                    # 语义变化（**有意**，不是笔误）：
+                    #   不重置 -> KL 衡量「离 BC 有多远」，约束恒定 ✓
+                    #   重置   -> KL 衡量「离**上一轮最优**有多远」，
+                    #             约束**每 REHEAT 一次就松一档** ✓
+                    # 效果 = 每次 REHEAT 都再给一点自由 ✓ 与退火目标同向 ✓
+                    # 不重置的坏处：回滚后 KL 会瞬间变大 -> 下一轮又判「有余量」
+                    #   -> 可能反复降档 ✗
+                    #
+                    # ⚠️ 这里原来写的是「否则下轮还锚在坏策略上」—— **那句不成立** ✗
+                    # ref_net 的初值是 RL 开始前的 BC 权重 ✓ 它固定、不参与求导、
+                    # 也不会被 RL 改坏 ✓ 所以不存在「锚在坏策略上」这回事 ✓
+                    # （mac 审出来的：**注释写错理由比没注释更危险** ⚠️ 第②种形状）
+                    ref_net = net.copy()
+                    net.kl_coef = kl_coef_now
+                    print(f"    ↩ 退火触发回滚：内存权重已回到 {best_delta:+.1f}")
         log["rl"].append({"iter": it, "samples": int(len(data["X"])), "eval": ev,
+                          "kl_coef": kl_coef_now,
                           "selfplay": {k: v for k, v in st.items() if k != "scores"}})
         if ev["平均段位分"] > best_delta:
             best_delta = ev["平均段位分"]
@@ -993,6 +1067,16 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--kl-coef", type=float, default=0.1,
                     help="KL 锚定强度（0 = 关）。把 RL 策略拉回克隆阶段的参考策略，"
                          "防止把 BC 学的牌效训崩；太紧 RL 动不了，太松等于没锚")
+    ap.add_argument("--kl-anneal", action="store_true",
+                    help="KL 退火：按「逐头熵 + 实测 KL」逐步放开锚定（**默认关**，"
+                         "不开则行为与以前完全一致）。规则见 tools/kl_anneal.py："
+                         "熵有余量且 KL 小才降一档；熵坍缩则回退一档并回滚内存权重；"
+                         "已在上限仍坍缩则 ABORT（回滚 + 停止本次 RL，不空转）")
+    ap.add_argument("--kl-floor", type=float, default=0.01,
+                    help="退火的锚定下限（**永不归零** —— P1-2 的防崩精神："
+                         "留一个很小的锚 != 没锚，仍能挡住一步崩掉）")
+    ap.add_argument("--kl-decay", type=float, default=0.5,
+                    help="每降一档乘多少")
     args = ap.parse_args(argv)
 
     if args.list_models:
