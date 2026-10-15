@@ -33,7 +33,24 @@ def check(cond: bool, msg: str) -> None:
 
 
 print("== 注册表 ==")
-check(len(variants.MODELS) == 8, f"应该有 8 个模型，得到 {len(variants.MODELS)}")
+# ⚠️ 别写死数量 ✗ 模型家族会继续增加（maj-pro 加进来时这条断言就误报过 ✓）
+#    注册表里存的是**带版本号**的规范名（maj-normalv1.1）✓
+#    所以按「8 个基础别名都能解析出来」断言结构，额外家族允许存在 ✓
+_base = [f"maj-{cond}{suf}"
+         for cond in ("normal", "mountain", "flash", "huge")
+         for suf in ("", "4")]
+_unresolved = []
+for alias in _base:
+    try:
+        variants.resolve(alias)
+    except KeyError:
+        _unresolved.append(alias)
+check(not _unresolved, f"这八个基础模型的名字解析不出来：{_unresolved}")
+check(len(variants.MODELS) >= 8,
+      f"至少要有 8 个基础模型，得到 {len(variants.MODELS)}")
+_extra = sorted(n for n in variants.MODELS if "pro" in n)
+print(f"  ✅ 8 个基础模型（四个条件 × 三/四麻）都能解析；"
+      f"另有扩展家族：{_extra or '无'}")
 # 正名带版本号（当前 v1.1），不带版本的写法都是别名
 from aimodel import variants as _v  # noqa: E402
 
