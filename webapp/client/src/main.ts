@@ -594,6 +594,11 @@ class App {
       seq: this.conn.lastState?.seq ?? -1,
     };
   }
+
+  /** 排障入口：自检脚本要能主动触发一次布局修正。 */
+  tableApi(): TableView {
+    return this.table;
+  }
 }
 
 function hint(text: string): HTMLSpanElement {
@@ -614,5 +619,6 @@ if (host) {
     state: () => app.debug().state as StateMsg | null,
     debug: () => app.debug(),
     el: () => document.querySelector(".table"),
+    table: () => app.tableApi(),
   };
 }

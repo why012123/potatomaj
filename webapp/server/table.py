@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -471,6 +472,8 @@ class Room:
            观战的人看到的就是「牌桌卡住了」。``broadcast_later`` 自带 30fps 合并。
         """
         kind = ev.get("kind")
+        if os.environ.get("MAJ_DEBUG_PUSH"):
+            log.info("ACT %s kind=%s conns=%d", self.id, kind, len(self.conns))
         if kind == "start_hand":
             self._pond_red = [[] for _ in range(self.players)]
             self._hand_started = True
@@ -864,7 +867,15 @@ class Room:
 
         这里会做**合并**：引擎跑得快的时候（AI 节拍 0），一次动作可能连着
         触发好几次广播请求；全部照发只会把客户端和网络刷爆，而且后一帧
-        本来就把前一帧覆盖了。所以合并窗口内只保留一次，窗口结束时补发。
+        本来就把前一帧覆盖了。
+
+        实现上是**自驱动的重排**：窗口内再来请求就只记一个「还有活」的标记，
+        由当前这次回调在窗口结束时**再排一轮**，自己把自己续上，
+        直到没有新请求为止。
+
+        （之前写成「标记置上就直接 return」—— 而标记只有当前回调会清，
+        一旦它先跑完、标记后到，这条链就断了：房间还剩几十手没打，
+        客户端却再也收不到帧。观战「打着打着就静止」就是这个 bug。）
         """
         if self.closed and self.phase != PHASE_FINISHED:
             return
@@ -873,8 +884,10 @@ class Room:
             if self._push_scheduled:
                 self._push_pending = True
                 return
-            wait = self._push_min_gap - (now - self._push_last)
+            wait = max(0.0, self._push_min_gap - (now - self._push_last))
             self._push_scheduled = True
+        if os.environ.get("MAJ_DEBUG_PUSH"):
+            log.info("PUSH-REQ %s wait=%.4f conns=%d", self.id, wait, len(self.conns))
         try:
             if wait <= 0:
                 self.loop.call_soon_threadsafe(self._push_now)
@@ -884,21 +897,41 @@ class Room:
             with self._push_lock:
                 self._push_scheduled = False
 
+    def push_soon(self) -> None:
+        """立刻推一帧，不做合并。给「必须马上看到」的场合用（新连接进来）。"""
+        with self._push_lock:
+            self._push_last = time.time()
+
     def _push_now(self) -> None:
         """（事件循环线程）合并窗口到期，真正推一帧。"""
-        with self._push_lock:
-            again = self._push_pending
-            self._push_pending = False
-            if again:
+        try:
+            with self._push_lock:
+                self._push_scheduled = False
+                again = self._push_pending
+                self._push_pending = False
                 self._push_last = time.time()
+                if again:
+                    # 窗口内又有人请求了：把下一次回调排上，链条不断
+                    self._push_scheduled = True
+            if os.environ.get("MAJ_DEBUG_PUSH"):
+                log.info("PUSH-NOW %s again=%s", self.id, again)
+            self.push_state()
+            if os.environ.get("MAJ_DEBUG_PUSH"):
+                log.info("PUSH-DONE %s seq=%d conns=%d", self.id, self.seq,
+                         len(self.conns))
+            if again:
                 try:
                     self.loop.call_later(self._push_min_gap, self._push_now)
-                    return
                 except RuntimeError:
-                    pass
-            self._push_scheduled = False
-            self._push_last = time.time()
-        self.push_state()
+                    with self._push_lock:
+                        self._push_scheduled = False
+        except Exception:  # noqa: BLE001
+            # **绝不能把合并链断掉**：这里一旦抛出去，``_push_scheduled``
+            # 可能停在 True 上，之后所有 ``broadcast_later`` 都只置一个标记、
+            # 谁也不会来清理 —— 房间还在打，客户端却永远收不到下一帧。
+            log.exception("房间 %s 推送失败", self.id)
+            with self._push_lock:
+                self._push_scheduled = False
 
     def push_state(self) -> None:
         """（事件循环线程）给每条连接推一份**他自己的**快照。
@@ -910,6 +943,9 @@ class Room:
         conns = list(self.conns.values())
         if not conns:
             return
+        # 只在这一小段里持锁**做快照**；逐条连接拼视角 + 序列化放到锁外 ——
+        # 引擎线程在 `_on_action` 里也要拿这把锁，事件循环攥着它做几十条
+        # 连接的 JSON 序列化，会把引擎整段卡住（观战看着就是「画面不动了」）。
         with self.lock:
             self.seq += 1
             seq = self.seq

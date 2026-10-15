@@ -252,10 +252,10 @@ export class TableView {
   /**
    * 「下一帧再量一次」。
    *
-   * 手牌刚被重建的那一帧，浏览器可能还没把 flex 布局算完（尤其是侧家 ——
-   * 祖先带旋转，`offsetWidth` 在第一帧会读到旧值）。这时算出来的盒子尺寸
-   * 是错的，会把整家摆到屏幕外。所以每帧结束后再补一次，用一个 rAF 兜底，
-   * 不重复排队。
+   * 手牌 / 牌河刚被重建的那一帧，浏览器还没把布局算完；而且我们在同一帧里写了
+   * `--edge-w/h`、`--fix-x/y` 这些自定义属性，**立刻**去读 `getBoundingClientRect`
+   * 拿到的还是改动之前的值。所以修正必须跨帧迭代：一帧一轮，量到稳定为止。
+   * 用一个标记去重，不重复排队。
    */
   private scheduleRefit(): void {
     if (this.refitPending) return;
@@ -513,27 +513,22 @@ export class TableView {
   // ---------------------------------------------------------------- 布局 --
 
   /**
-   * 定尺寸修正。顺序不能反：
+   * 布局修正：一帧只做一轮「量 → 改」，靠 `scheduleRefit()` 逐帧迭代到收敛。
    *
-   * 1. `fitHandSpan` 量出手牌真实跨度 → 写 `--edge-w` / `--edge-h` /
-   *    `--hand-span`。**必须先做**：盒子尺寸是下一步解方程里的已知量，
-   *    而 CSS 自己撑不出这个尺寸（见 fitHandSpan 的注释）。
-   * 2. `fitEdge` 反解 `--fix-x / --fix-y`，把整家摆到桌边（贴桌沿 + 居中）。
+   * 顺序：先把手牌尺寸 / 盒内偏移算好（纯算术，见 `fitHandSpan`），再让整家
+   * 的自校正往前走一步（`fitEdge`，量现状补差值）。
    *
-   * 副露和牌河**不需要单独修正**：它们的落点在 CSS 里就是用
-   * `--edge-w/h` 和 `--hand-span` 算出来的（`calc(50% ± var(--hand-span))`），
-   * 盒子一摆正，它们自然跟着正。之前对牌河做「量残差再补」那一步是多余的，
-   * 而且是有害的 —— 量出来的残差一旦被脏值污染，就会把牌河推到屏幕外
-   * （踩过：`--pond-dy` 累加到 3000px）。**能算就别量。**
+   * 为什么不在同一帧里跑两遍：改完自定义属性立刻量，读到的还是旧布局 ——
+   * 两遍里第二遍量到的仍是旧值，纯属白跑（踩过：修正写了但位置纹丝不动）。
    */
   fitLayout(): void {
     this.fitCount++;
-    for (let pass = 0; pass < 2; pass++) {
-      for (const v of this.seats.values()) this.fitHandSpan(v);
-      for (const v of this.seats.values()) this.fitEdge(v);
-    }
+    let moved = 0;
+    for (const v of this.seats.values()) this.fitHandSpan(v);
+    for (const v of this.seats.values()) moved += this.fitEdge(v);
     this.lastDiag = {
       fit: this.fitCount,
+      moved: Math.round(moved * 10) / 10,
       size: `${window.innerWidth}x${window.innerHeight}`,
       seats: [...this.seats.entries()].map(([seat, v]) => {
         const r = v.edge.getBoundingClientRect();
@@ -554,6 +549,8 @@ export class TableView {
       }),
       overflow: this.overflowReport(),
     };
+    // 还没收敛就下一帧接着来（最多几帧，不会一直跑）
+    if (moved > 0.5) this.scheduleRefit();
   }
 
   /**
@@ -567,52 +564,94 @@ export class TableView {
    * `getPropertyValue()` 返回的是**没解析的表达式字符串**，parseFloat 是 NaN。
    */
   private fitHandSpan(v: SeatView): void {
-    const span = handSpan(v.hand);
-    if (!span) return;
     const tile = v.hand.querySelector<HTMLElement>(".tile");
-    const tileH = tile && tile.offsetHeight ? tile.offsetHeight : span / 14;
+    const tileW = tile && tile.offsetWidth ? tile.offsetWidth : 30;
+    const tileH = tile && tile.offsetHeight ? tile.offsetHeight : tileW / 0.96;
+    const n = v.hand.children.length;
+    if (!n) return;
+    // 跨度按「张数 × 牌宽 + 牌距」算，不依赖任何一次 DOM 收缩计算 ——
+    // 手牌在带旋转的祖先里会被压扁，父元素的尺寸一律不可信。
+    const gap = parseFloat(getComputedStyle(v.hand).columnGap) || 0;
+    const span = tileW * n + gap * (n - 1);
     const side = v.dir === "left" || v.dir === "right";
     const slack = Math.max(2, tileH * 0.1);
     const thick = tileH + slack * 2;
 
-    v.boxW = side ? thick : span;
-    v.boxH = side ? span : thick;
+    // 盒子尺寸：一边是「手牌跨度」，另一边是「牌厚 + 留白」。**不能比手牌窄** ——
+    // 手牌要在盒子里居中，盒子比手牌窄就会把它顶出去（下家只剩几张牌的时候
+    // 最容易碰上）。短边用 max，多出来的空间由居中偏移吃掉，这样牌河 / 副露
+    // 相对手牌的位置不随手牌张数抖动。
+    const across = Math.max(span, thick);
+    v.boxW = side ? thick : across;
+    v.boxH = side ? across : thick;
     v.edge.style.setProperty("--edge-w", `${v.boxW.toFixed(2)}px`);
     v.edge.style.setProperty("--edge-h", `${v.boxH.toFixed(2)}px`);
     v.edge.style.setProperty("--side-slack", `${slack.toFixed(2)}px`);
     v.edge.style.setProperty("--hand-span", `${span.toFixed(2)}px`);
     v.edge.style.setProperty("--hand-thick", `${thick.toFixed(2)}px`);
-    // 副露：紧跟手牌右端（侧家是「手牌厚」之后一个留白）
-    v.edge.style.setProperty("--melds-lead", `${(span / 2 + slack * 2).toFixed(2)}px`);
-    // 牌河：下 / 上家在手牌内侧让开半张牌；侧家还要跨过副露那一条带子
-    v.edge.style.setProperty(
-      "--pond-gap",
-      side ? `${(slack + tileH * 2.6).toFixed(2)}px` : `${(slack * 2 + tileH * 0.5).toFixed(2)}px`,
-    );
+    // 手牌居中偏移 =「盒子长边 - 手牌跨度」的一半
+    v.edge.style.setProperty("--hand-center", `${((across - span) / 2).toFixed(2)}px`);
+    if (side) {
+      // ---- 侧家 ----
+      // 手牌在局部 x = slack .. slack + 牌厚（贴着墙那一边）。
+      // 副露紧挨手牌里侧；牌河再往里让开副露那一条带子（最多 4 张副露）。
+      v.edge.style.setProperty("--melds-lead", `${thick.toFixed(2)}px`);
+      v.edge.style.setProperty("--pond-lead", `${(thick + slack).toFixed(2)}px`);
+      // 牌河的上边缘 = 手牌起点 + 让开的距离。手牌在局部 y ∈ [0, span]，
+      // 用 `top`（自盒子顶边往下量）最直观，不跟 `bottom` 的百分比打架。
+      v.edge.style.setProperty("--pond-gap", `${(tileH * 2.6 + slack).toFixed(2)}px`);
+    } else {
+      // ---- 下 / 上家 ----
+      // 副露紧挨手牌右端；牌河右端与手牌右端对齐，整体在手牌内侧。
+      // 顶家整体转了 180°，局部 x/y 都翻了，所以它的 CSS 用的是
+      // `right` / `bottom` —— 同一套「往盒子里量」的偏移在两边都成立。
+      v.edge.style.setProperty("--melds-lead", `${((across - span) / 2 - slack).toFixed(2)}px`);
+      v.edge.style.setProperty(
+        "--pond-lead",
+        `${((across - span) / 2 - slack).toFixed(2)}px`,
+      );
+      v.edge.style.setProperty("--pond-gap", `${(thick + tileH * 0.5).toFixed(2)}px`);
+    }
   }
 
   /**
-   * 把整家摆到桌边。
+   * 副露 / 牌河的位置**全部靠算**（见 `fitHandSpan` 里那几个 `--melds-lead`
+   * / `--pond-lead` / `--pond-gap`），没有单独的修正函数。
    *
-   * 用**自校正**而不是解方程：
+   * 为什么不留「量残差再补」的兜底（踩过的坑）：这类元素的落点在带旋转的祖先
+   * 里量不准，一旦某个 `--x` 被补反了方向，`requestAnimationFrame` 每帧都会
+   * 再补一次同样的量，几十帧之后牌河就跑到离桌子几千像素外去了。
+   * **能算就别量**，这条比「量了再补」稳得多。
+   */
+
+  /**
+   * 把整家摆到桌边 —— 一次自校正迭代。
    *
    *     translate ← translate + (目标位置 - 现在的实际位置)
    *
    * 因为 `translate(t) rotate(θ)` 里 rotate 绕自身中心、**旋转不改包围盒中心**，
-   * 所以「包围盒中心 = 静止中心 + t」恒成立，一轮就把差值补平，不会振荡。
+   * 所以「包围盒中心 = 静止中心 + t」恒成立，一次迭代就把差值补平，不会振荡。
    *
-   * 为什么不直接解方程：同一帧里刚写进去的 `--edge-w/h`，读 `offsetWidth` 还是
-   * 上一帧的旧值 —— 拿它当已知量会把旋转中心算错（实测右家被推到桌子中线上、
-   * 左家跑出屏幕）。自校正只用「量到的现状」：脏数据只会让这一轮少补一点，
-   * 下一轮补上（跑两轮 + 每帧兜底一次，足够收敛）。
+   * ## 为什么必须跨帧迭代，不能在同一帧里跑两遍
+   *
+   * 我们在同一帧里改了 `--edge-w/h`、`--fix-x/y` 这些自定义属性，然后**立刻**
+   * 用 `getBoundingClientRect()` 去量 —— 拿到的还是**改动之前**的布局。同一帧里
+   * 跑两遍「改 → 量」是白跑：第二遍量到的仍然是旧值。表现就是「明明算了修正，
+   * 位置却纹丝不动」，或者更糟 —— 用旧尺寸解方程把整家推到屏幕外。
+   *
+   * 正确做法：一帧只做一轮「量 → 改」，靠 `requestAnimationFrame` 迭代到收敛
+   * （见 `scheduleRefit`）。实测 2~3 帧就稳定到亚像素。
+   *
+   * 返回这一轮改了多少（收敛判据用）。
    */
-  private fitEdge(v: SeatView): void {
+  private fitEdge(v: SeatView): number {
     const parent = this.root.getBoundingClientRect();
     const side = v.dir === "left" || v.dir === "right";
-    const r = v.edge.getBoundingClientRect();
-    if (!r.width && !r.height) return;
+    // 量**手牌里每一张牌的并集**：容器在带旋转的祖先下会塌掉，而牌一定画出来了
+    const r = spanOf(v.hand, ".tile, .hand__gap");
+    if (!r) return 0;
 
-    // 目标：整家贴到桌子对应的沿上、另一个方向居中
+    // 目标：让手牌贴到桌子对应的沿上、另一个方向居中
     const wantCx = side
       ? v.dir === "right"
         ? parent.right - r.width / 2
@@ -626,12 +665,13 @@ export class TableView {
 
     const haveX = num(v.edge.style.getPropertyValue("--fix-x"));
     const haveY = num(v.edge.style.getPropertyValue("--fix-y"));
-    const dx = wantCx - (r.left + r.width / 2);
-    const dy = wantCy - (r.top + r.height / 2);
-    // 限幅：万一量到脏值，也不要把整家甩到屏幕外，下一轮再收敛
-    const clamp = (d: number): number => Math.max(-300, Math.min(300, d));
-    v.edge.style.setProperty("--fix-x", `${(haveX + clamp(dx)).toFixed(2)}px`);
-    v.edge.style.setProperty("--fix-y", `${(haveY + clamp(dy)).toFixed(2)}px`);
+    // 限幅：先按小步长逼近，量到脏值也不会把整家甩出屏幕
+    const clamp = (d: number): number => Math.max(-200, Math.min(200, d));
+    const dx = clamp(wantCx - (r.left + r.width / 2));
+    const dy = clamp(wantCy - (r.top + r.height / 2));
+    v.edge.style.setProperty("--fix-x", `${(haveX + dx).toFixed(2)}px`);
+    v.edge.style.setProperty("--fix-y", `${(haveY + dy).toFixed(2)}px`);
+    return Math.abs(dx) + Math.abs(dy);
   }
 
   /** 自检用：哪些家具跑出了牌桌。 */
@@ -669,29 +709,25 @@ export class TableView {
 
 // ---------------------------------------------------------------- 工具 --
 
-/** 手牌里每张牌的宽度之和 + 牌距 = 手牌真实跨度。 */
-function handSpan(box: HTMLElement): number {
-  const kids = Array.from(box.children).filter((c): c is HTMLElement => c instanceof HTMLElement);
-  if (!kids.length) return 0;
-  let sum = 0;
-  for (const k of kids) sum += k.offsetWidth;
-  const gap = parseFloat(getComputedStyle(box).columnGap) || 0;
-  return sum + gap * Math.max(0, kids.length - 1);
+/** CSS 自定义属性里的像素值（写进去的都是 `12.34px`，解析失败当 0）。 */
+function num(raw: string): number {
+  const n = parseFloat(raw);
+  return Number.isFinite(n) ? n : 0;
 }
 
 /**
- * 一组子元素的包围盒并集。
+ * 一组子元素的包围盒并集（取不到就返回 null）。
  *
- * 为什么要并集而不是直接量父元素：左右两家的 ancestor 带 `rotate(±90deg)`，
- * `.edge__hand` 自己的包围盒会被压成「一张牌的宽度」（实测 19px vs 378px），
- * 而**牌本身**没有旋转，逐张量是准的。
+ * **不要直接量容器**：左右两家的祖先带 `rotate(±90deg)`，容器自己的包围盒会
+ * 被压成「一张牌的宽度」（实测 19px vs 378px）。子元素（牌、副露组）自己没有
+ * 额外的旋转，逐个子元素量出来的并集才是真的。
  */
-function unionRect(box: HTMLElement): DOMRect | null {
+function spanOf(box: HTMLElement, sel: string): DOMRect | null {
   let l = Infinity;
   let t = Infinity;
   let r = -Infinity;
   let b = -Infinity;
-  for (const child of Array.from(box.children)) {
+  for (const child of Array.from(box.querySelectorAll(sel))) {
     if (!(child instanceof HTMLElement)) continue;
     const cr = child.getBoundingClientRect();
     if (!cr.width && !cr.height) continue;
@@ -702,12 +738,6 @@ function unionRect(box: HTMLElement): DOMRect | null {
   }
   if (!Number.isFinite(l)) return null;
   return new DOMRect(l, t, r - l, b - t);
-}
-
-/** CSS 自定义属性里的像素值（写进去的都是 `12.34px`，解析失败当 0）。 */
-function num(raw: string): number {
-  const n = parseFloat(raw);
-  return Number.isFinite(n) ? n : 0;
 }
 
 function countMeldTiles(melds: MeldInfo[]): number {

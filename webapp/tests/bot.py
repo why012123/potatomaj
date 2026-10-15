@@ -57,9 +57,14 @@ class Bot:
         self.rejects: list[str] = []
         self.acts = 0
         self.actions: list[tuple[str, int | str]] = []
+        self.last_raw = ""
         self.rng = __import__("random").Random(hash(name) & 0xFFFF)
         #: state.seq -> 已经在这个决策点提交过的动作种类（防重复提交）
         self._decided: dict[int, set[str]] = {}
+        #: **后台读协程**把消息收进这个队列
+        self._inbox: asyncio.Queue[dict | None] = asyncio.Queue()
+        self._reader: asyncio.Task | None = None
+        self._dropped = 0
 
     # -- 身份 ---------------------------------------------------------------
     def _http_url(self) -> str:
@@ -115,10 +120,45 @@ class Bot:
         if self.auth:
             kw.setdefault("additional_headers", {"Cookie": f"maj_id={self.auth}"})
         self.ws = await websockets.connect(self.url, max_size=16 << 20, **kw)
+        # **必须先起后台读协程**：牌桌是服务端主动推的，客户端不能等到
+        # 「自己想读了」才去 recv。TCP 窗口读满之后 aiohttp 的 send_str
+        # 会被流控挡住，房间的写协程就卡在 await 上 —— 症状是
+        # 「服务端 seq 一直在涨、客户端却一帧都收不到」，很容易误判成
+        # 服务端的广播坏了。（这个坑花了一轮才定位到。）
+        self._reader = asyncio.create_task(self._read_loop(), name=f"bot-{self.name}")
+        # 连上就先收一条 hello（服务端会主动推），顺便把 lobby 也吃掉。
+        # 顺序很重要：**先等 hello，再发 hello**，不然自己发的那条回执
+        # 会被下一句 ``wait(hello)`` 吃掉、接着等一条永远不来的消息。
+        await self.wait(lambda m: m.get("t") == "hello", timeout=30)
         await self.send({"t": "hello", "name": self.name})
-        await self.wait(lambda m: m["t"] == "hello")
+
+    async def _read_loop(self) -> None:
+        try:
+            while True:
+                raw = await self.ws.recv()
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(msg, dict):
+                    if "t" in msg:
+                        self.absorb(msg)
+                    self.last_raw = raw
+                    self._inbox.put_nowait(msg)
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001 - 连接断了就结束
+            return
+        finally:
+            try:
+                self._inbox.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
 
     async def close(self) -> None:
+        if self._reader is not None:
+            self._reader.cancel()
+            self._reader = None
         if self.ws is not None:
             try:
                 await self.ws.close()
@@ -131,12 +171,24 @@ class Bot:
         await self.ws.send(json.dumps(obj))
 
     async def recv(self, timeout: float = 10.0) -> dict:
-        assert self.ws is not None, "没连接"
-        raw = await asyncio.wait_for(self.ws.recv(), timeout)
-        msg = json.loads(raw)
-        if isinstance(msg, dict) and "t" in msg:
-            self.absorb(msg)
-        self.last_raw = raw
+        """从后台读协程的队列里取一条。
+
+        队列满了就丢**最旧的** —— 状态快照本来就是「后一帧覆盖前一帧」，
+        测试脚本永远只关心最新的那一帧；不丢的话队列会无界增长。
+        """
+        if self._inbox.qsize() > 4000:
+            for _ in range(1000):
+                try:
+                    self._inbox.get_nowait()
+                    self._dropped += 1
+                except asyncio.QueueEmpty:
+                    break
+        try:
+            msg = await asyncio.wait_for(self._inbox.get(), timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            raise TimeoutError(f"{self.name} 等消息超时") from None
+        if msg is None:
+            raise ConnectionError(f"{self.name} 连接已断开")
         return msg
 
     def absorb(self, msg: dict) -> None:

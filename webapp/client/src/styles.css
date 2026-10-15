@@ -327,9 +327,16 @@ input, select { font: inherit; }
   height: var(--edge-h, calc(var(--tile-h) + var(--hand-pad) * 2));
 }
 
-.edge--bottom { left: 0; bottom: 0; }
+/* 下 / 上家也要带 translate：它们的 `--fix-x` / `--fix-y` 是 JS 写进去的
+   居中修正，**CSS 不读这两个变量，修正就等于白算**（踩过：下家和上家的手牌
+   一直贴在桌子左边，怎么调 JS 都没用）。 */
+.edge--bottom { left: 0; bottom: 0; transform: translate(var(--fix-x, 0px), var(--fix-y, 0px)); }
 /* 顶家整体转 180°：`.edge__hand` 因此要贴自己的下边缘 —— 转过来才落到屏幕上方 */
-.edge--top { left: 0; top: 0; transform: rotate(180deg); }
+.edge--top {
+  left: 0;
+  top: 0;
+  transform: translate(var(--fix-x, 0px), var(--fix-y, 0px)) rotate(180deg);
+}
 
 /*
   侧家：rotate(∓90°)。**两条边的旋转方向故意相反**，这是让「墙边」对上
@@ -353,16 +360,16 @@ input, select { font: inherit; }
 }
 
 .edge__hand {
-  /* 手牌是**普通流里的 flex 行**（不是绝对定位）—— 它要能被精确摆位，
-     也要能把「跨度」这件事交给最可靠的来源：JS 算好写进 `--hand-span`。
-     宽高都写死，不依赖浏览器收缩计算：父链上有 rotate(±90°)，收缩计算出来的
-     尺寸会被压扁（实测 19px vs 378px），而尺寸一旦错，盒子、副露、牌河全跟着错。 */
+  /* 手牌是**普通流里的 flex 行**风格的绝对定位块：宽高都由 JS 写死
+     （`--hand-span` / `--tile-h`），不依赖浏览器收缩计算 —— 父链上有
+     rotate(±90°)，收缩算出来的尺寸会被压扁（实测 19px vs 378px），
+     尺寸一错，盒子、副露、牌河全跟着错。 */
   position: absolute;
   display: flex;
   align-items: flex-end;
   gap: var(--tile-gap);
   flex-wrap: nowrap;
-  left: var(--side-slack, 0px);
+  left: var(--hand-center, 0px);
   right: auto;
   bottom: var(--side-slack, 0px);
   top: auto;
@@ -408,26 +415,30 @@ input, select { font: inherit; }
   align-content: start;
   justify-content: start;
 }
-/* 下 / 上家：牌河右端与手牌右端对齐（按列对齐，天凤的牌河就是这么看的） */
+/* 下 / 上家：牌河右端与手牌右端对齐（按列对齐，天凤的牌河就是这么看的）。
+   偏移量 `--pond-lead` 是 JS 算好的 px —— 这里**不写 `calc(50% - var(--x))`**：
+   百分比和自定义属性混在一条 calc 里会被静默算成 0（实测牌河贴到桌子边上）。 */
 .edge--bottom .edge__pond {
-  right: calc(50% - var(--hand-span, 0px) / 2 - var(--side-slack, 0px));
+  right: var(--pond-lead, 0px);
   left: auto;
   bottom: var(--pond-gap, 0px);
   top: auto;
 }
+/* 顶家整体转 180°：局部 x / y 都翻了过来，所以它的偏移要用「另一边」量
+   （`right` / `bottom`），否则牌河会跑到桌子外面去（`top` 会变成往上走）。 */
 .edge--top .edge__pond {
-  left: calc(50% - var(--hand-span, 0px) / 2 - var(--side-slack, 0px));
-  right: auto;
-  top: var(--pond-gap, 0px);
-  bottom: auto;
+  right: var(--pond-lead, 0px);
+  left: auto;
+  bottom: var(--pond-gap, 0px);
+  top: auto;
 }
-/* 侧家：牌河在手牌内侧，要跨过副露那一条带子 —— `--pond-gap` 里已经含了
-   这段距离（由 JS 算，别在这里写 `calc(100% - var())`，会被算成 0）。 */
+/* 侧家：牌河由「手牌靠桌心那一侧」往桌心叠，跨过副露那一条带子 ——
+   两个偏移都是 JS 算好的 px（见 table.ts 的 fitHandSpan）。 */
 .edge--side .edge__pond {
-  left: var(--hand-thick, 0px);
+  left: var(--pond-lead, 0px);
   right: auto;
-  top: var(--pond-gap, 0px);
-  bottom: auto;
+  bottom: var(--pond-gap, 0px);
+  top: auto;
   grid-template-columns: repeat(3, auto);
 }
 

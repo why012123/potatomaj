@@ -20,6 +20,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 from aimodel import variants
@@ -100,16 +101,53 @@ def net_missing_heads(net: Any) -> tuple[str, ...]:
     return tuple(getattr(net, "missing_heads", ()) or ())
 
 
-def probe_model(name: str) -> tuple[bool, str]:
-    """试着载一次，返回 ``(能不能用, 原因)``。给模型列表 / 开局前校验用。"""
+def probe_model(name: str, players: int | None = None) -> tuple[bool, str]:
+    """试着载一次并**真跑一下前向**，返回 ``(能不能用, 原因)``。
+
+    ``players`` 很关键：``encode()`` 的特征维度是**跟人数走**的
+    （三麻 486 维、四麻 560 维，因为对手的手牌/副露/牌河块数不同）。
+    拿三麻的 486 维去喂四麻权重，第一层 matmul 就会炸 —— 这就是
+    「四麻模型一直降级成教师」的真原因。
+    """
     try:
-        net = load_net(name)
+        spec = variants.get(name)
+    except KeyError:
+        return False, "注册表里没有这个模型"
+    n = players or spec.players
+    try:
+        net = load_net(spec.name)
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
+    want = int(getattr(net, "dim", 0) or 0)
+    got = _encode_dim(n)
+    if want and want != got:
+        return False, (f"特征维度对不上：权重 {want} 维，当前 encode({n}人) "
+                       f"{got} 维 —— 表示改过了，必须重训")
     missing = net_missing_heads(net)
     if missing:
         return True, f"未训练 {'/'.join(missing)}（这些动作交给内置教师）"
     return True, ""
+
+
+@lru_cache(maxsize=8)
+def _encode_dim(players: int) -> int:
+    """当前代码在 N 人局下的特征维度（缓存，别每次都造引擎）。
+
+    维度**跟人数走**（三麻 486 / 四麻 560，对手的牌河/副露块数不同），
+    所以不能写死一个常数。
+    """
+    from aimodel import sanma as S
+    from aimodel.agents import HeuristicAgent
+    from aimodel.encode import encode
+    from aimodel.engine import Game
+
+    # 座位 0 是「被观察的自己」，后面才是对手 —— 引擎要的是**整桌**的
+    # agent（人数必须和规则一致），少一个就报「这条规则要 4 个 agent」。
+    agents = [HeuristicAgent(999)] + [HeuristicAgent(1000 + i)
+                                      for i in range(players - 1)]
+    game = Game(agents, seed=99, rule=S.rule_for(players), rounds=1)
+    game.play_hand(0)
+    return int(len(encode(game.view_for(0))))
 
 
 def audit_at_startup() -> dict:
@@ -166,7 +204,7 @@ def available_models(refresh: bool = False) -> list[dict]:
             spec = variants.get(name)
         except KeyError:
             return
-        usable, why = probe_model(spec.name)
+        usable, why = probe_model(spec.name, spec.players)
         net = _nets.get(spec.name)
         missing = list(net_missing_heads(net)) if net is not None else []
         out[name] = {
@@ -446,6 +484,12 @@ class AISeat(Agent):
                     "（其余动作照常用模型）",
                     self.seat, name, list(self._missing),
                 )
+            # **开局前先真跑一次推理**：权重可能是按旧特征维度训的
+            # （encode.py 一改表示，存量权重的第一层就对不上了）。
+            # 那时候每次决策都会在线程池里抛 ValueError、再降级 ——
+            # 桌子不会崩，但一手牌要多花几十毫秒，而且日志会被刷满。
+            # 在这里撞一次墙，就能**整局**直接用教师，并且如实标出来。
+            self._probe(net, spec.players)
             return MLAgent(net, seed=self.seed, greedy=True, fallback=self.teacher)
         except Exception as exc:  # noqa: BLE001 - 模型坏了不能崩整桌
             self._missing = ()
@@ -456,6 +500,26 @@ class AISeat(Agent):
             if self.on_error is not None:
                 self.on_error(self.seat, self.degrade_reason)
             return self.teacher
+
+    def _probe(self, net: Any, players: int) -> None:
+        """确认权重和**当前代码**的表示配套。
+
+        两个都会踩的坑：
+
+        1. ``View`` 的字段会随训练侧改动增删（加 ``hand_red`` 那次就把这里
+           撞坏了，结果所有模型在开局探测时被判「载入失败」、整桌降级成教师）。
+           所以**不自己 ``View(...)``**，改用真的引擎造一副局面。
+        2. ``encode()`` 的特征维度**跟人数走**（三麻 486 / 四麻 560）。
+           拿三麻维度去喂四麻权重，第一层 matmul 就炸 —— 这就是
+           「四麻模型一直静默降级」的真原因。
+        """
+        want = int(getattr(net, "dim", 0) or 0)
+        got = _encode_dim(players)
+        if want and want != got:
+            raise ValueError(
+                f"特征维度对不上：这个权重是 {want} 维，当前代码在 {players} 人局下"
+                f"编出 {got} 维 —— 表示改过了，该权重必须重训"
+            )
 
     def _degrade(self, exc: BaseException) -> None:
         self.errors += 1
