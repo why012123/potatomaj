@@ -158,6 +158,7 @@ def _scan(body: str) -> str:
     out: list[str] = []
     n = len(body)
     i = 0
+    first_tag = True
     while i < n:
         ch = body[i]
         if ch != "<":
@@ -186,7 +187,8 @@ def _scan(body: str) -> str:
                 break
             k += 1
         tag = body[i : k + 1]
-        out.append(_clean_tag(tag))
+        out.append(_clean_tag(tag, is_root=(first_tag and tag.lstrip().startswith("<svg"))))
+        first_tag = False
         i = k + 1
     return "".join(out)
 
@@ -206,7 +208,7 @@ def _skip_brace(body: str, i: int) -> int:
     return n
 
 
-def _clean_tag(tag: str) -> str:
+def _clean_tag(tag: str, is_root: bool = False) -> str:
     """``<path style={{...}} fillRule="x" cx={12} {...p} />`` -> 干净的标准 SVG 标签。
 
     JSX 里属性值可能是表达式：``cx={135.055}``。**不能直接丢掉** —— 丢掉的
@@ -288,11 +290,29 @@ def _clean_tag(tag: str) -> str:
         if k in seen or v == "":
             continue
         seen.add(k)
+        if k in ("xmlns", "xmlns:xlink") and not is_root:
+            # ★ **命名空间只在根元素上声明一次**。
+            #
+            # 原来每个子元素都带一份 `xmlns="…"` / `xmlns:xlink="…"`（4p.svg 有
+            # 28 个！）。这在 XML 里是**合法但多余**的，可有些浏览器（尤其
+            # WebKit / Safari 系）对 `image/svg+xml` 走严格 XML 解析，遇到这种
+            # 就**整张图不画** —— 表现正是用户报的两件事：
+            #   1. 牌面的白底不见了（我在生成时新加的那层 `<rect>` 没被画出来）
+            #   2. 图加载失败 -> `<img>` 自然尺寸变成 0 -> 布局全算错 -> **牌乱飞**
+            # 只在根上声明就没有任何歧义了。
+            continue
         keep.append(f'{k}="{v}"')
-    if "xmlns" not in seen:
-        keep.insert(0, 'xmlns="http://www.w3.org/2000/svg"')
-    if "xmlns:xlink" not in seen:
-        keep.insert(1, 'xmlns:xlink="http://www.w3.org/1999/xlink"')
+    if is_root:
+        if "xmlns" not in seen:
+            keep.insert(0, 'xmlns="http://www.w3.org/2000/svg"')
+        # viewBox 有、width/height 也补上：有些环境不按 viewBox 推自然尺寸，
+        # `<img>` 拿不到尺寸就会让布局塌掉。
+        if "width" not in seen:
+            keep.append('width="300"')
+        if "height" not in seen:
+            keep.append('height="400"')
+    else:
+        keep = [f'{k}="{v}"' for k, v in attrs if k not in ("xmlns", "xmlns:xlink")]
     return f"<{name} {' '.join(keep)}{' /' if self_close else ''}>"
 
 

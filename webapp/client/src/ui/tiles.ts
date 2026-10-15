@@ -30,6 +30,18 @@ export function tileSrc(id: TileId | null | undefined): string {
   return id ? `/tiles/${id}.svg` : "/tiles/back.svg";
 }
 
+/**
+ * 所有牌面图的 `naturalWidth` 都 > 0 吗？用来做**整页自检**：
+ * 有一张挂了就说明素材或路由出了问题，牌桌的布局跟着就会歪。
+ */
+export function tilesHealthy(): { total: number; broken: number } {
+  const all = Array.from(document.querySelectorAll<HTMLImageElement>(".tile img"));
+  return {
+    total: all.length,
+    broken: all.filter((i) => i.complete && i.naturalWidth === 0).length,
+  };
+}
+
 /** 这张牌是不是赤宝牌（id 以 0 开头）。 */
 export function isRed(id: TileId | null | undefined): boolean {
   return !!id && id.startsWith("0");
@@ -42,6 +54,35 @@ export function isRed(id: TileId | null | undefined): boolean {
  * 别家手牌和牌河里那几十张牌都做成 button 的话，Tab 键会变成灾难，
  * 而且浏览器会给它们加上一堆默认样式。
  */
+/**
+ * 一张牌里的 `<img>` 加载失败时的兜底。
+ *
+ * 为什么需要：牌的尺寸**全靠图片本身**（`.tile` 用 `--tile-w/h` 定盒子，
+ * 但布局那边要量每张牌的 `offsetWidth` 去算手牌跨度）。图一挂，
+ * `naturalWidth` 变 0、`offsetWidth` 也可能塌掉，于是手牌跨度算成 0，
+ * 副露 / 牌河 / 整家的 `translate` 全跟着错 —— 屏幕上就是**牌乱飞**。
+ *
+ * 所以这里挂 `error` 事件，失败就给这张牌加 `is-broken`：
+ * CSS 里用纯色 + 文字把它画出来（见 styles.css 的 `.tile.is-broken`），
+ * 尺寸由 CSS 保证，不依赖图片。
+ *
+ * 顺带记一条 `console.warn`，排障时一眼能看到是哪张牌没取到。
+ */
+function attachFallback(el: HTMLElement, img: HTMLImageElement, id: TileId | null): void {
+  const mark = (): void => {
+    if (el.classList.contains("is-broken")) return;
+    el.classList.add("is-broken");
+    el.dataset["broken"] = id ?? "back";
+    console.warn(`[tiles] 牌面图加载失败，已用纯色兜底：${img.src}`);
+  };
+  img.addEventListener("error", mark, { once: true });
+  // 有些浏览器在缓存里拿到坏响应时不会触发 error，只在 complete 后
+  // `naturalWidth === 0`。补一次检查（用 rAF 等这一轮加载结算）。
+  requestAnimationFrame(() => {
+    if (img.complete && img.naturalWidth === 0) mark();
+  });
+}
+
 export function tileEl(o: TileOpts): HTMLElement {
   const tag = o.onClick ? "button" : "div";
   const el = document.createElement(tag);
@@ -60,7 +101,12 @@ export function tileEl(o: TileOpts): HTMLElement {
   img.alt = o.id ?? "牌背";
   img.src = tileSrc(o.id);
   img.loading = "eager";
-  el.appendChild(img);
+  // 兜底用的文字（图片正常时被 CSS 藏起来）
+  const label = document.createElement("span");
+  label.className = "tile__fallback";
+  label.textContent = o.id ? tileText(o.id as TileId) : "";
+  el.append(img, label);
+  attachFallback(el, img, o.id ?? null);
 
   if (o.badge) {
     const b = document.createElement("span");

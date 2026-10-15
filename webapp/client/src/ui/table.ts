@@ -114,6 +114,8 @@ export class TableView {
   private readonly doraEl: HTMLDivElement;
   private readonly sticksEl: HTMLDivElement;
   private readonly turnEl: HTMLDivElement;
+  /** 中央区的「四家点数 / 场风自风 / 出牌指示」一行 */
+  private readonly scoreStrip: HTMLDivElement;
   private readonly curtain: HTMLDivElement;
   /** 上一帧牌河长度：用来判断哪张是新打出的（做动画） */
   private readonly prevPond = new Map<number, number>();
@@ -136,6 +138,7 @@ export class TableView {
           <div class="centerbox__wall"><b>--</b><span>枚</span></div>
           <div class="centerbox__dora"><span class="lbl">宝牌</span><div class="dora-row"></div></div>
           <div class="centerbox__sticks"><span class="lbl">供托</span><span class="stick"></span><b>0</b></div>
+          <div class="scorestrip"></div>
           <div class="centerbox__turn"></div>
         </div>
       </div>
@@ -146,6 +149,7 @@ export class TableView {
     this.doraEl = this.root.querySelector(".dora-row") as HTMLDivElement;
     this.sticksEl = this.root.querySelector(".centerbox__sticks") as HTMLDivElement;
     this.turnEl = this.root.querySelector(".centerbox__turn") as HTMLDivElement;
+    this.scoreStrip = this.root.querySelector(".scorestrip") as HTMLDivElement;
     this.curtain = this.root.querySelector(".table__curtain") as HTMLDivElement;
   }
 
@@ -498,6 +502,9 @@ export class TableView {
 
     this.sticksEl.querySelector("b")!.textContent = String(r.sticks);
 
+    // 四家点数 / 场风自风指示器 + 出牌玩家指示
+    this.renderScoreStrip(state);
+
     // 轮到谁 + 倒计时
     const a = state.actions;
     if (a && state.phase === "playing") {
@@ -511,6 +518,51 @@ export class TableView {
         `<span class="muted small"> · ${escapeHtml(a.kind_cn)}</span>`;
     } else {
       this.turnEl.textContent = "";
+    }
+  }
+
+  /**
+   * 中央区那一行「四家点数 / 场风 · 自风」。
+   *
+   * 为什么要这个东西：光看每家的名牌，得把视线在桌子四条边上转一圈才知道
+   * 谁多少分、谁在出牌。中央区是眼睛本来就会落的地方（牌河、宝牌都在这儿），
+   * 把四家的分数按**座次顺序**排一行放在这里，一眼就能扫完 ——
+   * 天凤和雀魂的中央信息区都是这个作用。
+   *
+   * - 按 `rel`（自己 → 下家 → 对家 → 上家）排序，和自己看桌子的方向一致
+   * - `is-dealer` 标红自风，`is-riichi` 在名字后挂个「立」
+   * - **`is-active` 是出牌指示**：正在行动的那家整行加金边高亮 + 名字变金，
+   *   配合 `actions.ms_left` 的倒计时，不用去猜轮到谁
+   * - `is-me` 让自己那家颜色区分开，和下方手牌呼应
+   */
+  private renderScoreStrip(state: StateMsg): void {
+    const order = ["自己", "下家", "对家", "上家"];
+    const rows = [...state.seats].sort((a, b) => {
+      const ia = order.indexOf(a.rel ?? "");
+      const ib = order.indexOf(b.rel ?? "");
+      return (ia < 0 ? 9 : ia) - (ib < 0 ? 9 : ib);
+    });
+    const actions = state.actions;
+    const activeSeat = actions && state.phase === "playing" ? actions.seat : -1;
+
+    this.scoreStrip.replaceChildren();
+    for (const s of rows) {
+      const line = h("div", "scoreline");
+      if (s.seat === state.viewer.seat) line.classList.add("is-me");
+      if (s.is_dealer) line.classList.add("is-dealer");
+      if (s.riichi) line.classList.add("is-riichi");
+      if (!s.connected) line.classList.add("is-offline");
+      if (s.seat === activeSeat) line.classList.add("is-active");
+      line.appendChild(h("span", "scoreline__wind", escapeHtml(s.seat_wind || "?")));
+      line.appendChild(
+        h("span", "scoreline__name",
+          escapeHtml(s.seat === state.viewer.seat ? `${s.name}（你）` : s.name)),
+      );
+      line.appendChild(h("span", "scoreline__score", String(s.score)));
+      line.title =
+        `${s.name} · ${s.seat_wind}家${s.is_dealer ? "（亲）" : ""}` +
+        ` · ${s.score} 点${s.riichi ? " · 立直" : ""}${s.connected ? "" : " · 离线"}`;
+      this.scoreStrip.appendChild(line);
     }
   }
 
@@ -612,16 +664,27 @@ export class TableView {
       // 用 `top`（自盒子顶边往下量）最直观，不跟 `bottom` 的百分比打架。
       v.edge.style.setProperty("--pond-gap", `${(tileH * 2.6 + slack).toFixed(2)}px`);
     } else {
-      // ---- 下 / 上家 ----
-      // 副露紧挨手牌右端；牌河右端与手牌右端对齐，整体在手牌内侧。
-      // 顶家整体转了 180°，局部 x/y 都翻了，所以它的 CSS 用的是
-      // `right` / `bottom` —— 同一套「往盒子里量」的偏移在两边都成立。
-      v.edge.style.setProperty("--melds-lead", `${((across - span) / 2 - slack).toFixed(2)}px`);
-      v.edge.style.setProperty(
-        "--pond-lead",
-        `${((across - span) / 2 - slack).toFixed(2)}px`,
-      );
+      /*
+       * ---- 下 / 上家 ----
+       *
+       * 改了两处（用户提的）：
+       *
+       * 1. **副露挪到右下角**，不再紧挨手牌右端。原来 `--melds-lead` 是
+       *    「手牌右端 - slack」，副露就从手牌右边挤出来，手牌一多（副露之后
+       *    手牌变短、位置又居中）副露会**压在手牌上**。
+       *    现在用 `right: 0` 把它钉在盒子右下角，和手牌彻底分开。
+       *
+       * 2. **牌河往桌子中间挪**。原来是 `right: --pond-lead`，牌河整体贴着
+       *    「手牌右端」摆，看起来全挤在右边。现在改成**水平居中**
+       *    （`left: 50%` + `translateX(-50%)`），牌河就落在桌心一带 ——
+       *    天凤 / 雀雀都是这样，四条牌河围着中央信息区。
+       */
+      v.edge.style.setProperty("--melds-lead", `${slack.toFixed(2)}px`);
       v.edge.style.setProperty("--pond-gap", `${(thick + tileH * 0.5).toFixed(2)}px`);
+      v.edge.style.setProperty(
+        "--pond-drop",
+        `${(thick + tileH * 0.5).toFixed(2)}px`,
+      );
     }
   }
 
