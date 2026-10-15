@@ -45,5 +45,19 @@ for _f in maj-normal4v1.25 maj-normal4v1.3; do
 done
 echo
 
+# ⚠️ `--loose` 默认开 ✗ —— 不加的话两端会**静默冻结** ✓
+#
+# 实测：同一批模型跑两轮，排名**完全洗牌** ✗
+#   maj-flash4v1.2   825.5(#1) -> 627.8(#8)
+#   maj-pro4v1.1     613.5(#2) -> 970.9(#1)
+# 根因是 `--max-gap 200`：评分散开之后，**两端都找不到分差 ≤200 的对手** ✓
+# → 他们的分数不再更新 ✓ → 早先一波运气好的被**永久冻在第一** ✓
+# 证据：第 1 名只有 264 场、第 15 名 162 场 ✓ 而中间的第 8 名有 567 场 ✓
+#
+# **这和「选优判据」是同一类毛病** ✗：一个带阈值的规则在阈值外会**静默停止工作** ✓
+LOOSE_FLAG=()
+[ "${LOOSE:-1}" = "0" ] || LOOSE_FLAG=(--loose)
+
 exec .venv/bin/python -m aimodel.ui.arena_server \
-     --players 4 --port "${PORT}" --copies "${COPIES}" --models "${MODELS[@]}"
+     --players 4 --port "${PORT}" --copies "${COPIES}" \
+     "${LOOSE_FLAG[@]}" --models "${MODELS[@]}"

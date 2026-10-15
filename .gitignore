@@ -69,3 +69,4 @@ samples/*.mjai
 # 这两条在合并里丢过一次（被 aimodel/tests/test_repo_hygiene.py 当场抓到 ✓）
 mjai_dump/
 aimodel/mjai_dump/
+_aicomm/
