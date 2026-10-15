@@ -765,12 +765,93 @@ async def _enter_room(
     room.push_state()
 
 
+def _alive(pid: int) -> bool:
+    """这个 PID 还在不在？
+
+    **Windows 上不能用 ``os.kill(pid, 0)``** 探活 —— 它会抛
+    ``SystemError: <built-in function kill> returned a result with an
+    exception set``（CPython 在 Windows 上的已知怪癖，实测踩过）。
+    所以 Windows 走 ``OpenProcess`` + ``GetExitCodeProcess``，
+    别的平台才用 ``os.kill(pid, 0)``。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_lock(lock_path: Path) -> None:
+    """同一时刻只允许一个服务进程写这个数据目录。
+
+    **为什么必须有**：对局记录是**追加写 gzip** 的（``gzip.open(path, "ab")``）。
+    两个进程同时往同一个分片里追加，gzip 成员会交错，整个文件从交错点起
+    变成「invalid block type」——**已经写好的记录一起废掉**（实测踩过：
+    手工重启时漏杀一个旧进程，2.5MB 的分片只剩 26KB 能救回来）。
+
+    gzip 本身没有任何跨进程保护，所以只能在这一层挡住。用 ``O_EXCL`` 建锁
+    文件是原子的，顺便把 PID 写进去，方便运维看是谁占着。
+    """
+    import atexit
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in (1, 2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                old = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError):
+                old = 0
+            if _alive(old):
+                log.error(
+                    "已经有一个服务进程（PID %d）在写这个数据目录：%s\n"
+                    "记录是追加写 gzip 的，两个进程同时写会把分片写坏。"
+                    "先停掉那个进程（deploy\\maj.ps1 stop）再启动。",
+                    old, lock_path.parent,
+                )
+                raise SystemExit(3)
+            if attempt == 2:
+                log.error("锁文件 %s 用不了，退出", lock_path)
+                raise SystemExit(3)
+            log.warning("发现残留的锁文件（PID %s 已经不在了），清掉重来", old)
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        atexit.register(lambda: lock_path.unlink(missing_ok=True))
+        return
+
+
 def main(argv: list[str] | None = None) -> None:
     from .config import parse_args
     from .logging_setup import setup
 
     cfg = parse_args(argv)
     setup(cfg.log_dir, cfg.log_level, cfg.log_max_bytes, cfg.log_backups)
+    if cfg.record:
+        _pid_lock(cfg.data_dir.parent / "maj-server.lock")
     app = create_app(cfg)
     web.run_app(app, host=cfg.host, port=cfg.port, access_log=None,
                 print=lambda *a, **k: None)
