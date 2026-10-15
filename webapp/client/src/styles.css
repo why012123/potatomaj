@@ -38,7 +38,7 @@
      系数是**算出来的**：牌河 6 张 + 副露 + 手牌 14 张要放进宽度里；
      同时左右两家的手牌是竖着摆的，一张牌的高度不能超过屏高的 1/21。
      用户反馈「略小」，两个系数各放大一档（4.3→5.0vw，4.9→5.6vh）。 */
-  --tile-w: min(5.0vw, 5.6vh, 62px);
+  --tile-w: min(5.0vw, 5.6vh, 62px, var(--tile-cap, 999px));
   --tile-h: calc(var(--tile-w) / 0.96);   /* 真牌 26x28mm，略高 */
   --tile-gap: calc(var(--tile-w) * 0.045);
 
@@ -569,12 +569,10 @@ input, select { font: inherit; }
    因为顶家整体转了 180°）。
    第一组贴着手牌那一侧，**后面的往上磊**（`column-reverse`：新的一组装在
    上面），所以副露永远只往一个方向长，不会忽然跳位置。
-   位置是固定值，**跟手牌张数无关** —— 手牌怎么变，副露都不动。
-   额外再让开约半张牌（`--tile-w * 0.45`）：用户反馈「副露还不够偏」，
-   贴着盒子边缘会和手牌右端挤在一起。这个量也是固定值，不会随手牌变。 */
+   位置是固定值，**跟手牌张数无关** —— 手牌怎么变，副露都不动。 */
 .edge--bottom .edge__melds {
   left: auto;
-  right: calc(var(--melds-lead, 0px) + var(--tile-w) * 0.45);
+  right: var(--melds-lead, 0px);
   bottom: var(--side-slack, 0px);
   top: auto;
   flex-direction: column-reverse;
@@ -582,7 +580,7 @@ input, select { font: inherit; }
 }
 /* 顶家整体转了 180°：局部 x 反过来，所以「右手边」在它那边是左 */
 .edge--top .edge__melds {
-  left: calc(var(--melds-lead, 0px) + var(--tile-w) * 0.45);
+  left: var(--melds-lead, 0px);
   right: auto;
   bottom: var(--side-slack, 0px);
   top: auto;
@@ -592,7 +590,7 @@ input, select { font: inherit; }
 /* 侧家：手牌贴墙（局部 x = 0..牌厚），副露在局部 x = 牌厚.. 即朝桌心一侧；
    同样往「第二个在上」的方向磊。 */
 .edge--side .edge__melds {
-  left: calc(var(--hand-thick, 0px) + var(--tile-w) * 0.45);
+  left: var(--hand-thick, 0px);
   bottom: var(--side-slack, 0px);
   flex-direction: column-reverse;
   align-items: flex-start;
@@ -634,18 +632,48 @@ input, select { font: inherit; }
    和下 / 上家旋转过来的样子一致。
    （之前写成 2 列 × 6 行，方向正好反了：顺着桌心方向一排排铺开，
    看起来既不像牌河、位置也歪。） */
+/*
+ * 侧家的牌河：两个方向的分量都**直接按局部坐标写死**，不再靠 `translate`
+ * 或边锚点去凑。
+ *
+ * 为什么（这是绕了最久的一处）：`.edge--side` 带 `rotate(±90deg)`，
+ * 它把局部的 x/y 在屏幕上互换了 —— 实测变换矩阵是 `[0 ∓1; ±1 0]`。
+ * 于是「沿手牌方向」（屏幕上纵向）在局部是 **x**，「朝桌心方向」（屏幕上横向）
+ * 在局部是 **y**，而且右家的号还要翻。用 `translate` / `bottom` 这类写法
+ * 根本表达不清，怎么调都有一头是歪的（左边偏上、右边偏下，或者压住手牌）。
+ *
+ * 直接把两件事分开：
+ *   - 沿手牌方向：由 `--pond-x` 给（局部 x），右家翻号
+ *   - 朝桌心方向：由 `--pond-y` + 牌河自己的高度给（局部 y），右家翻号
+ * 牌河的高度在局部是 `--pond-h`（转 90° 之后屏幕上量到的宽变成高），
+ * 所以用 `calc(var(--pond-y) - var(--pond-h))` 把盒子推到手牌那一侧。
+ */
+/*
+ * ★ 右家的手牌**沿盒子长轴放在相反的一端**。
+ *
+ * 实测：左家的手牌在局部 x = 0 那一端，右家的手牌在局部 x = span 那一端
+ * （两条 `.edge` 的 `rotate(±90deg)` 方向相反，而手牌在屏幕上都是居中的，
+ * 于是它在各自的局部坐标系里落在了相反的两头）。
+ *
+ * 后果就是牌河怎么摆都不对称：同一个 `--pond-x`，左家量出来离手牌 31px、
+ * 右家 463px；`--melds-lead` 也一样，右家的副露会长到手牌另一头去。
+ *
+ * 把右家的手牌挪到和左家相同的一端，两家的局部布局就完全一致了，
+ * 牌河 / 副露都用同一套偏移。
+ */
+.edge--right .edge__hand { left: var(--hand-center, 0px); right: auto; }
+.edge--left .edge__hand { left: 0; right: auto; }
+
+/* 侧家牌河：沿手牌方向由 `--pond-x` 定（局部 x），朝桌心方向由
+   `--pond-y` + 牌河高度定（局部 y）。见 table.ts 里那段说明。 */
 .edge--side .edge__pond {
-  left: var(--pond-lead, 0px);
+  left: var(--pond-x, 0px);
   right: auto;
-  bottom: var(--pond-gap, 0px);
-  top: auto;
+  top: calc(var(--pond-y, 0px) - var(--pond-h, 120px));
+  bottom: auto;
   grid-template-columns: repeat(6, var(--tw, var(--tile-w)));
   grid-template-rows: repeat(2, calc(var(--tile-w) / 0.96));
-  /* 侧家的牌河**沿手牌方向**对齐到手牌起点附近。
-     左右两家的 `rotate(±90deg)` 方向相反，同一个 `translate` 在屏幕上会往
-     反方向走 —— 所以这里读 JS 给的 `--pond-shift`（左家一个方向、右家相反），
-     而不是写死一个符号。不这么做就是用户看到的「左边偏上、右边偏下」。 */
-  translate: 0 var(--pond-shift, 0px);
+  translate: none;
 }
 
 /* ------------------------------------------------------------- 名牌 -- */
@@ -1072,10 +1100,14 @@ input, select { font: inherit; }
 @media (max-width: 980px) {
   .side { display: none; }
 }
-/* 矮屏：牌再小一档，保证四家的手牌 + 牌河都在屏内（同样各放大一档） */
+/* 矮屏：牌再小一档，保证四家的手牌 + 牌河都在屏内（同样各放大一档）。
+   **每一处都要带上 `var(--tile-cap)`** —— 这个上限是 JS 按实际可用空间
+   算出来挂在 `.table` 上的（见 capTileSize）。漏掉一处，那一条断点就会
+   把上限盖掉：实测 1920x1080 下 `--tile-w` 一路解析成 999px 的兜底值，
+   手牌 16 张直接冲出屏幕。 */
 @media (max-height: 800px) {
-  :root { --tile-w: min(4.6vw, 5.2vh, 56px); }
+  :root { --tile-w: min(4.6vw, 5.2vh, 56px, var(--tile-cap, 999px)); }
 }
 @media (max-height: 680px) {
-  :root { --tile-w: min(4.2vw, 4.8vh, 50px); }
+  :root { --tile-w: min(4.2vw, 4.8vh, 50px, var(--tile-cap, 999px)); }
 }

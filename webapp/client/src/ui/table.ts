@@ -670,11 +670,24 @@ export class TableView {
     const tileH = tile && tile.offsetHeight ? tile.offsetHeight : tileW / 0.96;
     const n = v.hand.children.length;
     if (!n) return;
+    const side = v.dir === "left" || v.dir === "right";
+    /*
+     * ★ 手牌张数最多的那一家（侧家 16 张）决定牌能不能放进屏幕。
+     *
+     * 侧家的手牌是**竖着**排的，16 张 = 16 个牌宽 + 15 个牌距。牌的尺寸是
+     * 全局的（`--tile-w`），所以只要侧家放不下，整桌都得缩 —— 反过来，
+     * 尺寸放大到侧家放不下就会「手牌跑到画面外」（实测：1920x1080 下
+     * 右家 16 张高 1001px、2560x1440 下 1146px，都超出了各自的可视高度）。
+     *
+     * 这里按**实际可用高度**反推一个上限，给 `.table` 挂上去；CSS 里
+     * `--tile-w` 用 `min(..., var(--tile-cap))` 兜住。这样任何分辨率、
+     * 三麻四麻都不会把手牌顶出屏幕，同时牌尽可能大。
+     */
+    this.capTileSize();
     // 跨度按「张数 × 牌宽 + 牌距」算，不依赖任何一次 DOM 收缩计算 ——
     // 手牌在带旋转的祖先里会被压扁，父元素的尺寸一律不可信。
     const gap = parseFloat(getComputedStyle(v.hand).columnGap) || 0;
     const span = tileW * n + gap * (n - 1);
-    const side = v.dir === "left" || v.dir === "right";
     const slack = Math.max(2, tileH * 0.1);
     // 牌厚（含两侧留白）。盒子尺寸见下面 —— **按最大手牌算，不按当前张数**。
     const thick = tileH + slack * 2;
@@ -708,25 +721,36 @@ export class TableView {
     );
     if (side) {
       // ---- 侧家 ----
-      // 手牌在局部 x = slack .. slack + 牌厚（贴着墙那一边）。
-      // 副露紧挨手牌里侧；牌河再往里让开副露那一条带子（最多 4 张副露）。
+      // 手牌在局部 x = slack .. slack + 牌厚（贴着墙那一边）；副露挨着手牌里侧。
       v.edge.style.setProperty("--melds-lead", `${thick.toFixed(2)}px`);
-      v.edge.style.setProperty("--pond-lead", `${(thick + slack).toFixed(2)}px`);
-      // 牌河的上边缘 = 手牌起点 + 让开的距离。手牌在局部 y ∈ [0, span]，
-      // 用 `top`（自盒子顶边往下量）最直观，不跟 `bottom` 的百分比打架。
-      v.edge.style.setProperty("--pond-gap", `${(tileH * 2.6 + slack).toFixed(2)}px`);
       /*
-       * 牌河**沿手牌方向**对齐到手牌起点附近。
+       * 牌河：两个方向的分量都按**局部坐标**直接给（见 CSS 里的说明）。
        *
-       * 为什么符号要分左右：两家的 `rotate(±90deg)` 方向相反，同一个
-       * `translate` 在屏幕上会往反方向走 —— 写死一个值就是用户看到的
-       * 「左边牌河偏上、右边偏下」。所以这里按方向取正负号，左右对称。
-       * 距离取「手牌跨度的一半 - 两张牌」：牌河是一行 6 张、最多 2 行，
-       * 从这个位置起往手牌末端方向磊，正好落在手上方那一带的中间。
+       * `.edge--side` 的 `rotate(±90deg)` 把局部的 x/y 在屏幕上互换了
+       * （实测变换矩阵 `[0 ∓1; ±1 0]`），所以对应关系是：
+       *   - 局部 **x** = 屏幕上**沿手牌**方向 → `--pond-x`
+       *   - 局部 **y** = 屏幕上**朝桌心**方向 → `--pond-y`
+       * 右家要翻号：两条 `.edge` 的旋转方向相反，同一个局部正值在屏幕上是
+       * 反方向（这就是「左边偏上、右边偏下」以及右家压住手牌的原因）。
+       *
+       * `--pond-x` 取**手牌中点**：牌河一行 6 张、最多 2 行，从手牌中点起算
+       * 正好落在手牌旁边那一带的中间，左右两家对称。
        */
-      const along = span / 2 - tileW * 2;
       const dir = v.dir === "left" ? 1 : -1;
-      v.edge.style.setProperty("--pond-shift", `${(dir * along).toFixed(2)}px`);
+      /*
+       * 两个分量都取**固定值**（只跟牌尺寸走，不跟手牌张数走）：
+       *   - 沿手牌方向：0 → 牌河相对手牌长度居中（手牌在盒子里居中摆放，
+       *     所以局部中点就是手牌中点）
+       *   - 朝桌心方向：让开「半个牌厚 + 一副露带子」
+       * 用固定值是有意的：之前拿 `span` 去算，手牌一张数变化牌河就跟着挪，
+       * 又回到「牌一直在乱动」那个老问题上。
+       */
+      const half = tileH / 2 + slack;
+      const inward = half + tileW * 2.4;
+      v.edge.style.setProperty("--pond-x", "0px");
+      v.edge.style.setProperty("--pond-y", `${(dir * inward).toFixed(2)}px`);
+      // 牌河在局部坐标系里的「高」：转 90° 之后，屏幕上量到的宽就是它
+      v.edge.style.setProperty("--pond-h", `${tileW.toFixed(2)}px`);
     } else {
       /*
        * ---- 下 / 上家 ----
@@ -745,6 +769,39 @@ export class TableView {
        */
       v.edge.style.setProperty("--melds-lead", `${slack.toFixed(2)}px`);
       v.edge.style.setProperty("--pond-gap", `${(thick + tileH * 0.5).toFixed(2)}px`);
+    }
+  }
+
+  /**
+   * 牌尺寸上限：按**实际可用空间**反推，挂到 `.table` 的 `--tile-cap` 上。
+   *
+   * 为什么要这一层：牌尺寸是全局的（`--tile-w`），而侧家的手牌是**竖着**排的，
+   * 16 张就要 16 个牌宽。只要它放不下，手牌就会被顶出屏幕
+   * （实测 1920x1080 下右家 16 张高 1001px、2560x1440 下 1146px，都超了）。
+   *
+   * 反推依据（都是「一屏里必须塞下」的硬约束）：
+   *   - 纵向：侧家 16 张（16 宽 + 15 距）≈ 牌高 × 16.6，得放得进可视高
+   *   - 横向：自己 14 张 + 副露 ≈ 牌宽 × 15，再加上两侧安全区
+   * 取两边的较小值，再留 12% 余量。三麻（13 张）自然就更大一点。
+   */
+  private capTileSize(): void {
+    const availH = this.root.clientHeight;
+    const availW = this.root.clientWidth;
+    if (!availH || !availW) return;
+    /*
+     * 系数是按**实测**定的，不是拍的：
+     *   1920x1080 下 16 张牌、牌高 63px → 手牌跨度 1008px（16 × 63），
+     *   已经超过可视高度；要放进 1080 里，牌高得压到 55px 以下。
+     * 所以纵向按「17 个牌高」算（16 张 + 间距 + 上下留白），再留 15% 余量。
+     * 横向同理：自家 16 张 + 副露 + 两侧安全区。
+     */
+    const byHeight = (availH * 0.85) / 17.0;
+    const byWidth = (availW * 0.85) / 17.0;
+    const cap = Math.max(16, Math.min(byHeight, byWidth));
+    const cur = parseFloat(this.root.style.getPropertyValue("--tile-cap"));
+    // 只在变化超过 1px 时写，避免每帧都动样式触发重排
+    if (!Number.isFinite(cur) || Math.abs(cur - cap) > 1) {
+      this.root.style.setProperty("--tile-cap", `${cap.toFixed(2)}px`);
     }
   }
 
