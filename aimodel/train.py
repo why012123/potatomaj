@@ -581,6 +581,65 @@ def build_net(args, resume: bool = True) -> Net:
     return Net(dim=dim, hidden=hidden, seed=args.seed, lr=args.lr, l2=args.l2)
 
 
+def _pid_alive(pid: int) -> bool:
+    '''这个 pid 还活着吗？**跨平台**。
+
+    ⚠️ 为什么不能只用 `os.kill(pid, 0)`（server 在 Windows 上实测踩到的真 bug）：
+    Linux/macOS 上它是「只探测、不发信号」✓ 抛 `ProcessLookupError`（进程没了）
+    / `PermissionError`（是别人的进程）✓
+    **但 Windows 不支持信号 0** ✗ —— 它抛的是 **`OSError(WinError 87)`** ✗
+    而调用方原来只接了那两个异常 -> 异常冒出去，**整个 `cmd_rl` 崩** ✗✗
+
+    后果特别重：`cmd_rl` **无条件**调 `acquire_out_lock` ✓ 而「陈旧锁」在
+    一次崩溃/被杀之后**必然出现** ✓ -> **等于「崩一次之后这台机器再也起不了 RL」** ✗
+
+    走哪条分支**由能力决定，不由 os.name 决定** ✓ 两个理由：
+      ① 更准：只看「有没有 Windows 的 windll」✓
+      ② **可测**：Unix 上塞个假 windll 就能覆盖 Windows 分支 ✓
+         （按 os.name 分派的话，Unix 上永远走不到那条 ✗
+          -> 第七种形状「代码存在 != 代码被执行过」✗）
+
+    ⚠️ **Windows 真分支未经实测**（server 没有 Windows CI，mac 无法验证）：
+    正确性只到「逻辑走通了（假 windll）」这一层 ✓ 真 ctypes 调用没被验证过 ✗
+    那条分支自身若出错，会落到 except Exception -> **保守返回 True** ✓
+    （保守方向是**故意选的**：误判「死了」-> 两个写者同时写 ✗
+      误判「活着」-> 只是拒绝启动 ✓ 后者安全得多 ✓）
+    '''
+    import os as _os
+
+    try:
+        import ctypes
+        windll = getattr(ctypes, 'windll', None)
+    except Exception:
+        windll = None
+
+    if windll is not None:
+        # --- Windows 真分支（⚠️ 未经实测，见 docstring）---
+        try:
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not h:
+                return False            # 打不开 -> 进程不存在（或已退出）✓
+            try:
+                code = ctypes.c_ulong()
+                ok = windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+                return bool(ok) and code.value == 259   # STILL_ACTIVE
+            finally:
+                windll.kernel32.CloseHandle(h)
+        except Exception:
+            # 判不了就**当作活着** ✓ 保守：宁可拒绝写，也不误删别人的锁 ✗
+            return True
+
+    # --- Unix 分支 ---
+    try:
+        _os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def acquire_out_lock(out: Path) -> Path | None:
     """**单写者锁**：两个训练进程写同一个权重文件时，第二个直接拒绝启动。
 
@@ -599,49 +658,6 @@ def acquire_out_lock(out: Path) -> Path | None:
     import os as _os
 
     lock = out.with_suffix(out.suffix + ".lock")
-
-    def _pid_alive(pid: int) -> bool:
-        """这个 pid 还活着吗？**跨平台**。
-
-        ⚠️ 为什么不能只用 `os.kill(pid, 0)`（server 在 Windows 上实测踩到的真 bug）：
-        Linux/macOS 上 `os.kill(pid, 0)` 是「只探测、不发信号」✓ 抛
-        `ProcessLookupError`（进程没了）/ `PermissionError`（是别人的进程）✓
-        **但 Windows 不支持信号 0** ✗ —— 它抛的是 **`OSError(WinError 87)`** ✗
-        而调用方原来只接了那两个异常 -> **异常冒出去，整个 `cmd_rl` 崩** ✗✗
-
-        后果特别重：`cmd_rl` **无条件**调 `acquire_out_lock` ✓ 而「陈旧锁」在
-        一次崩溃/被杀之后**必然出现** ✓ -> **等于「崩一次之后这台机器再也起不了 RL」** ✗
-        """
-        if _os.name == "nt":
-            # 正确的 Windows 判据：OpenProcess 拿不到句柄 = 进程没了；
-            # 拿得到就看退出码是不是 STILL_ACTIVE(259) ✓
-            try:
-                import ctypes
-
-                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-                h = ctypes.windll.kernel32.OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-                )
-                if not h:
-                    return False            # 打不开 -> 进程不存在（或已退出）✓
-                try:
-                    code = ctypes.c_ulong()
-                    ok = ctypes.windll.kernel32.GetExitCodeProcess(
-                        h, ctypes.byref(code)
-                    )
-                    return bool(ok) and code.value == 259   # STILL_ACTIVE
-                finally:
-                    ctypes.windll.kernel32.CloseHandle(h)
-            except Exception:  # noqa: BLE001
-                # 判不了就**当作活着** ✓ 保守：宁可拒绝写，也不误删别人的锁 ✗
-                return True
-        try:                        # Unix：信号 0 = 只探测存活，不真发信号 ✓
-            _os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:     # 存在但不是我的进程 ✓ 也算活着 ✓
-            return True
 
     def _owner_alive() -> bool:
         try:
