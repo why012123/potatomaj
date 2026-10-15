@@ -662,11 +662,22 @@ export class TableView {
     const r = spanOf(v.hand, ".tile, .hand__gap");
     if (!r) return 0;
 
-    // 目标：让手牌贴到桌子对应的沿上、另一个方向居中
+    /*
+     * ★ 侧家的「牌厚」是包围盒的**高**，不是宽。
+     *
+     * 左右两家整体转了 ±90°，所以手牌那条**横条**在屏幕上变成了一条**竖条**：
+     * 包围盒宽 = 一张牌的厚度（~55px），包围盒高 = 整手牌的长度（~430px）。
+     *
+     * 一开始写的是 `parent.right - r.width / 2` —— 于是「竖条的中心」被摆到
+     * 距右边 27px 的位置，竖条前半截（约 190px）直接伸到屏幕外。表现就是
+     * 「下家只在最右边露出几个边，牌看不到」，而对家（顶家）没旋转所以是好的。
+     * 这两个症状同源，修好这一处两个都好。
+     */
+    const thick = side ? r.height : r.width;
     const wantCx = side
       ? v.dir === "right"
-        ? parent.right - r.width / 2
-        : parent.left + r.width / 2
+        ? parent.right - thick / 2
+        : parent.left + thick / 2
       : parent.left + parent.width / 2;
     const wantCy = side
       ? parent.top + parent.height / 2

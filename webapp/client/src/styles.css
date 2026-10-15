@@ -793,11 +793,11 @@ input, select { font: inherit; }
 
 .toast {
   position: fixed;
-  left: 50%;
-  /* 贴在**底部居中**：大厅里不挡卡片；牌桌上是观战提示，3.6 秒自动淡出。
-     中间上方是上家的手牌，绝不能压。 */
-  bottom: 26px;
-  transform: translateX(-50%) translateY(20px);
+  left: 12px;
+  /* 贴在**左下角**。中央下方是自己手牌的地盘（牌桌占满整个视口），
+     中央上方是上家的手牌，都不能压。3.6 秒自动淡出。 */
+  bottom: 88px;
+  transform: translateY(20px);
   background: rgba(10, 24, 18, 0.96);
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -806,9 +806,9 @@ input, select { font: inherit; }
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--anim), transform var(--anim);
-  max-width: 70vw;
+  max-width: min(420px, 40vw);
 }
-.toast.is-on { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.is-on { opacity: 1; transform: translateY(0); }
 .toast.is-warn { border-color: #d9a03f; }
 .toast.is-bad { border-color: var(--red); }
 
