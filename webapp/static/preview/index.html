@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>土豆麻将 · 牌桌预览（静态，不连后端）</title>
+<style>
+/*
+ * 静态预览样式。**牌的定位完全由 JS 算成屏幕坐标**（见 table.js），
+ * 这里只负责皮肤：绒布、木框、牌的立体感。
+ * 刻意不写任何 left/right/bottom/百分比布局 —— 那正是之前乱动的来源。
+ */
+:root {
+  --felt-1: #1d6b4a;
+  --felt-2: #124a33;
+  --felt-3: #0a2c1e;
+  --wood-1: #7a4a24;
+  --wood-2: #5c3618;
+  --wood-3: #3d220e;
+  --line: rgba(232, 196, 106, 0.22);
+  --gold: #e8c46a;
+  --muted: #9fb3a8;
+  --red: #d64a4a;
+  --blue: #6cc7ff;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #06120c;
+  font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  color: #e8efe9;
+}
+
+/* 定尺舞台：1920x1080，按窗口等比缩放 */
+#board {
+  position: absolute;
+  width: 1920px;
+  height: 1080px;
+  transform-origin: 0 0;
+}
+/* 绒布 */
+#board::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at 50% 44%, var(--felt-1) 0%, var(--felt-2) 58%, var(--felt-3) 100%);
+}
+/* 木框 */
+#board::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 22px solid transparent;
+  border-image: linear-gradient(160deg, var(--wood-1), var(--wood-2) 55%, var(--wood-3)) 1;
+  box-shadow: inset 0 0 90px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+}
+/* 所有牌都挂在这一层；每家的牌包在一个 `.plane` 里 */
+#layer { position: absolute; inset: 0; }
+
+/*
+ * 一家的「局部平面」。
+ *
+ * ★ 这是整个排版的关键：一家先在自己的坐标系里把牌排好
+ *   （local +x = 沿手牌，local +y = 朝桌心），再由 JS 对 plane 施加
+ *   `translate(锚点) rotate(角度)` 整体转过去。
+ *
+ * `transform-origin: 0 0` 必须写：这样 plane 里的 (0,0) 正好落在锚点上，
+ * 「把这一家的局部原点搬到屏幕某处」就是一次纯平移，不用再去反解中心。
+ */
+.plane {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+}
+
+/*
+ * 一张牌。
+ *
+ * JS 给的 left/top 是这张牌的**左上角**（它已经自己减掉了半个宽高），
+ * 旋转只用来调牌面朝向。
+ *
+ * 为什么不在这里写 `translate: -50% -50%`：`translate` 属性和 `transform`
+ * 是**两个独立属性**，都会生效，但组合顺序在带旋转的元素上很容易出事
+ * （实测横放的牌位置整体偏了、名牌在侧家被翻成镜像字）。
+ * 把「居中」这件事放到 JS 里做，这里就只剩「宽高 + 旋转」，没有歧义。
+ */
+.tile {
+  position: absolute;
+  border-radius: 4px;
+  background: #fbf8f1;               /* 象牙白牌身 —— 牌面 SVG 是透明底的 */
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(0, 0, 0, 0.18);
+  transform-origin: 50% 50%;
+}
+.tile img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border-radius: 4px;
+  pointer-events: none;
+  user-select: none;
+}
+/* 赤 5：右上角一个小红点 */
+.tile.is-red::after {
+  content: "";
+  position: absolute;
+  right: 8%;
+  top: 6%;
+  width: 16%;
+  height: 16%;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 6px rgba(214, 74, 74, 0.8);
+}
+/* 摸到的那张：淡淡的金边，跟理好的牌区分开 */
+.tile.is-drawn { box-shadow: 0 2px 5px rgba(0, 0, 0, 0.45), 0 0 0 2px rgba(232, 196, 106, 0.55); }
+/* 立直宣言牌：横放 + 蓝边 */
+.tile.is-riichi { box-shadow: 0 2px 5px rgba(0, 0, 0, 0.45), 0 0 0 2px rgba(108, 199, 255, 0.75); }
+/* 副露里被叫的那张 */
+.tile.is-called { outline: 1px solid rgba(255, 255, 255, 0.2); }
+
+/* --------------------------------------------------------------- 名牌 -- */
+.plate {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(12, 28, 20, 0.96), rgba(6, 16, 11, 0.96));
+  border: 1px solid var(--line);
+  font-size: 15px;
+  white-space: nowrap;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.5);
+  /* 名牌**跟着这一家一起转**（它在 plane 里），所以文字方向天然是对的。
+     不要在 CSS 里再写 rotate —— 那会把侧家的字翻成镜像。 */
+  transform: translate(-50%, -50%);
+}
+.plate .wind {
+  width: 20px; height: 20px;
+  display: grid; place-items: center;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.1);
+  font-weight: 800; font-size: 13px;
+}
+.plate .score { font-variant-numeric: tabular-nums; font-weight: 700; color: var(--gold); }
+.bg {
+  font-style: normal;
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #dfe9e3;
+}
+.bg--dealer { background: rgba(214, 74, 74, 0.3); color: #ffd9d9; }
+.bg--riichi { background: rgba(232, 196, 106, 0.25); color: var(--gold); }
+.bg--ai { background: rgba(108, 199, 255, 0.2); color: var(--blue); }
+
+/* ----------------------------------------------------------- 中央信息 -- */
+#center {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 8px 18px;
+  align-items: center;
+  padding: 14px 20px;
+  min-width: 420px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(8, 20, 14, 0.9), rgba(5, 14, 10, 0.95));
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.5);
+}
+.c-round { font-size: 24px; font-weight: 800; }
+.c-round .sub { display: block; font-size: 12px; font-weight: 400; color: var(--muted); }
+.c-wall b { font-size: 26px; color: var(--gold); }
+.c-wall span { font-size: 12px; color: var(--muted); margin-left: 4px; }
+.c-dora { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; }
+.c-dora .lbl { font-size: 12px; color: var(--muted); }
+.dora-row { display: flex; gap: 4px; }
+.dora-row img { width: 34px; height: 36px; border-radius: 3px; background: #fbf8f1; box-shadow: 0 1px 3px rgba(0,0,0,.5); }
+.c-sticks { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.c-sticks .lbl { color: var(--muted); }
+.stick {
+  width: 5px; height: 20px; border-radius: 3px; display: inline-block;
+  background: linear-gradient(180deg, #f6f2ea, #cfc7b7);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+.scorestrip { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 5px 10px; }
+.scoreline {
+  display: flex; align-items: center; gap: 7px;
+  padding: 4px 9px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 13px;
+}
+.scoreline .wind {
+  width: 18px; height: 18px; display: grid; place-items: center;
+  border-radius: 4px; background: rgba(255, 255, 255, 0.08);
+  font-size: 12px; font-weight: 800;
+}
+.scoreline .name { flex: 1; color: var(--muted); }
+.scoreline .sc { font-variant-numeric: tabular-nums; font-weight: 700; }
+.scoreline.is-me .name { color: #9fe8bf; font-weight: 700; }
+.scoreline.is-dealer .wind { background: rgba(214, 74, 74, 0.3); color: #ffd9d9; }
+.scoreline.is-riichi .name::after {
+  content: "立"; margin-left: 6px; padding: 0 4px; border-radius: 3px;
+  background: rgba(232, 196, 106, 0.22); color: var(--gold); font-size: 11px;
+}
+/* 正在出牌的那一家 —— 整行金边高亮 */
+.scoreline.is-active {
+  background: linear-gradient(90deg, rgba(232, 196, 106, 0.2), rgba(232, 196, 106, 0.05));
+  border-color: rgba(232, 196, 106, 0.55);
+}
+.scoreline.is-active .name { color: var(--gold); }
+.c-turn { grid-column: 1 / -1; font-size: 14px; }
+.c-turn .who.is-mine { color: #7ee0aa; font-weight: 700; }
+.c-turn .timer { margin-left: 8px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.muted { color: var(--muted); }
+</style>
+</head>
+<body>
+  <!-- 定尺 1920x1080 的舞台，牌全部由 JS 用屏幕坐标摆进来 -->
+  <div id="board">
+    <div id="center"></div>
+    <div id="layer"></div>
+  </div>
+  <script src="./table.js"></script>
+</body>
+</html>

@@ -275,6 +275,10 @@ def create_app(cfg: Config) -> web.Application:
                           follow_symlinks=False)
     app.router.add_static("/assets/", path=str(STATIC), show_index=False,
                           follow_symlinks=False)
+    # 纯静态的**外观预览页**（`webapp/static/preview/`）：不连后端、数据写死，
+    # 用来单独调牌桌构图。放在这里只为方便在同一个端口上看，跟正式前端无关。
+    app.router.add_static("/preview/", path=str(STATIC / "preview"),
+                          show_index=True, follow_symlinks=False)
     app.router.add_get("/favicon.ico", favicon_handler)
     return app
 
