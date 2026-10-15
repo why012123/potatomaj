@@ -267,9 +267,19 @@ def _startup_audit() -> None:
 
 def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
           copies: int = 3, divisor: float = 500.0,
-          models: list[str] | None = None) -> None:
+          models: list[str] | None = None,
+          loose: bool = False) -> None:
+    """``loose=True`` → ``Arena(strict=False)``：分差不够就放宽 ✓
+
+    为什么该开：`strict` 下只让分差 ≤ ``max_gap`` 的配对 ✓
+    评分散开之后**两端都找不到对手** ✗ → 他们的分数**不再更新** ✓
+    → 早先一波运气好的被**永久冻在第一** ✓
+    （实测：同一批模型跑两轮，排名完全洗牌 ✗
+      第 1 名 264 场、第 15 名 162 场，而中间的第 8 名有 567 场 ✓）
+    """
     _startup_audit()
-    session = Session(players=players, copies=copies, divisor=divisor, models=models)
+    session = Session(players=players, copies=copies, divisor=divisor,
+                      models=models, strict=not loose)
     Handler.session = session
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"🏟  ELO 混战池：http://{host}:{port}")
@@ -289,6 +299,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--copies", type=int, default=3, help="每个模型派几个参赛者")
+    ap.add_argument("--loose", action="store_true",
+                    help="分差不够就放宽（修掉「两端静默冻结」✓ 推荐开）")
     ap.add_argument("--models", nargs="*", default=None,
                     help="只让这几个模型参赛（默认全部）✓ 要写带版本号的正名，"
                          "例：--models maj-normal4v1.2 maj-pro4v1.1")
@@ -296,7 +308,7 @@ def main(argv: list[str] | None = None) -> None:
                     help="点数段位分的除数（0 = 关掉点数项，只按名次算）")
     args = ap.parse_args(argv)
     serve(args.players, args.port, args.host, args.copies, args.divisor,
-          models=args.models)
+          models=args.models, loose=args.loose)
 
 
 if __name__ == "__main__":
