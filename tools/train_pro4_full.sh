@@ -104,8 +104,13 @@ PYEOF
     # 从远端的 3-epoch 权重起步（复制一份，别改原件）
     [ -f "${WEIGHTS}" ] || cp "${ROOT}/aimodel/weights/maj-pro4v1.1.npz" "${WEIGHTS}"
     log "  开始 BC 训练 30 epoch（从 ${WEIGHTS##*/} 继续）"
+    # ⚠️ `--patience 8`：默认 3 对**人类数据**太紧 ✗
+    #    人类和教师不同 —— 教师是确定性策略 ✓ 人类同一局面有多个合理选择 ✓
+    #    实测人类数据的同源留出率在 63~64% 就近饱和、且**来回震荡** ✓
+    #    3 轮判定「没进步」会过早停 ✗ 而那个指标对这条路本来就是**弱信号** ✗
+    #    真正的裁判是**天梯**（谁赢）✓ 所以给足震荡空间 ✓ 同时保留「真崩了能停」✓
     "${PY}" -m aimodel.train bc --model=maj-pro4v1.1 \
-            --bc-data="${BC_DATA}" --resume --epochs 30 \
+            --bc-data="${BC_DATA}" --resume --epochs 30 --patience 8 \
             --out "${WEIGHTS}" --log "${DATA}/bc_train.log" 2>&1 | tee -a "${LOG}"
     stage_done bc
 fi
