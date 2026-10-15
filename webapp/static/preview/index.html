@@ -36,10 +36,23 @@ html, body {
 /* 定尺舞台：1920x1080，按窗口等比缩放 */
 #board {
   position: absolute;
+  left: 0;
+  top: 0;
   width: 1920px;
   height: 1080px;
   transform-origin: 0 0;
 }
+/*
+ * ★ 舞台**只**用 `transform` 缩放和平移，`left` / `top` 永远是 0。
+ *
+ * 之前是「`left/top` 摆位置 + `transform: scale()` 缩放」—— 这两种位移机制
+ * 叠在一起，在窗口比舞台小的时候会互相干扰，实测在小屏上只能看见右上角
+ * （用户报的「其他设备上只看见了右上角」）。
+ * 现在把**缩放和居中一起写进 `transform`**，一次矩阵搞定：
+ *     translate(offsetX, offsetY) scale(s)
+ * `transform-origin: 0 0` 保证左上角对齐，缩放围绕原点走，算起来最直观。
+ */
+#board { transform-origin: 0 0; }
 /* 绒布 */
 #board::before {
   content: "";
