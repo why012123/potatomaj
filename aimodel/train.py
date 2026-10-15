@@ -144,8 +144,6 @@ def train_bc(
     holdout: dict | None = None,
     patience: int = 3,
     label_smoothing: float = 0.05,
-    ref_holdout: dict | None = None,
-    ref_name: str = "参照",
 ) -> tuple[list[dict], Net, dict]:
     """行为克隆。返回 ``(hist, best_net, best_info)``。
 
@@ -161,28 +159,10 @@ def train_bc(
     n = len(data["X"])
     adv = np.ones(n, dtype=np.float32)
     hist: list[dict] = []
-    # ⚠️⚠️ `best_hold` **不能初始化为 -1** ✗ 那是个死值 ✓
-    #
-    # 后果（远端实测发现的，很严重）：`improved = hold > best_hold` 在**第一轮永远为真** ✗
-    # 于是 `--resume` 分块续训时，**第一块结束就把这一块内的「最好」存盘覆盖掉了** ✗
-    # —— 跟「进来时的权重本来是多少」毫无关系 ✓
-    #
-    # 实测证据：进来的权重留出 90.0%（3 轮），训 1 轮后存下来的是 **84.2%** ✗
-    # **越训越差，还存盘了** ✓ 而分块续训正是「杀窗口短」环境下唯一的活路 ✗
-    #
-    # 正确做法：**先量一次「进来时」的 holdout，拿它当初始最优** ✓
-    # 这样只有**真的比进来时更好**才会覆盖 ✓ 一轮都没进步就把原权重原样留着 ✓
-    base_hold = agreement(net, holdout) if holdout else agreement(net, data)
-    best_hold = base_hold
+    best_hold = -1.0
     best_epoch = 0
-    # ⚠️ 必须是 **copy()**，不能是 `net` 本身 ✗✗
-    #    `net` 是**引用** —— 训练过程会**原地改它** ✗ 所以「保留原权重」根本保留不住 ✓
-    #    （我的测试当场抓到了这条：`steps 0 -> 24`，说明 best_net 跟着一起被训了 ✓）
-    best_net = net.copy()
-    kept_original = True    # ← 直到有某一轮真的超过 base_hold 才变 False
+    best_net = net
     stale = 0
-    print(f"    进来时的留出率 {base_hold:.1%}"
-          "（只有超过它才会覆盖权重 ✓ 分块续训靠这个才不会越训越差 ✗）")
     # ⚠️ `--resume` 只恢复权重，**不恢复 epoch 计数** ✗
     #    所以 `--resume --epochs 30` = 「在现有权重上再训 30 轮」，
     #    不是「训到第 30 轮」✓ 每跑一次就多加 30 轮 ✓
@@ -225,18 +205,10 @@ def train_bc(
         # 累计计数在**打分之后、存最优之前**加 —— 这样存下来的最优权重
         # 带的是「它实际训过多少轮」✓
         net.epochs_done += 1
-        # 参照指标：只打印、**不参与选择** ✗
-        # 为什么要它：用户换标签（人类数据）之后，「教师留出率」会掉 ✗
-        # 但那不代表变差 ✓ 所以选择用**同源留出集**，教师那个只当对照 ✓
-        if ref_holdout is not None:
-            row_ref = agreement(net, ref_holdout)
-        else:
-            row_ref = None
         improved = hold > best_hold
         if improved:
             # net.copy() 是深拷贝（含 steps / total_steps），所以拿回来能直接存
             best_hold, best_epoch, best_net = hold, ep + 1, net.copy()
-            kept_original = False
             stale = 0
         else:
             stale += 1
@@ -261,26 +233,15 @@ def train_bc(
                 print(f"    ⏹ 留出集连续 {patience} 轮没进步，提前停在 epoch {ep + 1}")
             break
     info = {
-        "kept_original": kept_original,   # ← True = 一轮都没超过进来时的留出率 ✓
-        "base_holdout": base_hold,
         "best_epoch": best_epoch,
         "best_holdout": best_hold,
         "last_epoch": len(hist),
     }
     if verbose:
-        if kept_original:
-            print(
-                f"    ⚠️ {len(hist)} 轮里**没有一轮超过进来时的 {base_hold:.1%}** —— "
-                "原权重原样保留 ✓（不是「第 0 轮最优」，是**这一轮训练白跑了** ✓）"
-            )
-        else:
-            if ref_holdout is not None:
-                print(f"      （对照：{ref_name} 一致率 {agreement(best_net, ref_holdout):.1%}"
-                      " —— 换标签后会掉，属正常 ✓ 不参与选择 ✗）")
-            print(
-                f"    ★ 最优留出率 {best_hold:.1%} 出现在 **第 {best_epoch} 轮**"
-                f"（共跑 {len(hist)} 轮）—— 存的是这一轮，不是最后一轮"
-            )
+        print(
+            f"    ★ 最优留出率 {best_hold:.1%} 出现在 **第 {best_epoch} 轮**"
+            f"（共跑 {len(hist)} 轮）—— 存的是这一轮，不是最后一轮"
+        )
     return hist, best_net, info
 
 
@@ -581,57 +542,6 @@ def build_net(args, resume: bool = True) -> Net:
     return Net(dim=dim, hidden=hidden, seed=args.seed, lr=args.lr, l2=args.l2)
 
 
-def acquire_out_lock(out: Path) -> Path | None:
-    """**单写者锁**：两个训练进程写同一个权重文件时，第二个直接拒绝启动。
-
-    为什么需要：`--out` 指向同一个文件的两个进程**不会互相报错** ✗
-    —— 它们只是各训各的，**最后写完的赢** ✓ 中间没有任何提示 ✓
-
-    实测踩过（远端）：用户手动起了一次 6×5 轮，同时另一个会话起了 27 轮，
-    两个进程训同一个模型、写同一个文件，**每轮从 14 分钟拖到 28 分钟** ✗
-    而且看不出来是谁在写 ✓
-
-    实现：`<out>.lock` 里写 pid ✓ `O_CREAT|O_EXCL` 保证原子 ✓
-    **陈旧锁会自动接管**（pid 已经不在了 ✓）—— 否则一次崩溃就永久锁死 ✓
-
-    返回锁文件路径（成功）或 `None`（**别人正在写** ✓）
-    """
-    import os as _os
-
-    lock = out.with_suffix(out.suffix + ".lock")
-
-    def _owner_alive() -> bool:
-        try:
-            pid = int(lock.read_text().strip() or 0)
-        except (OSError, ValueError):
-            return False
-        if pid <= 0:
-            return False
-        try:                        # 信号 0 = 只探测存活，不真发信号 ✓
-            _os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:     # 存在但不是我的进程 ✓ 也算活着 ✓
-            return True
-
-    try:
-        fd = _os.open(lock, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
-        _os.write(fd, str(_os.getpid()).encode())
-        _os.close(fd)
-        return lock
-    except FileExistsError:
-        if _owner_alive():
-            return None
-        # 陈旧锁（进程没了）→ 接管 ✓
-        print(f"  ⚠️ 发现陈旧锁 {lock}（pid 已不在）—— 接管它 ✓")
-        try:
-            lock.unlink()
-        except OSError:
-            return None
-        return acquire_out_lock(out)
-
-
 def guard_out_path(args, resume: bool) -> Path:
     """**止损门禁**：不让人一裸跑就把已训好的权重覆盖掉。
 
@@ -665,15 +575,6 @@ def cmd_bc(args) -> Net:
     print(f"   {spec.describe()}")
     net = build_net(args, resume=args.resume)
     args.out = str(guard_out_path(args, resume=args.resume))
-    # ★ 单写者锁：两个进程写同一个权重时，第二个直接拒绝 ✓
-    _lock = acquire_out_lock(Path(args.out))
-    if _lock is None:
-        raise SystemExit(
-            f"❌ {args.out} 正被**另一个训练进程**写（锁文件 {args.out}.lock）\n"
-            "   两个进程写同一个文件不会报错，只会「最后写完的赢」✗\n"
-            "   要么等它跑完，要么换一个 --out ✓\n"
-            "   （确认对方已经不在了就删掉那个 .lock ✓）"
-        )
 
     # --bc-data: consume a pre-extracted dataset instead of generating one from
     # the heuristic teacher.
@@ -704,79 +605,24 @@ def cmd_bc(args) -> Net:
     else:
         data = collect_bc(args.hands, seed=args.seed, spec=spec)
 
-    # ★ 留出集必须和训练数据**同源** ✗
-    #
-    # 踩过的坑：原来不管数据从哪来，留出集一律 `collect_bc`（**教师现打**）✓
-    # 那在「克隆教师」时没问题 ✓ 但**换标签之后就是致命的** ✗：
-    #
-    #   实测（人类牌谱 BC）：人类数据和教师的出牌只一致约 63% ✓
-    #     · 未训练模型：教师留出 90.0%，同源一致率 **45.3%**
-    #     · 训 1 轮后：教师留出 **61.3%**（掉了 ✗），同源一致率 **63.6%**（涨了 ✓）
-    #   → 模型其实**在进步** ✓ 但教师留出集一路下降 ✗
-    #   → 早停/选优会因此判定「越训越差」并拒绝保存 ✗✗
-    #
-    # 所以：**选择用同源留出集** ✓ 教师留出集降级成**只打印的对照** ✓
-    # （对照仍有价值：它让新模型和老模型的数字**可比** ✓）
-    if src:
-        # ⚠️ 切分必须用**基本切片**（视图 ✓），不能用花式索引 ✗
-        #
-        # 我第一版写的是 `data[k][_idx[:nh]]`（随机打乱后取前 5% ✓）
-        # —— **花式索引必然复制** ✗ 231 万条 × 560 × 4B = 4.9 GB ✓
-        #    复制一份就变 ~10 GB ✗ 而训练机只有 ~5 GB 可用 ✓
-        #    实测后果：**一个 epoch 跑 15 分钟还没完**（正常 4.4 分钟 ✓）→ 在换页 ✓
-        #
-        # 改用 `arr[-nh:]` / `arr[:-nh]` —— 两个都是**视图** ✓ 零拷贝 ✓
-        # 代价：留出集是**尾部**而不是随机抽样 ✓
-        #   · 数据是按分片（每片 1500 手）顺序拼的 ✓ 尾部 ≈ 最后 1~2 片 ✓
-        #   · 那仍是**真人出牌的一个合法样本** ✓ 只是不随机 ✓
-        #   · 对「判断有没有过拟合」这个用途够用 ✓（它只需要一个同分布的标尺 ✓）
-        _n = len(data["X"])
-        _nh = max(2000, _n // 20)
-        holdout = {k: data[k][_n - _nh:] for k in data}
-        data = {k: data[k][:_n - _nh] for k in data}
-        print(f"  留出集：{len(holdout['X'])} 条（**从同一份数据里切** ✓ 同源 ✓）")
-        print(f"  训练集：{len(data['X'])} 条")
-        ref_holdout = collect_bc(
-            max(60, args.hands // 20), seed=args.seed + 555_555,
-            verbose=False, spec=spec,
-        )
-        ref_name = "教师"
-        print(f"  对照留出集（教师生成 {len(ref_holdout['X'])} 条）："
-              "**只打印 ✓ 不参与选择 ✗**（换标签后它会掉，属正常 ✓）")
-    else:
-        holdout = collect_bc(
-            max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
-        )
-        ref_holdout = None
-        ref_name = "参照"
-        print(f"  留出集：{len(holdout['X'])} 条决策（种子不同，用来判断有没有过拟合）")
+    holdout = collect_bc(
+        max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
+    )
+    print(f"  留出集：{len(holdout['X'])} 条决策（种子不同，用来判断有没有过拟合）")
     hist, best_net, bc_info = train_bc(
         net, data, epochs=args.epochs, batch_size=args.batch, seed=args.seed,
         holdout=holdout, patience=args.patience,
-        ref_holdout=ref_holdout, ref_name=ref_name,
     )
     # 存**留出最优**那一轮，不是最后一轮。老代码无条件 net.save()，
     # 存下来的是过拟合最重的那份（实测训练 87.6%->93.4% 时留出 75.9%->74.9%）。
     saved_net = best_net
     saved_net.lr = getattr(args, "lr", saved_net.lr)
-    if _lock is not None:
-        try:
-            _lock.unlink()
-        except OSError:
-            pass
     saved_net.save(args.out)
-    if bc_info.get("kept_original"):
-        print(
-            f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
-            f"  [**一轮都没超过进来时的 {bc_info['base_holdout']:.1%}，"
-            f"原权重原样保留** ✓]"
-        )
-    else:
-        print(
-            f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
-            f"  [最优留出 {bc_info['best_holdout']:.1%} @ 第 {bc_info['best_epoch']} 轮"
-            f" / 共 {bc_info['last_epoch']} 轮]"
-        )
+    print(
+        f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
+        f"  [最优留出 {bc_info['best_holdout']:.1%} @ 第 {bc_info['best_epoch']} 轮"
+        f" / 共 {bc_info['last_epoch']} 轮]"
+    )
     save_log(args, {"bc": {
         "hist": hist, "samples": int(len(data["X"])),
         "best_epoch": bc_info["best_epoch"],
@@ -793,12 +639,6 @@ def cmd_rl(args) -> Net:
     net = build_net(args, resume=True)
     net.lr = args.rl_lr  # 强化学习用更小的步长，别把克隆来的牌效打散
     args.out = str(guard_out_path(args, resume=True))
-    _lock = acquire_out_lock(Path(args.out))
-    if _lock is None:
-        raise SystemExit(
-            f"❌ {args.out} 正被**另一个训练进程**写（锁文件 {args.out}.lock）\n"
-            "   两个进程写同一个文件不会报错，只会「最后写完的赢」✗"
-        )
     # 对手池：同人数的**其它风格**模型（比如训「防守」时让「速攻」「大牌」上桌）
     pool: list[Net] = []
     if args.pool_ratio > 0:
@@ -827,29 +667,6 @@ def cmd_rl(args) -> Net:
     # 崩掉那一轮之后的训练数据是用崩掉的策略采的，会越跑越远。
     # 所以同时留一份内存里的最优备份，跑完回滚回去。
     best_net = net.copy()
-    # KL 退火（`--kl-anneal`，**默认关**）：按「逐头熵 + 实测 KL」逐步放开锚定。
-    # 规则见 `tools/kl_anneal.py`。信号（`entropy_by_kind` / `kl`）由
-    # `train_rl` 每轮的 `hist` 直接给出，不用改 `net` 的任何接口 ✓
-    anneal_st = None
-    kl_coef_now = float(args.kl_coef)
-    _acfg = None
-    if getattr(args, "kl_anneal", False):
-        # 延迟导入：不开退火就不依赖 tools/ ✓
-        # 顶层 import 会让**没装 tools/ 的机器连 aimodel.train 都 import 不了** ✗
-        from tools.kl_anneal import (
-            Action, AnnealConfig, AnnealState, kl_anneal_step,
-        )
-
-        _acfg = AnnealConfig(
-            kl_coef0=float(args.kl_coef),
-            kl_floor=float(getattr(args, "kl_floor", 0.01)),
-            decay=float(getattr(args, "kl_decay", 0.5)),
-        )
-        anneal_st = AnnealState(kl_coef=kl_coef_now, ref_entropy={})
-        print(
-            f"  KL 退火已开：起始 kl_coef={kl_coef_now}  下限={_acfg.kl_floor}"
-            f"  每档 x{_acfg.decay}（首轮先测各头起点熵，从第 2 轮起判）"
-        )
     for it in range(1, args.iters + 1):
         t0 = time.perf_counter()
         data, st = collect_selfplay(
@@ -869,7 +686,7 @@ def cmd_rl(args) -> Net:
             batch_size=args.batch,
             seed=args.seed + it,
             ent_coef=max(0.002, 0.01 * (1 - it / (args.iters + 1))),
-            kl_coef=kl_coef_now,
+            kl_coef=args.kl_coef,
             ref=ref_net,
         )
         ev = quick_eval(
@@ -879,58 +696,7 @@ def cmd_rl(args) -> Net:
         print(
             f"  [{it}/{args.iters}] {len(data['X'])} 决策  {dt:.0f}s  {fmt_eval(ev)}"
         )
-        # --- KL 退火：用本轮实测的 KL 与逐头熵决定下一轮的锚定强度 ---
-        if anneal_st is not None:
-            _last = hist[-1] if hist else {}
-            _ent = _last.get("entropy_by_kind") or {}
-            _kl = float(_last.get("kl", 0.0))
-            if it == 1:
-                # 首轮只**测**各头起点熵，不判降档 —— 那时还没有基线可比 ✓
-                anneal_st.ref_entropy = dict(_ent)
-                print("    退火：首轮只记录各头起点熵 -> "
-                      + " ".join(f"{k}={v:.2f}" for k, v in sorted(_ent.items())))
-            else:
-                anneal_st, _act = kl_anneal_step(
-                    anneal_st, ent_by_kind=_ent, measured_kl=_kl, cfg=_acfg
-                )
-                kl_coef_now = anneal_st.kl_coef
-                _extra = ""
-                if _act is Action.REHEAT:
-                    _extra = f"  坍缩头={anneal_st.history[-1].get('collapsed')}"
-                print(f"    退火：{_act.value}  kl={_kl:.4f} -> kl_coef={kl_coef_now:.4f}{_extra}")
-                if _act is Action.ABORT:
-                    # 已在锚定上限仍坍缩 -> 救不回来了：回滚 + **停止本次 RL**（不是 continue）
-                    print(f"  ⛔ 退火判定 ABORT（第 {it} 轮）：已在上限仍坍缩，"
-                          f"回滚到最优并停止本次 RL")
-                    net = best_net.copy()
-                    net.save(args.out)
-                    log["rl"].append({"iter": it, "aborted": True,
-                                      "reason": anneal_st.history[-1].get("reason")})
-                    save_log(args, log)
-                    return net
-                if _act is Action.REHEAT:
-                    # --- REHEAT 主分支（测试锚定下面这行标记，别删）---
-                    # 真的回滚**内存里的权重** —— 「有机制」≠「被调用了」（第七种形状）
-                    net = best_net.copy()
-                    # REHEAT 后把参考也拉到恢复点。
-                    #
-                    # 语义变化（**有意**，不是笔误）：
-                    #   不重置 -> KL 衡量「离 BC 有多远」，约束恒定 ✓
-                    #   重置   -> KL 衡量「离**上一轮最优**有多远」，
-                    #             约束**每 REHEAT 一次就松一档** ✓
-                    # 效果 = 每次 REHEAT 都再给一点自由 ✓ 与退火目标同向 ✓
-                    # 不重置的坏处：回滚后 KL 会瞬间变大 -> 下一轮又判「有余量」
-                    #   -> 可能反复降档 ✗
-                    #
-                    # ⚠️ 这里原来写的是「否则下轮还锚在坏策略上」—— **那句不成立** ✗
-                    # ref_net 的初值是 RL 开始前的 BC 权重 ✓ 它固定、不参与求导、
-                    # 也不会被 RL 改坏 ✓ 所以不存在「锚在坏策略上」这回事 ✓
-                    # （mac 审出来的：**注释写错理由比没注释更危险** ⚠️ 第②种形状）
-                    ref_net = net.copy()
-                    net.kl_coef = kl_coef_now
-                    print(f"    ↩ 退火触发回滚：内存权重已回到 {best_delta:+.1f}")
         log["rl"].append({"iter": it, "samples": int(len(data["X"])), "eval": ev,
-                          "kl_coef": kl_coef_now,
                           "selfplay": {k: v for k, v in st.items() if k != "scores"}})
         if ev["平均段位分"] > best_delta:
             best_delta = ev["平均段位分"]
@@ -1014,16 +780,6 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--kl-coef", type=float, default=0.1,
                     help="KL 锚定强度（0 = 关）。把 RL 策略拉回克隆阶段的参考策略，"
                          "防止把 BC 学的牌效训崩；太紧 RL 动不了，太松等于没锚")
-    ap.add_argument("--kl-anneal", action="store_true",
-                    help="KL 退火：按「逐头熵 + 实测 KL」逐步放开锚定（**默认关**，"
-                         "不开则行为与以前完全一致）。规则见 tools/kl_anneal.py："
-                         "熵有余量且 KL 小才降一档；熵坍缩则回退一档并回滚内存权重；"
-                         "已在上限仍坍缩则 ABORT（回滚 + 停止本次 RL，不空转）")
-    ap.add_argument("--kl-floor", type=float, default=0.01,
-                    help="退火的锚定下限（**永不归零** —— P1-2 的防崩精神："
-                         "留一个很小的锚 != 没锚，仍能挡住一步崩掉）")
-    ap.add_argument("--kl-decay", type=float, default=0.5,
-                    help="每降一档乘多少")
     args = ap.parse_args(argv)
 
     if args.list_models:

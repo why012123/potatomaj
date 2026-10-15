@@ -355,7 +355,9 @@ class Room:
                     "uid": uid,
                     "name": s.name,
                     "kind": s.kind,
-                    "ai": s.ai,
+                    # 只有真的是 AI 才写模型名 —— 真人座位接过 AI 位之后
+                    # 那个字段要清掉，否则真人的决策会被标成某个模型打的
+                    "ai": (s.ai if s.kind == "ai" else None),
                     "host": s.host,
                     "elo": round(prof.elo, 2),
                     "games": prof.games,
@@ -712,11 +714,14 @@ class Room:
         s.uid = uid
         s.name = (name or "玩家")[:16]
         s.kind = "human"
+        # 这三行都得清干净：AI 座位留下的模型名会跟着「人」一路进到
+        # 决策记录和画像里（`ai: maj-normal4v1.2` 挂在真人身上），
+        # 训练数据里就分不清哪个是人打的了。
         s.ai = None
-        s.online = True
-        s.token = _token()
         s.ai_degraded = False
         s.ai_degrade_reason = ""
+        s.online = True
+        s.token = _token()
         return seat
 
     def _can_take_ai_seat(self, seat: int) -> bool:

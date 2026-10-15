@@ -43,6 +43,14 @@ run-electron.sh
 *.log
 *.swp
 
+# ── 网页平台跑起来之后才有的东西（本地保留）───────────────────
+# logs/ 下有匿名玩家 ID 的对局流水，run/ 是 PID 文件。
+# 这两样都不该进仓库（隐私 + 每次重启都在变）。
+logs/
+run/
+data/profiles.json
+games-*.jsonl.gz
+
 # 识图那套已被协议解码替代，这些是它的遗留物（本地保留）
 tools/evaluate.py
 samples/

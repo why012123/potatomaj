@@ -65,7 +65,55 @@ CAMEL = {
     "stopOpacity": "stop-opacity",
 }
 
-#: 只保留这些属性（style 会被展开，其余丢掉）
+#: 牌面底色。**素材的 SVG 是「透明底的彩色笔画」**，直接放到牌桌上就是
+#: 一堆深绿方块（背景透出绒布的颜色）—— 这就是「牌面不是白的」的真原因。
+#: 所有牌面都往里补一张象牙白底，牌就自己带底色了，不依赖任何外部 CSS。
+TILE_FACE_BG = (
+    '<rect x="0" y="0" width="300" height="400" rx="26" fill="#fbf8f1"/>'
+    '<rect x="4" y="4" width="292" height="392" rx="24" fill="none" '
+    'stroke="#ddd6c8" stroke-width="3"/>'
+)
+
+
+def with_face_bg(svg_text: str) -> str:
+    """在 ``<svg …>`` 之后插一层象牙白底（幂等）。"""
+    if 'fill="#fbf8f1"' in svg_text:
+        return svg_text
+    i = svg_text.find(">", svg_text.find("<svg"))
+    if i < 0:
+        return svg_text
+    return svg_text[: i + 1] + TILE_FACE_BG + svg_text[i + 1 :]
+
+
+#: 牌背。**不沿用素材里那个 back.svg** —— 它整张是靠 SVG <mask> 抠出来的，
+#: 而 mask 里的底是洋红 `#ff3737`（chroma key）。浏览器对这套 mask 的解析
+#: 跟素材作者的预期不一致时，mask 失效，露出来的就是那块洋红 ——
+#: 实测渲染出来是一整张纯红，**四家别家的手牌全变成红方块**。
+#: 所以这里自己画：牌背就是「象牙白的牌身 + 深绿绒布的背面」，自己画更可控。
+TILE_BACK_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 400" '
+    'width="300" height="400">'
+    '<defs>'
+    '<linearGradient id="rs" x1="0" y1="0" x2="0" y2="1">'
+    '<stop offset="0" stop-color="#2f8a63"/>'
+    '<stop offset="0.5" stop-color="#226b4d"/>'
+    '<stop offset="1" stop-color="#184f39"/>'
+    '</linearGradient>'
+    '</defs>'
+    # 牌身（象牙白，和牌面一致 —— 同一张牌的两面）
+    '<rect x="0" y="0" width="300" height="400" rx="26" fill="#fbf8f1"/>'
+    '<rect x="4" y="4" width="292" height="392" rx="24" fill="none" '
+    'stroke="#ddd6c8" stroke-width="3"/>'
+    # 背面（深绿绒布）
+    '<rect x="22" y="22" width="256" height="356" rx="16" fill="url(#rs)"/>'
+    '<rect x="22" y="22" width="256" height="356" rx="16" fill="none" '
+    'stroke="rgba(0,0,0,.30)" stroke-width="3"/>'
+    '<rect x="36" y="36" width="228" height="328" rx="10" fill="none" '
+    'stroke="rgba(255,255,255,.20)" stroke-width="2"/>'
+    '<circle cx="150" cy="200" r="34" fill="none" '
+    'stroke="rgba(255,255,255,.16)" stroke-width="3"/>'
+    '</svg>'
+)
 KEEP = {
     "d", "fill", "fill-rule", "fill-opacity", "stroke", "stroke-width",
     "stroke-linecap", "stroke-linejoin", "stroke-opacity", "stroke-dasharray",
@@ -110,6 +158,7 @@ def _scan(body: str) -> str:
     out: list[str] = []
     n = len(body)
     i = 0
+    first_tag = True
     while i < n:
         ch = body[i]
         if ch != "<":
@@ -138,7 +187,8 @@ def _scan(body: str) -> str:
                 break
             k += 1
         tag = body[i : k + 1]
-        out.append(_clean_tag(tag))
+        out.append(_clean_tag(tag, is_root=(first_tag and tag.lstrip().startswith("<svg"))))
+        first_tag = False
         i = k + 1
     return "".join(out)
 
@@ -158,7 +208,7 @@ def _skip_brace(body: str, i: int) -> int:
     return n
 
 
-def _clean_tag(tag: str) -> str:
+def _clean_tag(tag: str, is_root: bool = False) -> str:
     """``<path style={{...}} fillRule="x" cx={12} {...p} />`` -> 干净的标准 SVG 标签。
 
     JSX 里属性值可能是表达式：``cx={135.055}``。**不能直接丢掉** —— 丢掉的
@@ -240,11 +290,29 @@ def _clean_tag(tag: str) -> str:
         if k in seen or v == "":
             continue
         seen.add(k)
+        if k in ("xmlns", "xmlns:xlink") and not is_root:
+            # ★ **命名空间只在根元素上声明一次**。
+            #
+            # 原来每个子元素都带一份 `xmlns="…"` / `xmlns:xlink="…"`（4p.svg 有
+            # 28 个！）。这在 XML 里是**合法但多余**的，可有些浏览器（尤其
+            # WebKit / Safari 系）对 `image/svg+xml` 走严格 XML 解析，遇到这种
+            # 就**整张图不画** —— 表现正是用户报的两件事：
+            #   1. 牌面的白底不见了（我在生成时新加的那层 `<rect>` 没被画出来）
+            #   2. 图加载失败 -> `<img>` 自然尺寸变成 0 -> 布局全算错 -> **牌乱飞**
+            # 只在根上声明就没有任何歧义了。
+            continue
         keep.append(f'{k}="{v}"')
-    if "xmlns" not in seen:
-        keep.insert(0, 'xmlns="http://www.w3.org/2000/svg"')
-    if "xmlns:xlink" not in seen:
-        keep.insert(1, 'xmlns:xlink="http://www.w3.org/1999/xlink"')
+    if is_root:
+        if "xmlns" not in seen:
+            keep.insert(0, 'xmlns="http://www.w3.org/2000/svg"')
+        # viewBox 有、width/height 也补上：有些环境不按 viewBox 推自然尺寸，
+        # `<img>` 拿不到尺寸就会让布局塌掉。
+        if "width" not in seen:
+            keep.append('width="300"')
+        if "height" not in seen:
+            keep.append('height="400"')
+    else:
+        keep = [f'{k}="{v}"' for k, v in attrs if k not in ("xmlns", "xmlns:xlink")]
     return f"<{name} {' '.join(keep)}{' /' if self_close else ''}>"
 
 
@@ -342,13 +410,19 @@ def main(argv: list[str] | None = None) -> int:
         '<rect x="4" y="4" width="292" height="392" rx="24" fill="none" '
         'stroke="#c8c1b4" stroke-width="4"/></svg>'
     )
+    # 牌背：素材那个是靠 <mask> 抠的（mask 底是 chroma key `#ff3737`），
+    # mask 一失效就露成纯红 —— 直接换成自己画的（见 TILE_BACK_SVG 的注释）。
+    comps["Back"] = TILE_BACK_SVG
     for comp, tid in COMPONENT_TO_ID.items():
         src = comps.get(comp)
         if not src:
             missing.append(f"{tid}({comp})")
             continue
         try:
-            svg = strip_jsx(src)
+            if comp == "Back":
+                svg = TILE_BACK_SVG
+            else:
+                svg = with_face_bg(strip_jsx(src))
         except ValueError as exc:
             missing.append(f"{tid}({comp}: {exc})")
             continue

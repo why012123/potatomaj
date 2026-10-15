@@ -114,6 +114,8 @@ export class TableView {
   private readonly doraEl: HTMLDivElement;
   private readonly sticksEl: HTMLDivElement;
   private readonly turnEl: HTMLDivElement;
+  /** 中央区的「四家点数 / 场风自风 / 出牌指示」一行 */
+  private readonly scoreStrip: HTMLDivElement;
   private readonly curtain: HTMLDivElement;
   /** 上一帧牌河长度：用来判断哪张是新打出的（做动画） */
   private readonly prevPond = new Map<number, number>();
@@ -136,6 +138,7 @@ export class TableView {
           <div class="centerbox__wall"><b>--</b><span>枚</span></div>
           <div class="centerbox__dora"><span class="lbl">宝牌</span><div class="dora-row"></div></div>
           <div class="centerbox__sticks"><span class="lbl">供托</span><span class="stick"></span><b>0</b></div>
+          <div class="scorestrip"></div>
           <div class="centerbox__turn"></div>
         </div>
       </div>
@@ -146,6 +149,7 @@ export class TableView {
     this.doraEl = this.root.querySelector(".dora-row") as HTMLDivElement;
     this.sticksEl = this.root.querySelector(".centerbox__sticks") as HTMLDivElement;
     this.turnEl = this.root.querySelector(".centerbox__turn") as HTMLDivElement;
+    this.scoreStrip = this.root.querySelector(".scorestrip") as HTMLDivElement;
     this.curtain = this.root.querySelector(".table__curtain") as HTMLDivElement;
   }
 
@@ -236,17 +240,20 @@ export class TableView {
     this.renderCenter(state);
     this.renderCurtain(state);
 
-    // 尺寸 / 座位数变了就无条件重排；否则每帧也排一次（很便宜，
-    // 而且手牌张数一变，这一家的盒子和牌河偏移都得跟着更新）。
+    // 每帧都推进一轮布局修正。
+    //
+    // **不能只在「尺寸变了」的时候做**：这一帧手牌 / 牌河刚被重建，上一帧存下来的
+    // `--fix-*` 就是按旧内容算的，不重跑就会一直偏着；而一帧里改完自定义属性
+    // 立刻量，读到的还是旧布局，所以必须**逐帧**迭代到收敛（见 fitEdge）。
+    // 代价很小：一帧几次 getBoundingClientRect，只在有帧推送时发生（服务端
+    // 30fps 合并过）。换视口尺寸时顺手重置收敛状态。
     const fitKey = `${window.innerWidth}x${window.innerHeight}:${n}:${state.seats.length}`;
     if (fitKey !== this.lastFit) {
       this.lastFit = fitKey;
-      this.fitLayout();
-    } else if (freshFrame) {
-      this.fitLayout();
-    } else {
-      this.scheduleRefit();
+      this.fitCount = 0;
     }
+    void freshFrame;
+    this.fitLayout();
   }
 
   /**
@@ -257,7 +264,8 @@ export class TableView {
    * 拿到的还是改动之前的值。所以修正必须跨帧迭代：一帧一轮，量到稳定为止。
    * 用一个标记去重，不重复排队。
    */
-  private scheduleRefit(): void {
+  /** 请求下一帧再跑一轮布局修正（外部也可以调：侧栏开合后要重排）。 */
+  scheduleRefit(): void {
     if (this.refitPending) return;
     this.refitPending = true;
     requestAnimationFrame(() => {
@@ -269,6 +277,9 @@ export class TableView {
   private renderSeat(s: SeatState, state: StateMsg, freshFrame: boolean): void {
     const v = this.seats.get(s.seat);
     if (!v) return;
+    // 这一家的内容变了（手牌 / 副露 / 牌河重建）→ 现在存着的 `--fix-*` 是按旧
+    // 内容算的。**必须重新收敛**，否则它会一直偏着，直到下一次恰好有帧推送。
+    let dirty = false;
     const mine = s.seat === state.viewer.seat;
     const active =
       state.round != null &&
@@ -311,6 +322,7 @@ export class TableView {
       v.hand.classList.toggle("is-mine", mine);
       if (s.hand) this.buildMyHand(v.hand, s, state, size);
       else v.hand.appendChild(buildHiddenHand(s.hand_count, size));
+      dirty = true;
     } else if (mine) {
       this.updateHandSelection(v.hand, state);
     }
@@ -330,6 +342,7 @@ export class TableView {
         if (grew) box.classList.add("is-meld-new");
         v.melds.appendChild(box);
       }
+      dirty = true;
     }
 
     // -- 牌河 --
@@ -337,7 +350,10 @@ export class TableView {
     if (v.sig.pond !== pondSig) {
       v.sig.pond = pondSig;
       this.rebuildPond(v, s, size, freshFrame);
+      dirty = true;
     }
+
+    if (dirty) this.scheduleRefit();
   }
 
   /**
@@ -426,14 +442,52 @@ export class TableView {
    * 但牌河里可能有好几张同牌型的牌，所以取**最后一张**等于它的 ——
    * 那才是他立直时打出的那一张。`lastIndexOf` 正好是这个语义。
    */
+  /**
+   * 牌河重画。
+   *
+   * **第一张牌的位置是钉死的**（由 CSS 的固定 6×3 格子 + 座位盒子决定，
+   * 跟手牌张数无关），后面的牌往右一张张填，满 6 张换行。
+   *
+   * 两个「不乱动」的细节：
+   *
+   * 1. 新牌**只追加**（`appendChild`），不重排已有节点 —— 重排会让浏览器
+   *    给每张牌重新跑一遍布局/动画，看起来像整条牌河在抖。
+   *    只有「不是多一张」的情况（断线重连、重开一局、立直牌换了位置）
+   *    才整体重画。
+   * 2. 牌河的**格子是固定 6 列的 grid**，所以第 7 张一定落在第二行第一列 ——
+   *    不会因为总张数变化而重排。
+   */
   private rebuildPond(v: SeatView, s: SeatState, size: "md" | "lg", animate: boolean): void {
     const before = this.prevPond.get(s.seat) ?? 0;
     const pond = s.pond;
     const riichiAt = riichiIndex(s);
-    // 只有「多了恰好一张」才做动画：一帧里塞进两张（断线重连）就直接画。
-    const animFrom = animate && pond.length === before + 1 ? before : -1;
+    // 只有「多了恰好一张」才做增量：一帧里塞进两张（断线重连）就整体重画。
+    const grew = animate && pond.length === before + 1;
+    const sig = s.pond.join(",") + "|" + s.pond_red.join("") + "|" + (s.riichi_tile ?? "");
+
+    if (grew && v.pond.dataset["sig"] !== "" && v.pond.children.length === before) {
+      // 增量：把新的一张接到末尾，已有的一律不动
+      const i = pond.length - 1;
+      const red = s.pond_red[i] === 1;
+      v.pond.appendChild(
+        tileEl({
+          id: pond[i] as string,
+          size,
+          rotate: i === riichiAt,
+          cls: [`is-new`, red ? "is-red" : "", i >= 18 ? "is-overflow" : ""]
+            .filter(Boolean)
+            .join(" "),
+          title: i === riichiAt ? `立直宣言牌 ${pond[i]}` : (pond[i] as string),
+        }),
+      );
+      v.pond.dataset["sig"] = sig;
+      v.pond.dataset["count"] = String(pond.length);
+      this.prevPond.set(s.seat, pond.length);
+      return;
+    }
 
     v.pond.replaceChildren();
+    v.pond.dataset["sig"] = sig;
     v.pond.dataset["count"] = String(pond.length);
     pond.forEach((t, i) => {
       const red = s.pond_red[i] === 1;
@@ -445,7 +499,6 @@ export class TableView {
           cls: [
             i >= 18 ? "is-overflow" : "",
             red ? "is-red" : "",
-            i === animFrom ? "is-new" : "",
           ]
             .filter(Boolean)
             .join(" "),
@@ -487,6 +540,9 @@ export class TableView {
 
     this.sticksEl.querySelector("b")!.textContent = String(r.sticks);
 
+    // 四家点数 / 场风自风指示器 + 出牌玩家指示
+    this.renderScoreStrip(state);
+
     // 轮到谁 + 倒计时
     const a = state.actions;
     if (a && state.phase === "playing") {
@@ -500,6 +556,51 @@ export class TableView {
         `<span class="muted small"> · ${escapeHtml(a.kind_cn)}</span>`;
     } else {
       this.turnEl.textContent = "";
+    }
+  }
+
+  /**
+   * 中央区那一行「四家点数 / 场风 · 自风」。
+   *
+   * 为什么要这个东西：光看每家的名牌，得把视线在桌子四条边上转一圈才知道
+   * 谁多少分、谁在出牌。中央区是眼睛本来就会落的地方（牌河、宝牌都在这儿），
+   * 把四家的分数按**座次顺序**排一行放在这里，一眼就能扫完 ——
+   * 天凤和雀魂的中央信息区都是这个作用。
+   *
+   * - 按 `rel`（自己 → 下家 → 对家 → 上家）排序，和自己看桌子的方向一致
+   * - `is-dealer` 标红自风，`is-riichi` 在名字后挂个「立」
+   * - **`is-active` 是出牌指示**：正在行动的那家整行加金边高亮 + 名字变金，
+   *   配合 `actions.ms_left` 的倒计时，不用去猜轮到谁
+   * - `is-me` 让自己那家颜色区分开，和下方手牌呼应
+   */
+  private renderScoreStrip(state: StateMsg): void {
+    const order = ["自己", "下家", "对家", "上家"];
+    const rows = [...state.seats].sort((a, b) => {
+      const ia = order.indexOf(a.rel ?? "");
+      const ib = order.indexOf(b.rel ?? "");
+      return (ia < 0 ? 9 : ia) - (ib < 0 ? 9 : ib);
+    });
+    const actions = state.actions;
+    const activeSeat = actions && state.phase === "playing" ? actions.seat : -1;
+
+    this.scoreStrip.replaceChildren();
+    for (const s of rows) {
+      const line = h("div", "scoreline");
+      if (s.seat === state.viewer.seat) line.classList.add("is-me");
+      if (s.is_dealer) line.classList.add("is-dealer");
+      if (s.riichi) line.classList.add("is-riichi");
+      if (!s.connected) line.classList.add("is-offline");
+      if (s.seat === activeSeat) line.classList.add("is-active");
+      line.appendChild(h("span", "scoreline__wind", escapeHtml(s.seat_wind || "?")));
+      line.appendChild(
+        h("span", "scoreline__name",
+          escapeHtml(s.seat === state.viewer.seat ? `${s.name}（你）` : s.name)),
+      );
+      line.appendChild(h("span", "scoreline__score", String(s.score)));
+      line.title =
+        `${s.name} · ${s.seat_wind}家${s.is_dealer ? "（亲）" : ""}` +
+        ` · ${s.score} 点${s.riichi ? " · 立直" : ""}${s.connected ? "" : " · 离线"}`;
+      this.scoreStrip.appendChild(line);
     }
   }
 
@@ -569,48 +670,138 @@ export class TableView {
     const tileH = tile && tile.offsetHeight ? tile.offsetHeight : tileW / 0.96;
     const n = v.hand.children.length;
     if (!n) return;
+    const side = v.dir === "left" || v.dir === "right";
+    /*
+     * ★ 手牌张数最多的那一家（侧家 16 张）决定牌能不能放进屏幕。
+     *
+     * 侧家的手牌是**竖着**排的，16 张 = 16 个牌宽 + 15 个牌距。牌的尺寸是
+     * 全局的（`--tile-w`），所以只要侧家放不下，整桌都得缩 —— 反过来，
+     * 尺寸放大到侧家放不下就会「手牌跑到画面外」（实测：1920x1080 下
+     * 右家 16 张高 1001px、2560x1440 下 1146px，都超出了各自的可视高度）。
+     *
+     * 这里按**实际可用高度**反推一个上限，给 `.table` 挂上去；CSS 里
+     * `--tile-w` 用 `min(..., var(--tile-cap))` 兜住。这样任何分辨率、
+     * 三麻四麻都不会把手牌顶出屏幕，同时牌尽可能大。
+     */
+    this.capTileSize();
     // 跨度按「张数 × 牌宽 + 牌距」算，不依赖任何一次 DOM 收缩计算 ——
     // 手牌在带旋转的祖先里会被压扁，父元素的尺寸一律不可信。
     const gap = parseFloat(getComputedStyle(v.hand).columnGap) || 0;
     const span = tileW * n + gap * (n - 1);
-    const side = v.dir === "left" || v.dir === "right";
     const slack = Math.max(2, tileH * 0.1);
+    // 牌厚（含两侧留白）。盒子尺寸见下面 —— **按最大手牌算，不按当前张数**。
     const thick = tileH + slack * 2;
-
-    // 盒子尺寸：一边是「手牌跨度」，另一边是「牌厚 + 留白」。**不能比手牌窄** ——
-    // 手牌要在盒子里居中，盒子比手牌窄就会把它顶出去（下家只剩几张牌的时候
-    // 最容易碰上）。短边用 max，多出来的空间由居中偏移吃掉，这样牌河 / 副露
-    // 相对手牌的位置不随手牌张数抖动。
-    const across = Math.max(span, thick);
-    v.boxW = side ? thick : across;
-    v.boxH = side ? across : thick;
+    /*
+     * ★ **盒子尺寸按「最大的手牌」算，不按当前张数。**
+     *
+     * 用户的要求是「画面里只有手牌能动，其他牌位置定死」。原来
+     * `across = max(span, thick)` 是**随手牌张数变**的：14 张时 883px、
+     * 13 张时 717px。而牌河是 `left: 50%` 钉在盒子中线上的 ——
+     * 盒子一缩，牌河跟着横移 15px（实测：`--edge-w` 883.72 → 717.58，
+     * 牌河第一张从 x=976 跳到 x=961）。打完一张牌整条牌河就抖一下，
+     * 看起来就是「牌一直在乱动」。
+     *
+     * 现在盒子永远按 14 张的宽度算（手牌最多就是这个数），盒子的位置和尺寸
+     * 全程不变；变的是 `--hand-center`（手牌在这个固定盒子里自己居中）。
+     * 于是**牌河第一张的落点成了一根不动的桩子**，只有手牌在动。
+     */
+    const maxSpan = tileW * (side ? 14 : 15) + gap * (side ? 13 : 14);
+    const boxAcross = Math.max(maxSpan, thick);
+    v.boxW = side ? thick : boxAcross;
+    v.boxH = side ? boxAcross : thick;
     v.edge.style.setProperty("--edge-w", `${v.boxW.toFixed(2)}px`);
     v.edge.style.setProperty("--edge-h", `${v.boxH.toFixed(2)}px`);
     v.edge.style.setProperty("--side-slack", `${slack.toFixed(2)}px`);
     v.edge.style.setProperty("--hand-span", `${span.toFixed(2)}px`);
     v.edge.style.setProperty("--hand-thick", `${thick.toFixed(2)}px`);
-    // 手牌居中偏移 =「盒子长边 - 手牌跨度」的一半
-    v.edge.style.setProperty("--hand-center", `${((across - span) / 2).toFixed(2)}px`);
+    // 手牌居中偏移 =「固定盒子长边 - 当前手牌跨度」的一半
+    v.edge.style.setProperty(
+      "--hand-center",
+      `${((boxAcross - span) / 2).toFixed(2)}px`,
+    );
     if (side) {
       // ---- 侧家 ----
-      // 手牌在局部 x = slack .. slack + 牌厚（贴着墙那一边）。
-      // 副露紧挨手牌里侧；牌河再往里让开副露那一条带子（最多 4 张副露）。
+      // 手牌在局部 x = slack .. slack + 牌厚（贴着墙那一边）；副露挨着手牌里侧。
       v.edge.style.setProperty("--melds-lead", `${thick.toFixed(2)}px`);
-      v.edge.style.setProperty("--pond-lead", `${(thick + slack).toFixed(2)}px`);
-      // 牌河的上边缘 = 手牌起点 + 让开的距离。手牌在局部 y ∈ [0, span]，
-      // 用 `top`（自盒子顶边往下量）最直观，不跟 `bottom` 的百分比打架。
-      v.edge.style.setProperty("--pond-gap", `${(tileH * 2.6 + slack).toFixed(2)}px`);
+      /*
+       * 牌河：两个方向的分量都按**局部坐标**直接给（见 CSS 里的说明）。
+       *
+       * `.edge--side` 的 `rotate(±90deg)` 把局部的 x/y 在屏幕上互换了
+       * （实测变换矩阵 `[0 ∓1; ±1 0]`），所以对应关系是：
+       *   - 局部 **x** = 屏幕上**沿手牌**方向 → `--pond-x`
+       *   - 局部 **y** = 屏幕上**朝桌心**方向 → `--pond-y`
+       * 右家要翻号：两条 `.edge` 的旋转方向相反，同一个局部正值在屏幕上是
+       * 反方向（这就是「左边偏上、右边偏下」以及右家压住手牌的原因）。
+       *
+       * `--pond-x` 取**手牌中点**：牌河一行 6 张、最多 2 行，从手牌中点起算
+       * 正好落在手牌旁边那一带的中间，左右两家对称。
+       */
+      const dir = v.dir === "left" ? 1 : -1;
+      /*
+       * 两个分量都取**固定值**（只跟牌尺寸走，不跟手牌张数走）：
+       *   - 沿手牌方向：0 → 牌河相对手牌长度居中（手牌在盒子里居中摆放，
+       *     所以局部中点就是手牌中点）
+       *   - 朝桌心方向：让开「半个牌厚 + 一副露带子」
+       * 用固定值是有意的：之前拿 `span` 去算，手牌一张数变化牌河就跟着挪，
+       * 又回到「牌一直在乱动」那个老问题上。
+       */
+      const half = tileH / 2 + slack;
+      const inward = half + tileW * 2.4;
+      v.edge.style.setProperty("--pond-x", "0px");
+      v.edge.style.setProperty("--pond-y", `${(dir * inward).toFixed(2)}px`);
+      // 牌河在局部坐标系里的「高」：转 90° 之后，屏幕上量到的宽就是它
+      v.edge.style.setProperty("--pond-h", `${tileW.toFixed(2)}px`);
     } else {
-      // ---- 下 / 上家 ----
-      // 副露紧挨手牌右端；牌河右端与手牌右端对齐，整体在手牌内侧。
-      // 顶家整体转了 180°，局部 x/y 都翻了，所以它的 CSS 用的是
-      // `right` / `bottom` —— 同一套「往盒子里量」的偏移在两边都成立。
-      v.edge.style.setProperty("--melds-lead", `${((across - span) / 2 - slack).toFixed(2)}px`);
-      v.edge.style.setProperty(
-        "--pond-lead",
-        `${((across - span) / 2 - slack).toFixed(2)}px`,
-      );
+      /*
+       * ---- 下 / 上家 ----
+       *
+       * ★ **这里给的都是「跟手牌无关的固定值」**。
+       *
+       * 用户的要求是「画面里只有手牌能动，别的牌位置定死」。所以副露和牌河
+       * 不能再参与 `across - span` 这种**随手牌张数变**的算式了 ——
+       * 手牌一多一少，副露和牌河就跟着跳，看起来就是「牌一直在乱动」。
+       *
+       * 现在：
+       *   - 副露钉在盒子右端（`--melds-lead` = slack），后面的往上磊
+       *   - 牌河钉在盒子中线上（`left: 50%`，没有 translate），
+       *     第一张永远在同一个格子，后面的往右填、满 6 张换行
+       * 只有手牌自己会随张数重新居中。
+       */
+      v.edge.style.setProperty("--melds-lead", `${slack.toFixed(2)}px`);
       v.edge.style.setProperty("--pond-gap", `${(thick + tileH * 0.5).toFixed(2)}px`);
+    }
+  }
+
+  /**
+   * 牌尺寸上限：按**实际可用空间**反推，挂到 `.table` 的 `--tile-cap` 上。
+   *
+   * 为什么要这一层：牌尺寸是全局的（`--tile-w`），而侧家的手牌是**竖着**排的，
+   * 16 张就要 16 个牌宽。只要它放不下，手牌就会被顶出屏幕
+   * （实测 1920x1080 下右家 16 张高 1001px、2560x1440 下 1146px，都超了）。
+   *
+   * 反推依据（都是「一屏里必须塞下」的硬约束）：
+   *   - 纵向：侧家 16 张（16 宽 + 15 距）≈ 牌高 × 16.6，得放得进可视高
+   *   - 横向：自己 14 张 + 副露 ≈ 牌宽 × 15，再加上两侧安全区
+   * 取两边的较小值，再留 12% 余量。三麻（13 张）自然就更大一点。
+   */
+  private capTileSize(): void {
+    const availH = this.root.clientHeight;
+    const availW = this.root.clientWidth;
+    if (!availH || !availW) return;
+    /*
+     * 系数是按**实测**定的，不是拍的：
+     *   1920x1080 下 16 张牌、牌高 63px → 手牌跨度 1008px（16 × 63），
+     *   已经超过可视高度；要放进 1080 里，牌高得压到 55px 以下。
+     * 所以纵向按「17 个牌高」算（16 张 + 间距 + 上下留白），再留 15% 余量。
+     * 横向同理：自家 16 张 + 副露 + 两侧安全区。
+     */
+    const byHeight = (availH * 0.85) / 17.0;
+    const byWidth = (availW * 0.85) / 17.0;
+    const cap = Math.max(16, Math.min(byHeight, byWidth));
+    const cur = parseFloat(this.root.style.getPropertyValue("--tile-cap"));
+    // 只在变化超过 1px 时写，避免每帧都动样式触发重排
+    if (!Number.isFinite(cur) || Math.abs(cur - cap) > 1) {
+      this.root.style.setProperty("--tile-cap", `${cap.toFixed(2)}px`);
     }
   }
 
@@ -651,11 +842,22 @@ export class TableView {
     const r = spanOf(v.hand, ".tile, .hand__gap");
     if (!r) return 0;
 
-    // 目标：让手牌贴到桌子对应的沿上、另一个方向居中
+    /*
+     * ★ 侧家的「牌厚」是包围盒的**高**，不是宽。
+     *
+     * 左右两家整体转了 ±90°，所以手牌那条**横条**在屏幕上变成了一条**竖条**：
+     * 包围盒宽 = 一张牌的厚度（~55px），包围盒高 = 整手牌的长度（~430px）。
+     *
+     * 一开始写的是 `parent.right - r.width / 2` —— 于是「竖条的中心」被摆到
+     * 距右边 27px 的位置，竖条前半截（约 190px）直接伸到屏幕外。表现就是
+     * 「下家只在最右边露出几个边，牌看不到」，而对家（顶家）没旋转所以是好的。
+     * 这两个症状同源，修好这一处两个都好。
+     */
+    const thick = side ? r.height : r.width;
     const wantCx = side
       ? v.dir === "right"
-        ? parent.right - r.width / 2
-        : parent.left + r.width / 2
+        ? parent.right - thick / 2
+        : parent.left + thick / 2
       : parent.left + parent.width / 2;
     const wantCy = side
       ? parent.top + parent.height / 2
