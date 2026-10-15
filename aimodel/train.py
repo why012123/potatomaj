@@ -159,10 +159,28 @@ def train_bc(
     n = len(data["X"])
     adv = np.ones(n, dtype=np.float32)
     hist: list[dict] = []
-    best_hold = -1.0
+    # ⚠️⚠️ `best_hold` **不能初始化为 -1** ✗ 那是个死值 ✓
+    #
+    # 后果（远端实测发现的，很严重）：`improved = hold > best_hold` 在**第一轮永远为真** ✗
+    # 于是 `--resume` 分块续训时，**第一块结束就把这一块内的「最好」存盘覆盖掉了** ✗
+    # —— 跟「进来时的权重本来是多少」毫无关系 ✓
+    #
+    # 实测证据：进来的权重留出 90.0%（3 轮），训 1 轮后存下来的是 **84.2%** ✗
+    # **越训越差，还存盘了** ✓ 而分块续训正是「杀窗口短」环境下唯一的活路 ✗
+    #
+    # 正确做法：**先量一次「进来时」的 holdout，拿它当初始最优** ✓
+    # 这样只有**真的比进来时更好**才会覆盖 ✓ 一轮都没进步就把原权重原样留着 ✓
+    base_hold = agreement(net, holdout) if holdout else agreement(net, data)
+    best_hold = base_hold
     best_epoch = 0
-    best_net = net
+    # ⚠️ 必须是 **copy()**，不能是 `net` 本身 ✗✗
+    #    `net` 是**引用** —— 训练过程会**原地改它** ✗ 所以「保留原权重」根本保留不住 ✓
+    #    （我的测试当场抓到了这条：`steps 0 -> 24`，说明 best_net 跟着一起被训了 ✓）
+    best_net = net.copy()
+    kept_original = True    # ← 直到有某一轮真的超过 base_hold 才变 False
     stale = 0
+    print(f"    进来时的留出率 {base_hold:.1%}"
+          "（只有超过它才会覆盖权重 ✓ 分块续训靠这个才不会越训越差 ✗）")
     # ⚠️ `--resume` 只恢复权重，**不恢复 epoch 计数** ✗
     #    所以 `--resume --epochs 30` = 「在现有权重上再训 30 轮」，
     #    不是「训到第 30 轮」✓ 每跑一次就多加 30 轮 ✓
@@ -209,6 +227,7 @@ def train_bc(
         if improved:
             # net.copy() 是深拷贝（含 steps / total_steps），所以拿回来能直接存
             best_hold, best_epoch, best_net = hold, ep + 1, net.copy()
+            kept_original = False
             stale = 0
         else:
             stale += 1
@@ -233,15 +252,23 @@ def train_bc(
                 print(f"    ⏹ 留出集连续 {patience} 轮没进步，提前停在 epoch {ep + 1}")
             break
     info = {
+        "kept_original": kept_original,   # ← True = 一轮都没超过进来时的留出率 ✓
+        "base_holdout": base_hold,
         "best_epoch": best_epoch,
         "best_holdout": best_hold,
         "last_epoch": len(hist),
     }
     if verbose:
-        print(
-            f"    ★ 最优留出率 {best_hold:.1%} 出现在 **第 {best_epoch} 轮**"
-            f"（共跑 {len(hist)} 轮）—— 存的是这一轮，不是最后一轮"
-        )
+        if kept_original:
+            print(
+                f"    ⚠️ {len(hist)} 轮里**没有一轮超过进来时的 {base_hold:.1%}** —— "
+                "原权重原样保留 ✓（不是「第 0 轮最优」，是**这一轮训练白跑了** ✓）"
+            )
+        else:
+            print(
+                f"    ★ 最优留出率 {best_hold:.1%} 出现在 **第 {best_epoch} 轮**"
+                f"（共跑 {len(hist)} 轮）—— 存的是这一轮，不是最后一轮"
+            )
     return hist, best_net, info
 
 
@@ -618,11 +645,18 @@ def cmd_bc(args) -> Net:
     saved_net = best_net
     saved_net.lr = getattr(args, "lr", saved_net.lr)
     saved_net.save(args.out)
-    print(
-        f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
-        f"  [最优留出 {bc_info['best_holdout']:.1%} @ 第 {bc_info['best_epoch']} 轮"
-        f" / 共 {bc_info['last_epoch']} 轮]"
-    )
+    if bc_info.get("kept_original"):
+        print(
+            f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
+            f"  [**一轮都没超过进来时的 {bc_info['base_holdout']:.1%}，"
+            f"原权重原样保留** ✓]"
+        )
+    else:
+        print(
+            f"  已保存 -> {args.out}（{saved_net.n_params()} 参数）"
+            f"  [最优留出 {bc_info['best_holdout']:.1%} @ 第 {bc_info['best_epoch']} 轮"
+            f" / 共 {bc_info['last_epoch']} 轮]"
+        )
     save_log(args, {"bc": {
         "hist": hist, "samples": int(len(data["X"])),
         "best_epoch": bc_info["best_epoch"],

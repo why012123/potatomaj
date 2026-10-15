@@ -133,6 +133,59 @@ check(len(hist3) == 3, f"无 holdout 时应跑满 3 轮，得到 {len(hist3)}")
 check(info3["best_epoch"] >= 1, "无 holdout 时也要给出最优轮次")
 print(f"  ✅ 无 holdout 时正常跑完 3 轮（最优 @ 第 {info3['best_epoch']} 轮）")
 
+
+# ── 分块续训不许把「更差」的权重存盘 ────────────────────────────
+# 这是远端实测发现的真 bug ✗：`best_hold = -1.0` 是个**死值** ✓
+# 于是 `improved = hold > best_hold` 在**第一轮永远为真** ✓
+# `--resume` 分块续训时，第一块结束就把「这一块内的最好」存盘覆盖 ✓
+# —— 跟「进来时本来是多少」毫无关系 ✓
+#
+# 实测证据：进来的权重留出 90.0%，训 1 轮后存下来的是 **84.2%** ✗
+# **越训越差还存盘** ✓ 而分块续训正是「杀进程环境」下唯一的活路 ✗
+#
+# 这里用**单调下降的假评分**直接钉死它（真实训练很难自然触发这条路径 ✓
+# 因为数据顺序本身通常就有增益 ✓ 所以必须用假评分来测 ✓）
+print()
+print("== 分块续训：没有一轮超过「进来时」就必须原样保留 ==")
+import numpy as _np
+import aimodel.train as _T
+
+
+_data = make_data(64, seed=7)          # 用文件里现成的造数据函数 ✓
+_hold = make_data(32, seed=8)
+_net = make_net(0)
+_steps_before = _net.total_steps
+
+# 进来的那次是 0.90；之后每次调用都给更小的值（用完就停在 0.50）✓
+# 注意 agreement 每轮会被调两次（一次训练集 acc、一次 holdout）✓ 所以不能用有限序列 ✗
+_seq = [0.90, 0.80, 0.70, 0.60]
+_pos = [0]
+
+
+def _fake_agree(net, data, limit=4000):
+    i = _pos[0]
+    _pos[0] += 1
+    return _seq[i] if i < len(_seq) else 0.50
+
+
+_orig_agree = _T.agreement
+_T.agreement = _fake_agree
+try:
+    _hist, _best, _info = _T.train_bc(
+        _net, _data, holdout=_hold, epochs=3, batch_size=8, verbose=False,
+    )
+finally:
+    _T.agreement = _orig_agree
+
+check(_info.get("kept_original") is True,
+      f"没有一轮超过进来时的评分，必须保留原权重，实际 kept_original={_info.get('kept_original')}")
+check(abs(_info.get("base_holdout", -1) - 0.90) < 1e-9,
+      f"base_holdout 应当是「进来时」的 0.90，实际 {_info.get('base_holdout')}")
+check(_best.total_steps == _steps_before,
+      f"保留原权重时不该动过它：steps {_steps_before} -> {_best.total_steps}")
+print(f"  ✅ 进来时 0.90，3 轮都是更差的分数 → 原权重保留（steps 仍为 {_steps_before}）")
+print(f"  ✅ base_holdout = {_info.get('base_holdout')}  kept_original = {_info.get('kept_original')}")
+
 if FAILED:
     print(f"\n❌ {len(FAILED)} 条失败")
     raise SystemExit(1)
