@@ -479,6 +479,118 @@ def encode(view: View) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# v2：把「逐张牌的通道」和「标量」分开（表示重构的第一步）
+# ---------------------------------------------------------------------------
+# 为什么要动表示：`action_features` 实测占 `encode`+`action_features` 的 87%
+# （1711µs 里 1565µs 是 ukeire_count），而它是**逐候选牌**算的、形状是
+# (34, 13) 的扁平表。做成 (通道, 34) 张量之后：
+#   * 「某张牌的所有信息」是同一列，卷积/共享权重才顺理成章
+#   * 张量形状可以直接喂卷积，也才能谈 GPU
+#
+# **这个函数只产出表示，不接线** —— `net.py` / `train.py` 仍走老的 `encode()`。
+# 接线要等 Mac 那边（它正跑着流水线，中途改特征会让在跑的 RL 基线说不清）。
+#
+# 张量轴序：``(C, 34)`` —— **通道在前**。第 c 个通道的第 t 个元素 = 第 c 项
+# 关于牌 t 的值。通道含义见 :data:`ENCODE_V2_CHANNELS`（顺序即行号）。
+
+#: ``(C, 34)`` 里每个通道的含义，**顺序即通道号**。
+#: 写进这里是为了让下一个人不用对着 (16, 34) 猜哪个通道是什么。
+ENCODE_V2_CHANNELS: tuple[str, ...] = (
+    "hand",            # 自己的手牌计数 /4
+    "hand_onehot",     # 手上有这张（>=1）
+    "hand_pair",       # 手上两张以上（>=2）
+    "hand_triple",     # 手上三张以上（>=3）
+    "melds",           # 自己副露里出现的牌 /3
+    "own_pond",        # 自己牌河 /4
+    "opp1_pond",       # 下家牌河 /4
+    "opp2_pond",       # 对家牌河 /4
+    "opp3_pond",       # 上家牌河 /4（三麻时这是空通道，见 note）
+    "opp1_melds",      # 下家副露 /3
+    "opp2_melds",      # 对家副露 /3
+    "opp3_melds",      # 上家副露 /3（三麻时空）
+    "visible",         # 该玩家能看到的每种牌总数（含自己手牌）/4
+    "dora_indicator",  # 宝牌**指示**牌 one-hot
+    "dora_tile",       # 宝牌 one-hot
+    "yakuhai",         # 见下方 note：这不是逐张牌的项，占位保留以便对齐
+)
+
+#: 三麻只有 3 家，`opp3_*` 两个通道恒为 0。
+#: **这是有意的**：通道数固定成 16，三麻/四麻用同一套网络结构，
+#: 免得再加一个「按人数分叉」的维度（加头/加维都会搞挂存量权重，踩过）。
+
+
+def _tile_channel_names(players: int) -> list[str]:
+    """从 :func:`feature_blocks` 里挑出「宽度 34 且逐张牌有独立值」的块。
+
+    **不写死列表** —— 写死的话，将来有人往 `feature_blocks` 里插一个新块，
+    这里会静默错位（通道和含义对不上，而且看不出来）。
+
+    ``yakuhai`` 是宽度 34 但**不是**逐张牌的（它按 5 个役牌种类记数、
+    只用了前 5 格），所以这里必须把它排除掉 —— 否则它会占一个通道名、
+    而真实的 `yakuhai` 数据既进不了 tile 也进不了 scalar，整块丢失 34 维。
+    """
+    return [n for n, w in feature_blocks(players)
+            if w == 34 and n != "yakuhai"]
+
+
+#: 三麻只有 3 家，`opp3_*` 两个通道恒为 0 **且布局里没有这两个块**。
+#: 通道数固定成 16 是为了三麻/四麻共用一套网络结构（避免按人数分叉）。
+_CHANNELS_ABSENT_IN_3P = frozenset({"opp3_pond", "opp3_melds"})
+
+
+def encode_v2(view: View) -> tuple[np.ndarray, np.ndarray]:
+    """观测 -> ``(tile, scalar)``。
+
+    * ``tile``   : ``(C, 34)`` float32，``C == len(ENCODE_V2_CHANNELS)``，
+                   通道含义见 :data:`ENCODE_V2_CHANNELS`
+    * ``scalar`` : ``(S,)`` float32，剩下那些跟具体哪张牌无关的项
+                   （向听 one-hot / 巡目 / 点数 / 立直标记 …）
+
+    **等价性由构造保证**：``tile`` 是从 :func:`encode` 的输出里按块切出来的，
+    不是把公式再抄一遍 —— 抄一遍迟早会和 `encode()` 漂移。
+    ``scalar`` 同理。所以这个函数和 `encode()` 的关系是「同一次计算的两种排布」，
+    由 ``tests/test_encode_v2.py`` 逐通道验证。
+
+    注意：`encode()` 里有两项**不是**逐张牌的（`yakuhai` 5 宽、`shanten_onehot` 8 宽），
+    它们落在 `scalar` 里；`yakuhai` 在 `ENCODE_V2_CHANNELS` 里的占位通道恒为 0，
+    只是为了让通道号和含义表一一对应、便于阅读。
+    """
+    players = view.rule.players
+    O, dim = layout_for(players)
+    x = encode(view)
+
+    names = set(_tile_channel_names(players))
+    tile = np.zeros((len(ENCODE_V2_CHANNELS), 34), dtype=np.float32)
+    for i, name in enumerate(ENCODE_V2_CHANNELS):
+        if name == "yakuhai":
+            continue            # 非逐张牌项，占位恒 0
+        if name in _CHANNELS_ABSENT_IN_3P and players == 3:
+            continue            # 三麻没有第 4 家 -> 布局里没这两个块
+        if name in names:
+            a = O[name]
+            tile[i] = x[a : a + 34]
+
+    # 标量 = 除了「逐张牌那 34 宽」之外的所有块，按 feature_blocks 的顺序拼。
+    # 注意 `yakuhai`（宽 34 但非逐张牌）要**留在这里**，它得进 scalar。
+    parts: list[np.ndarray] = []
+    for n, w in feature_blocks(players):
+        if n in names:
+            continue
+        a = O[n]
+        parts.append(np.asarray(x[a : a + w], dtype=np.float32))
+    scalar = np.concatenate(parts) if parts else np.zeros(0, dtype=np.float32)
+    return tile, scalar
+
+
+#: v2 的标量块数量（供 `net.py` 的 meta 用；改布局时这个数会变）
+ENCODE_V2_SCALAR_DIM: dict[int, int] = {
+    p: sum(w for n, w in feature_blocks(p)
+           if n not in set(_tile_channel_names(p)))
+    for p in (3, 4)
+}
+
+
+# ---------------------------------------------------------------------------
 # 动作掩码
 # ---------------------------------------------------------------------------
 
@@ -516,6 +628,7 @@ def action_label(decision: Decision, choice: int) -> str:
 __all__ = [
     "DIM", "OFFSET", "FEATURE_BLOCKS", "HEAD_SIZE", "encode", "visible_counts",
     "feature_blocks", "layout_for",
+    "encode_v2", "ENCODE_V2_CHANNELS", "ENCODE_V2_SCALAR_DIM",
     "action_mask", "action_index", "action_label",
     "ACTION_DIM", "ACTION_OFFSET", "ACTION_BLOCKS", "action_features", "tile_danger",
 ]
