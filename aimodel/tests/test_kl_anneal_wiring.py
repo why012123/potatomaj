@@ -124,12 +124,17 @@ check("Action.REHEAT" in rl_src, "cmd_rl 里应当处理 Action.REHEAT")
 MARK = "REHEAT 主分支（测试锚定下面这行标记，别删）"
 mark_idx = [i for i, ln in enumerate(lines) if MARK in ln]
 check(len(mark_idx) == 1, f"应当有且仅有 1 处 REHEAT 主分支标记，找到 {len(mark_idx)}")
-reheat_seg = "\n".join(lines[mark_idx[0] : mark_idx[0] + 10]) if mark_idx else ""
+# 窗口给足 25 行：主分支里有一大段**注释**（解释「为什么重置 ref_net」的语义变化）✗
+# 注释也算行 -> 窗口太小会把 `ref_net = ...` 那些**赋值**挤到窗口外 ✗（实测踩过）
+reheat_seg = "\n".join(lines[mark_idx[0] : mark_idx[0] + 25]) if mark_idx else ""
 check(bool(reheat_seg), "找得到 REHEAT 主分支（靠上面那行标记 ✓）")
 check(re.search(r"^\s*net\s*=\s*best_net", reheat_seg, re.M) is not None,
       "REHEAT 分支必须重新赋值 net（回滚内存权重）；只改 kl_coef 是假修")
+# ⚠️ 只检**行为**（有没有重新赋值 ref_net），**不检注释文本** ✗
+# 第一版这条的说明写的是「否则下轮还锚在坏策略上」—— 而那正是 mac 指出**不成立**的理由 ✗
+# 断言文案跟着错误理由走 -> 改注释就红 ✓ 说明它其实绑在文案上，不是在检行为 ✓
 check(re.search(r"^\s*ref_net\s*=\s*", reheat_seg, re.M) is not None,
-      "REHEAT 后参考策略也要回到健康点，否则下轮还锚在坏策略上")
+      "REHEAT 后必须重新赋值 ref_net（把参考拉到恢复点 -> 约束再松一档，与退火同向）")
 
 print("\n== D) ABORT 必须**停止**，不是 continue（否则只是换个地方空转）==")
 abort_seg = ""
