@@ -79,20 +79,33 @@ MODELS: dict[str, ModelSpec] = _build()
 
 
 def _register_pro(version: str = VERSION) -> None:
-    """注册 ``maj-pro`` —— 用**真实天鳳人类牌谱**做 BC 的那一系。
+    """注册 ``maj-pro`` —— 单独一系，和 ``_build`` 的四个 style 并列。
 
-    为什么单独注册、而不是加进 ``_build`` 的 style 列表：那个列表里的每个
-    style 都同时是**教师风格**（``HeuristicAgent(style=...)``），而 pro 不是
-    一种教师口味 —— 它的训练数据来自人类，不来自教师。
+    ⚠️ **原先这里的文档是错的，已更正** ✗
 
-    但 ``spec.style`` 会被用来生成**留出集**（见 ``train.cmd_bc``），
-    而留出集必须是个固定标尺才能和已有的 maj-* 模型比。所以这里
-    ``reward`` 沿用用户条件，``style`` 固定成 ``"normal"`` —— 表示
-    「留出集用标准教师」，而不是「这个模型是标准风格」。
+    原文写的是「用**真实天鳳人类牌谱**做 BC 的那一系」✓ ——
+    **实际不是** ✗ 远端在 2026-10-17 用四条独立判据查明：
+    ``maj-pro4v1.1`` 训的那份 ``bc_tv13.npz`` 是 **``collect_bc`` 教师生成**的 ✓
+    （判据：特征分布和教师现打**几乎逐位相同**；数据出自 ``shortjob``，
+    而 ``shortjob`` 调的就是 ``collect_bc``；150 片账本的决策总数
+    与 npz 条数**精确相等**；人类抽取那条路 ``_data/tbc/`` **零产出** ✓）
 
-    训练方式：``python -m aimodel.train bc --model=maj-pro4v1.3
-    --bc-data=_data/bc_tv13.npz``（数据集由 ``aimodel/tenhou_bc.py`` +
-    ``aimodel/shortjob.py`` 从天鳳牌谱抽出）。
+    **所以 ``maj-pro`` 到目前为止和 ``maj-normal*`` 是同一个数据来源** ✓
+    它「人类数据线」的身份**不成立** ✗
+
+    名字保留 ✗（已注册、已进天梯、平台也在引用 ✓ 改名会连锁）
+    但**语义要说清**：它是「教师蒸馏线的另一支」，不是人类数据线 ✓
+
+    真正的「人类牌谱 BC」在 2026-10-15 才第一次跑起来 ✓
+    （``tenhou_bc.py`` 从 ``GL1.xlsm`` 抽出 231 万条 → ``maj-pro4v1.1_mac`` ✓）
+    **直接证据**：未训练的 ``maj-pro4v1.1`` 在**真人类数据**上，
+    教师留出率 90.0% ✓ 但**同源一致率只有 45.3%** ✗ ——
+    如果那份数据也是教师生成的，这个数字应该接近 90% ✓
+
+    单独注册（而不是加进 ``_build`` 的 style 列表）的原技术理由仍然成立：
+    那个列表里的 style 同时是**教师风格** ✓ 而 pro 的训练数据来源不同 ✓
+    而 ``spec.style`` 会被用来生成**留出集**（见 ``train.cmd_bc``），
+    所以这里 ``style`` 固定成 ``"normal"`` —— 表示「留出集的标准尺是标准教师」✓
     """
     for players, suffix in ((3, ""), (4, "4")):
         name = f"maj-pro{suffix}{version}"

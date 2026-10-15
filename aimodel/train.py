@@ -718,12 +718,22 @@ def cmd_bc(args) -> Net:
     # 所以：**选择用同源留出集** ✓ 教师留出集降级成**只打印的对照** ✓
     # （对照仍有价值：它让新模型和老模型的数字**可比** ✓）
     if src:
+        # ⚠️ 切分必须用**基本切片**（视图 ✓），不能用花式索引 ✗
+        #
+        # 我第一版写的是 `data[k][_idx[:nh]]`（随机打乱后取前 5% ✓）
+        # —— **花式索引必然复制** ✗ 231 万条 × 560 × 4B = 4.9 GB ✓
+        #    复制一份就变 ~10 GB ✗ 而训练机只有 ~5 GB 可用 ✓
+        #    实测后果：**一个 epoch 跑 15 分钟还没完**（正常 4.4 分钟 ✓）→ 在换页 ✓
+        #
+        # 改用 `arr[-nh:]` / `arr[:-nh]` —— 两个都是**视图** ✓ 零拷贝 ✓
+        # 代价：留出集是**尾部**而不是随机抽样 ✓
+        #   · 数据是按分片（每片 1500 手）顺序拼的 ✓ 尾部 ≈ 最后 1~2 片 ✓
+        #   · 那仍是**真人出牌的一个合法样本** ✓ 只是不随机 ✓
+        #   · 对「判断有没有过拟合」这个用途够用 ✓（它只需要一个同分布的标尺 ✓）
         _n = len(data["X"])
-        _rng = np.random.default_rng(args.seed + 555_555)
-        _idx = _rng.permutation(_n)
         _nh = max(2000, _n // 20)
-        holdout = {k: data[k][_idx[:_nh]] for k in data}
-        data = {k: data[k][_idx[_nh:]] for k in data}
+        holdout = {k: data[k][_n - _nh:] for k in data}
+        data = {k: data[k][:_n - _nh] for k in data}
         print(f"  留出集：{len(holdout['X'])} 条（**从同一份数据里切** ✓ 同源 ✓）")
         print(f"  训练集：{len(data['X'])} 条")
         ref_holdout = collect_bc(
