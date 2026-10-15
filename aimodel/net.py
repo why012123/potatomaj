@@ -106,6 +106,9 @@ class Net:
         self.ba2 = np.zeros(1, dtype=np.float32)
 
         self._adam: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        #: `_apply` 里按形状复用的两个临时缓冲（避免每步每参数分配临时数组）✓
+        #: ⚠️ 只是**缓冲**，不是状态 ✗ 不进存档、不影响数值 ✓
+        self._scratch: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
         #: Adam 的步数（决定偏差修正）；**读档时必须从 0 开始**
         self.steps = 0
         #: 这个网络累计被更新过多少次（读档后保留，只用于展示）
@@ -422,10 +425,25 @@ class Net:
 
     # -- Adam ---------------------------------------------------------------
     def _apply(self, grads: dict, beta1: float = 0.9, beta2: float = 0.999, eps: float = 1e-8) -> None:
+        """Adam 更新。
+
+        ⚠️ **本函数的数学与运算顺序必须与旧版逐位一致** ✓
+        它占了 `step()` 的 **47%**（cProfile 实测，见提交记录）✗
+        所以这里只做「少分配临时数组」，**不动公式** ✗
+        安全网：`aimodel/tests/test_step_equivalence.py` 的金值校验和 ✓
+        （金值是在**旧实现**下录制的 ✓ 改完必须仍然匹配 ✓）
+
+        逐位保持的要点（容易写错的地方都标了）：
+          · `m = beta1*m + (1-beta1)*g` -> 用 out= 复用缓冲，**加法交换律**保证等价 ✓
+          · `p -= lr*mh / (sqrt(vh)+eps)` -> 原式是 **`(lr*mh)/X`**（左结合）✗
+            **不能**写成 `mh/X*lr` ✗ 浮点结合律不成立 ✗
+          · 标量乘除一律用 `np.multiply(..., out=)`，dtype 与原来一致 ✓
+        """
         t = self.steps
-        # 偏置修正的分母是**标量** ✓ 提到循环外（原来每参数每步都算一次 `beta1 ** t`）✓
         c1 = 1.0 - beta1 ** t
         c2 = 1.0 - beta2 ** t
+        b1, b2 = beta1, beta2
+        o1, o2 = 1.0 - beta1, 1.0 - beta2
         for name, p in self.params():
             g = grads.get(name)
             if g is None:
@@ -436,19 +454,47 @@ class Net:
             #   -> 即使键已存在（稳态下**总是存在**），每步每参数都白分配两个
             #      全尺寸数组 ✓ 28 个参数 × 2 = **56 次分配/步** ✗
             #   profile 实测：`zeros_like` 1425 次 / 25 batch = **57 次/步** ✓ 对得上 ✓
-            #   删掉这个 eager default **不改变任何数值**（那些数组本来就丢掉了）✓
             mv = self._adam.get(name)
             if mv is None:
                 m = np.zeros_like(p)
                 v = np.zeros_like(p)
+                self._adam[name] = (m, v)
             else:
                 m, v = mv
-            m = beta1 * m + (1 - beta1) * g
-            v = beta2 * v + (1 - beta2) * (g * g)
-            self._adam[name] = (m, v)
-            mh = m / c1
-            vh = v / c2
-            p -= (self.lr * mh / (np.sqrt(vh) + eps)).astype(p.dtype)
+
+            # 两个可复用的临时缓冲（按形状缓存，**跨参数跨步复用**）✓
+            s, u = self._scratch_for(p)
+
+            # m = beta1*m + (1-beta1)*g   （原地写回 m 里）
+            np.multiply(g, o1, out=u)      # u = (1-beta1)*g
+            np.multiply(m, b1, out=s)      # s = beta1*m
+            np.add(s, u, out=m)            # m = beta1*m + (1-beta1)*g ✓
+
+            # v = beta2*v + (1-beta2)*(g*g)   （原地写回 v 里）
+            np.multiply(g, g, out=u)       # u = g*g
+            np.multiply(u, o2, out=u)      # u = (1-beta2)*(g*g)
+            np.multiply(v, b2, out=s)      # s = beta2*v
+            np.add(s, u, out=v)            # v = beta2*v + (1-beta2)*(g*g) ✓
+
+            # p -= (lr * (m/c1)) / (sqrt(v/c2) + eps)
+            np.divide(m, c1, out=s)        # s = mh
+            np.divide(v, c2, out=u)        # u = vh
+            np.sqrt(u, out=u)              # u = sqrt(vh)
+            np.add(u, eps, out=u)          # u = sqrt(vh) + eps
+            np.multiply(s, self.lr, out=s)  # s = lr*mh   （**先乘 lr**，保住左结合 ✓）
+            np.divide(s, u, out=s)         # s = (lr*mh) / (sqrt(vh)+eps) ✓
+            if s.dtype != p.dtype:
+                s = s.astype(p.dtype)
+            p -= s
+
+    def _scratch_for(self, p: np.ndarray):
+        """按形状缓存两个临时缓冲（避免每步每参数都分配）✓"""
+        key = (p.shape, p.dtype.str)
+        got = self._scratch.get(key)
+        if got is None:
+            got = (np.empty_like(p), np.empty_like(p))
+            self._scratch[key] = got
+        return got
 
     # -- 存档 ---------------------------------------------------------------
     def save(self, path: str | Path) -> None:
