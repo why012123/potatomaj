@@ -32,6 +32,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -301,7 +302,18 @@ async def index_handler(request: web.Request) -> web.StreamResponse:
             text=("前端还没构建。\n在 webapp/client 下跑： npm install && npm run build\n"),
             content_type="text/plain",
         )
-    resp = web.FileResponse(html)
+    # 产物用的是**固定文件名**（app.js / asset.css），所以必须给它挂一个
+    # 跟构建时间走的版本号 —— 否则浏览器会一直用缓存里的旧 JS，
+    # 表现就是「改了前端、刷新没变化、看到的还是上一版」。
+    # index.html 自己是 no-store，所以每次都会走这里，注入的版本号一定是最新的。
+    text = html.read_text(encoding="utf-8")
+    try:
+        stamp = str(int(max(f.stat().st_mtime for f in (STATIC / "app").glob("*"))))
+    except (ValueError, OSError):
+        stamp = "0"
+    text = re.sub(r'(/app/[A-Za-z0-9_.-]+\.(?:js|css))(\?[^"\']*)?',
+                  rf"\1?v={stamp}", text)
+    resp = web.Response(text=text, content_type="text/html", charset="utf-8")
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie("maj_id", sign_uid(who["uid"], who["name"]),
                     max_age=90 * 24 * 3600, httponly=True, samesite="Lax")
