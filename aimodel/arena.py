@@ -162,6 +162,11 @@ def collect(
                 version=spec.version, style=variants.STYLE_CN.get(spec.style, spec.style),
             ))
 
+    # ★ 注册表里的（当前版本）+ 盘上所有带版本号的权重 ✓
+    #   ⚠️ 这两段被我删过一次 ✗ —— 用 s[:start]+s[end:] 做拼接时，
+    #      把「_want 那段的开头」到「loose 那段的开头」之间的东西全删了 ✓
+    #      症状是**池子里只剩教师和随机**，一个模型都没有 ✗
+    #      （靠 `--models` 试跑时看到「2 个参战者」才发现 ✓ —— 改完必须试跑 ✓）
     for spec in variants.all_specs():          # 当前版本
         add(spec)
     for f in sorted(variants.WEIGHTS_DIR.glob("maj-*v*.npz")):
@@ -171,6 +176,7 @@ def collect(
             add(variants.get(f.stem))
         except KeyError:
             continue
+
     # 不在命名规则里的早期权重（policy_bc4 / policy 这些）也拉进来当参照
     for p in loose_participants(players, copies):
         if p.source in seen or (players and p.players != players):
@@ -209,6 +215,7 @@ class Arena:
         participants: list[Participant] | None = None,
         copies: int = 3,
         divisor: float = 500.0,
+        models: list[str] | None = None,
     ) -> None:
         self.copies = copies
         #: 点数段位分的除数：``(最终点数 - 初始点数) / divisor``。
@@ -221,7 +228,8 @@ class Arena:
         self.strict = strict
         self.seed = seed
         self.participants = (
-            participants if participants is not None else collect(players, copies=copies)
+            participants if participants is not None
+            else collect(players, include=models, copies=copies)
         )
         self.n_matches = 0
         self.log: list[str] = []
@@ -462,6 +470,11 @@ def main(argv: list[str] | None = None) -> None:
                     help="随机种子基数：第 n 场的种子 = seed + n×7919（同一种子重跑得到同样的牌）")
     ap.add_argument("--divisor", type=float, default=500.0,
                     help="点数段位分的除数（越小点数项越强；0 = 关掉点数项）")
+    ap.add_argument("--models", nargs="*", default=None,
+                    help="只让这几个模型参赛（默认全部）✓ 直接接到 collect 的 "
+                         "include 上。**要写带版本号的正名**（如 maj-normal4v1.2），"
+                         "因为 include 是精确匹配 source ✓。"
+                         "例：--models maj-normal4v1.2 maj-pro4v1.1")
     ap.add_argument("--copies", type=int, default=3,
                     help="每个模型版本派几个参赛者（默认 3，各记各的分）")
     ap.add_argument("--reset", action="store_true",
@@ -477,7 +490,7 @@ def main(argv: list[str] | None = None) -> None:
     if arena is None or arena.players != args.players:
         arena = Arena(players=args.players, k=args.k, max_gap=args.max_gap,
                       strict=not args.loose, seed=args.seed, copies=args.copies,
-                      divisor=args.divisor)
+                      divisor=args.divisor, models=args.models)
         print(f"新建 {args.players} 麻池：{len(arena.participants)} 个参战者"
               f"（每个模型 {args.copies} 个），"
               f"初始 500 分，分差上限 {args.max_gap:.0f}，0 分保底（不出局）")
