@@ -163,6 +163,15 @@ def train_bc(
     best_epoch = 0
     best_net = net
     stale = 0
+    # ⚠️ `--resume` 只恢复权重，**不恢复 epoch 计数** ✗
+    #    所以 `--resume --epochs 30` = 「在现有权重上再训 30 轮」，
+    #    不是「训到第 30 轮」✓ 每跑一次就多加 30 轮 ✓
+    #    （远端新会话读代码时发现的 —— 交接书里我正是这么写错的 ✗）
+    if net.epochs_done > 0:
+        print(f"    ⚠️ 这个权重**已经训过 {net.epochs_done} 轮**；"
+              f"本次再训 {epochs} 轮 → 累计 {net.epochs_done + epochs} 轮")
+        print("       （--resume 不恢复 epoch 计数，它是在现有权重上继续训 ✗）")
+
     for ep in range(epochs):
         idx = rng.permutation(n)
         tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
@@ -193,6 +202,9 @@ def train_bc(
             nb += 1
         acc = agreement(net, data)
         hold = agreement(net, holdout) if holdout else acc
+        # 累计计数在**打分之后、存最优之前**加 —— 这样存下来的最优权重
+        # 带的是「它实际训过多少轮」✓
+        net.epochs_done += 1
         improved = hold > best_hold
         if improved:
             # net.copy() 是深拷贝（含 steps / total_steps），所以拿回来能直接存
