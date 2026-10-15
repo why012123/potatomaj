@@ -272,6 +272,10 @@ def create_app(cfg: Config) -> web.Application:
     app.router.add_get("/tiles/{name}", tile_handler)
     app.router.add_get("/", index_handler)
     app.router.add_get("/room/{rid}", index_handler)
+    # 结尾多一个斜杠也要能吃（用户手打 / 复制粘贴很常见）。
+    # `index_handler` 不读 `rid`，它只发同一份 index.html ——
+    # 具体是哪张桌子由前端看 `location.pathname` 决定。
+    app.router.add_get("/room/{rid}/", index_handler)
     app.router.add_static("/app/", path=str(STATIC / "app"), show_index=False,
                           follow_symlinks=False)
     app.router.add_static("/assets/", path=str(STATIC), show_index=False,

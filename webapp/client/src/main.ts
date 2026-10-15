@@ -84,6 +84,22 @@ class App {
           m.spectator ? `进入观战：房间 ${m.room}` : `入座成功：房间 ${m.room} · ${m.seat + 1} 号位`,
           "ok",
         );
+        // ★ **入座之后要把画面切到牌桌**。
+        //
+        // 只弹个 toast 不算完：`setScreen("game")` 是由 `onState` 触发的，
+        // 而服务端在 `_enter_room()` 里是先推 `joined` 再推第一帧 `state`。
+        // 正常情况下这两条会到，画面也就切过去了；但只要第一帧因为任何原因
+        // 没到（或晚到），玩家就会**卡在大厅里，只看到一句「入座成功」**——
+        // 明明已经坐在牌桌上了，屏幕上却还是房间列表（实测踩过）。
+        //
+        // 所以这里显式切一下，并且把地址栏也改成 `/room/{id}`：
+        // 刷新之后能直接回到这张桌子（服务端对 `/room/{id}` 发的是同一份
+        // index.html，前端靠 `location.pathname` 判断该显示哪个画面）。
+        this.setScreen("game");
+        const want = `/room/${m.room}`;
+        if (location.pathname !== want) {
+          history.pushState({ room: m.room }, "", want);
+        }
       },
       onReveal: (m: RevealMsg) => {
         // 服务端可能拒绝（桌上有真人），**要把原因显示出来**
