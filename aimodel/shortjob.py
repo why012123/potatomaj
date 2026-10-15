@@ -160,9 +160,62 @@ def n_slices(a) -> int:
     return max(1, (a.hands + a.chunk_hands - 1) // a.chunk_hands)
 
 
+def _run_until_done(a, work: Path) -> int:
+    """Keep making slices until the set is complete.
+
+    WHY THIS LOOP EXISTS: on this box the process gets killed every
+    15s-3.5min (measured; five detach strategies all failed -- see README ⑥).
+    A single long `run` therefore dies partway no matter what `--budget` says.
+    But because every slice is atomic and recorded in `done.txt`, being killed
+    is harmless: the next attempt simply skips what is already done. So we
+    re-enter the slice loop rather than trying to survive.
+
+    `attempts` bounds how many times we tolerate a kill before giving up, so a
+    genuinely broken slice cannot spin forever.
+    """
+    total = n_slices(a)
+    t_start = time.perf_counter()
+    attempt = 0
+    while attempt < a.attempts:
+        attempt += 1
+        done = read_ledger(work, a.model)
+        todo = [i for i in range(total) if i not in done]
+        if not todo:
+            break
+        print(f"[attempt {attempt}] {len(done)}/{total} done, {len(todo)} to go")
+        try:
+            for idx in todo:
+                if a.time_limit and (time.perf_counter() - t_start) > a.time_limit:
+                    print(f"time limit {a.time_limit:.0f}s reached")
+                    return _summary(a, work, t_start)
+                run_one_slice(work, a.model, idx, a.chunk_hands, a.seed)
+        except KeyboardInterrupt:
+            print("interrupted")
+            break
+        except Exception as exc:                     # noqa: BLE001
+            # Includes the case where the process is torn down between slices
+            # and the interpreter reports it as an error. The ledger is the
+            # source of truth, so just go round again.
+            print(f"  attempt {attempt} ended: {type(exc).__name__}: {exc}")
+    return _summary(a, work, t_start)
+
+
+def _summary(a, work: Path, t0: float) -> int:
+    done = read_ledger(work, a.model)
+    total = n_slices(a)
+    print()
+    print(f"slices {len(done)}/{total}   rows {sum(r for r, _ in done.values()):,}   "
+          f"elapsed {time.perf_counter() - t0:.0f}s")
+    if len(done) < total:
+        print("  (incomplete -- re-run the same command to continue)")
+    return 0 if len(done) >= total else 1
+
+
 def cmd_run(a) -> int:
     work = Path(a.work)
     a.work = work
+    if a.until_done:
+        return _run_until_done(a, work)
     done = read_ledger(work, a.model)
     total = n_slices(a)
     t_start = time.perf_counter()
@@ -249,6 +302,13 @@ def main(argv=None) -> int:
     ap.add_argument("--work", default=str(DEFAULT_WORK))
     ap.add_argument("--budget", type=float, default=0.0,
                     help="seconds; stop starting new slices past this (0 = no cap)")
+    ap.add_argument("--until-done", action="store_true",
+                    help="keep going across kills until every slice exists "
+                         "(safe because each slice is atomic and ledgered)")
+    ap.add_argument("--time-limit", type=float, default=0.0,
+                    help="overall seconds across all attempts (0 = no cap)")
+    ap.add_argument("--attempts", type=int, default=40,
+                    help="max kill-restart cycles for --until-done")
     ap.add_argument("--out", default=str(ROOT / "_data" / "bc_tv13.npz"))
     a = ap.parse_args(argv)
     return {"plan": cmd_plan, "run": cmd_run,

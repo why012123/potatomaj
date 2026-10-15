@@ -563,7 +563,36 @@ def cmd_bc(args) -> Net:
     print(f"   {spec.describe()}")
     net = build_net(args, resume=args.resume)
     args.out = str(guard_out_path(args, resume=args.resume))
-    data = collect_bc(args.hands, seed=args.seed, spec=spec)
+
+    # --bc-data: consume a pre-extracted dataset instead of generating one from
+    # the heuristic teacher.
+    #
+    # WHY: `collect_bc` clones `HeuristicAgent`, a hand-written rule set, so the
+    # cloned policy can at best match those rules -- the teacher is the ceiling.
+    # `aimodel/tenhou_bc.py` extracts the SAME schema from 40,000 real Tenhou
+    # hands (Houou-level humans: 20.98% per-seat win rate), and
+    # `aimodel/shortjob.py` builds it in ~9s slices so that a process kill --
+    # which on this box happens every 15s-3.5min -- cannot lose more than one
+    # slice. Together they let BC imitate humans rather than our heuristics.
+    #
+    # The HOLDOUT still comes from the teacher, deliberately: that is the fixed
+    # yardstick the existing maj-* models were measured against, so keeping it
+    # makes the new model's holdout number directly comparable to theirs.
+    src = getattr(args, "bc_data", None)
+    if src:
+        import numpy as _np
+
+        with _np.load(src, allow_pickle=True) as d:
+            data = {k: d[k] for k in d.files}
+        print(f"  行为克隆数据：{len(data['X'])} 条决策 <- {src}（预抽，不是教师生成的）")
+        if data["X"].shape[1] != net.dim:
+            raise SystemExit(
+                f"维度不符：数据集 {data['X'].shape[1]} vs 网络 {net.dim}"
+                "（四麻 560 / 三麻 486 —— 拿错数据集了）"
+            )
+    else:
+        data = collect_bc(args.hands, seed=args.seed, spec=spec)
+
     holdout = collect_bc(
         max(60, args.hands // 20), seed=args.seed + 555_555, verbose=False, spec=spec
     )
@@ -710,6 +739,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     ap.add_argument("--list-models", action="store_true", help="列出八个模型和状态")
     ap.add_argument("--hands", type=int, default=2500, help="行为克隆的对局数")
+    ap.add_argument(
+        "--bc-data", default=None, metavar="NPZ",
+        help="用预先抽好的 BC 数据集代替教师自打（例如 "
+             "aimodel/tenhou_bc.py 从天鳳牌谱抽出的那批）。此时 --hands 只影响留出集大小。",
+    )
     ap.add_argument("--matches", type=int, default=300, help="每轮自对弈的场数")
     ap.add_argument("--iters", type=int, default=20, help="自对弈轮数")
     ap.add_argument("--epochs", type=int, default=6, help="行为克隆的 epoch 数")

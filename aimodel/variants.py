@@ -77,6 +77,33 @@ def _build(version: str = VERSION) -> dict[str, ModelSpec]:
 #: 正名 -> 规格
 MODELS: dict[str, ModelSpec] = _build()
 
+
+def _register_pro(version: str = VERSION) -> None:
+    """注册 ``maj-pro`` —— 用**真实天鳳人类牌谱**做 BC 的那一系。
+
+    为什么单独注册、而不是加进 ``_build`` 的 style 列表：那个列表里的每个
+    style 都同时是**教师风格**（``HeuristicAgent(style=...)``），而 pro 不是
+    一种教师口味 —— 它的训练数据来自人类，不来自教师。
+
+    但 ``spec.style`` 会被用来生成**留出集**（见 ``train.cmd_bc``），
+    而留出集必须是个固定标尺才能和已有的 maj-* 模型比。所以这里
+    ``reward`` 沿用用户条件，``style`` 固定成 ``"normal"`` —— 表示
+    「留出集用标准教师」，而不是「这个模型是标准风格」。
+
+    训练方式：``python -m aimodel.train bc --model=maj-pro4v1.3
+    --bc-data=_data/bc_tv13.npz``（数据集由 ``aimodel/tenhou_bc.py`` +
+    ``aimodel/shortjob.py`` 从天鳳牌谱抽出）。
+    """
+    for players, suffix in ((3, ""), (4, "4")):
+        name = f"maj-pro{suffix}{version}"
+        reward = "normal" if players == 4 else "normal"
+        MODELS[name] = ModelSpec(name, players, reward, "normal", version)
+
+
+_register_pro()
+
+# 注册之后要重建别名表（下面那段是按 MODELS 生成的）
+
 #: 别名（不带版本、不带 maj- 前缀、下划线等写法都认，一律指向最新版）
 _ALIASES: dict[str, str] = {}
 for _name, _spec in MODELS.items():
