@@ -30,11 +30,14 @@ class Session:
 
     def __init__(self, players: int = 3, k: float = 24.0, max_gap: float = 200.0,
                  strict: bool = True, pace: float = 0.0, copies: int = 3,
-                 divisor: float = 500.0) -> None:
+                 divisor: float = 500.0,
+                 models: list[str] | None = None) -> None:
+        #: 只让这几个模型参赛（None = 全部）✓ 传给 Arena -> collect(include=...)
+        self.models = models
         self.copies = copies
         self.divisor = divisor
         self.arena = Arena(players=players, k=k, max_gap=max_gap, strict=strict,
-                           copies=copies, divisor=divisor)
+                           copies=copies, divisor=divisor, models=models)
         self.lock = threading.Lock()
         self.running = False
         self.target = 0          # 还要跑多少场（0 = 无限）
@@ -69,7 +72,8 @@ class Session:
         with self.lock:
             self.arena = Arena(players=self.arena.players, k=self.arena.k,
                                max_gap=self.arena.max_gap, strict=self.arena.strict,
-                               copies=self.copies, divisor=self.divisor)
+                               copies=self.copies, divisor=self.divisor,
+                               models=self.models)   # ← 重置也要保住阵容 ✗
             self.done = 0
             self.error = ""
 
@@ -262,9 +266,10 @@ def _startup_audit() -> None:
 
 
 def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
-          copies: int = 3, divisor: float = 500.0) -> None:
+          copies: int = 3, divisor: float = 500.0,
+          models: list[str] | None = None) -> None:
     _startup_audit()
-    session = Session(players=players, copies=copies, divisor=divisor)
+    session = Session(players=players, copies=copies, divisor=divisor, models=models)
     Handler.session = session
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"🏟  ELO 混战池：http://{host}:{port}")
@@ -284,10 +289,14 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--port", type=int, default=8770)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--copies", type=int, default=3, help="每个模型派几个参赛者")
+    ap.add_argument("--models", nargs="*", default=None,
+                    help="只让这几个模型参赛（默认全部）✓ 要写带版本号的正名，"
+                         "例：--models maj-normal4v1.2 maj-pro4v1.1")
     ap.add_argument("--divisor", type=float, default=500.0,
                     help="点数段位分的除数（0 = 关掉点数项，只按名次算）")
     args = ap.parse_args(argv)
-    serve(args.players, args.port, args.host, args.copies, args.divisor)
+    serve(args.players, args.port, args.host, args.copies, args.divisor,
+          models=args.models)
 
 
 if __name__ == "__main__":
