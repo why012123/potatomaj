@@ -94,6 +94,40 @@ if real.exists():
 else:
     print(f"  （跳过：{real} 不存在）")
 
+
+# ── 单写者锁：两个进程不许写同一个权重 ────────────────────────
+# 实测踩过（远端）：两个训练进程写同一个文件**不报错** ✗ 只是「最后写完的赢」✓
+# 中间没有任何提示，而且互相抢 CPU（每轮 14 分钟 → 28 分钟）✗
+print()
+print("== 单写者锁：第二个进程必须被拒绝 ==")
+import os as _os
+from aimodel.train import acquire_out_lock
+
+with tempfile.TemporaryDirectory() as _td:
+    _w = Path(_td) / "m.npz"
+
+    _l1 = acquire_out_lock(_w)
+    check(_l1 is not None, "第一个进程应该拿到锁")
+    check(_l1 is not None and _l1.exists(), "锁文件应该被创建")
+
+    _l2 = acquire_out_lock(_w)                 # 同一个进程再拿一次（pid 相同 = 活着 ✓）
+    check(_l2 is None, "锁被占着时，第二个必须拿不到")
+
+    if _l1 is not None:
+        _l1.unlink()
+    _l3 = acquire_out_lock(_w)
+    check(_l3 is not None, "释放之后应该能重新拿到")
+    if _l3 is not None:
+        _l3.unlink()
+
+    # ★ 陈旧锁：进程早没了，不能永久锁死 ✓
+    _w.with_suffix(_w.suffix + ".lock").write_text("999999")
+    _l4 = acquire_out_lock(_w)
+    check(_l4 is not None, "陈旧锁（pid 已不存在）必须能被接管，否则一次崩溃就永久锁死 ✗")
+    if _l4 is not None:
+        _l4.unlink()
+    print("  ✅ 拿到 / 拒绝 / 释放 / 接管陈旧锁 —— 四条都对")
+
 if FAILED:
     print(f"\n❌ {len(FAILED)} 条失败")
     raise SystemExit(1)

@@ -569,6 +569,57 @@ def build_net(args, resume: bool = True) -> Net:
     return Net(dim=dim, hidden=hidden, seed=args.seed, lr=args.lr, l2=args.l2)
 
 
+def acquire_out_lock(out: Path) -> Path | None:
+    """**单写者锁**：两个训练进程写同一个权重文件时，第二个直接拒绝启动。
+
+    为什么需要：`--out` 指向同一个文件的两个进程**不会互相报错** ✗
+    —— 它们只是各训各的，**最后写完的赢** ✓ 中间没有任何提示 ✓
+
+    实测踩过（远端）：用户手动起了一次 6×5 轮，同时另一个会话起了 27 轮，
+    两个进程训同一个模型、写同一个文件，**每轮从 14 分钟拖到 28 分钟** ✗
+    而且看不出来是谁在写 ✓
+
+    实现：`<out>.lock` 里写 pid ✓ `O_CREAT|O_EXCL` 保证原子 ✓
+    **陈旧锁会自动接管**（pid 已经不在了 ✓）—— 否则一次崩溃就永久锁死 ✓
+
+    返回锁文件路径（成功）或 `None`（**别人正在写** ✓）
+    """
+    import os as _os
+
+    lock = out.with_suffix(out.suffix + ".lock")
+
+    def _owner_alive() -> bool:
+        try:
+            pid = int(lock.read_text().strip() or 0)
+        except (OSError, ValueError):
+            return False
+        if pid <= 0:
+            return False
+        try:                        # 信号 0 = 只探测存活，不真发信号 ✓
+            _os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:     # 存在但不是我的进程 ✓ 也算活着 ✓
+            return True
+
+    try:
+        fd = _os.open(lock, _os.O_CREAT | _os.O_EXCL | _os.O_WRONLY)
+        _os.write(fd, str(_os.getpid()).encode())
+        _os.close(fd)
+        return lock
+    except FileExistsError:
+        if _owner_alive():
+            return None
+        # 陈旧锁（进程没了）→ 接管 ✓
+        print(f"  ⚠️ 发现陈旧锁 {lock}（pid 已不在）—— 接管它 ✓")
+        try:
+            lock.unlink()
+        except OSError:
+            return None
+        return acquire_out_lock(out)
+
+
 def guard_out_path(args, resume: bool) -> Path:
     """**止损门禁**：不让人一裸跑就把已训好的权重覆盖掉。
 
@@ -602,6 +653,15 @@ def cmd_bc(args) -> Net:
     print(f"   {spec.describe()}")
     net = build_net(args, resume=args.resume)
     args.out = str(guard_out_path(args, resume=args.resume))
+    # ★ 单写者锁：两个进程写同一个权重时，第二个直接拒绝 ✓
+    _lock = acquire_out_lock(Path(args.out))
+    if _lock is None:
+        raise SystemExit(
+            f"❌ {args.out} 正被**另一个训练进程**写（锁文件 {args.out}.lock）\n"
+            "   两个进程写同一个文件不会报错，只会「最后写完的赢」✗\n"
+            "   要么等它跑完，要么换一个 --out ✓\n"
+            "   （确认对方已经不在了就删掉那个 .lock ✓）"
+        )
 
     # --bc-data: consume a pre-extracted dataset instead of generating one from
     # the heuristic teacher.
@@ -644,6 +704,11 @@ def cmd_bc(args) -> Net:
     # 存下来的是过拟合最重的那份（实测训练 87.6%->93.4% 时留出 75.9%->74.9%）。
     saved_net = best_net
     saved_net.lr = getattr(args, "lr", saved_net.lr)
+    if _lock is not None:
+        try:
+            _lock.unlink()
+        except OSError:
+            pass
     saved_net.save(args.out)
     if bc_info.get("kept_original"):
         print(
@@ -673,6 +738,12 @@ def cmd_rl(args) -> Net:
     net = build_net(args, resume=True)
     net.lr = args.rl_lr  # 强化学习用更小的步长，别把克隆来的牌效打散
     args.out = str(guard_out_path(args, resume=True))
+    _lock = acquire_out_lock(Path(args.out))
+    if _lock is None:
+        raise SystemExit(
+            f"❌ {args.out} 正被**另一个训练进程**写（锁文件 {args.out}.lock）\n"
+            "   两个进程写同一个文件不会报错，只会「最后写完的赢」✗"
+        )
     # 对手池：同人数的**其它风格**模型（比如训「防守」时让「速攻」「大牌」上桌）
     pool: list[Net] = []
     if args.pool_ratio > 0:
