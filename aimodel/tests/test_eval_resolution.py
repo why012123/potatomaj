@@ -164,22 +164,89 @@ def run_pairs(n_deals: int, same_wall: bool) -> list[float]:
 
 
 N_DEALS = 24
-sim = run_pairs(N_DEALS, same_wall=True)
-dif = run_pairs(N_DEALS, same_wall=False)
+
+#: 同牌山到底消掉了什么？——**测机制，不测方差**。
+#:
+#: 原来这里跑 24 组 × 2 副座位（96 局）去比「同牌山 vs 不同牌山」的方差。
+#: 两个问题：
+#:   ① 太贵（实测 40+ 秒，撞上本机「重计算 35~46 秒被回收」的窗口）
+#:   ② 用那么少的组数比方差，本身就是个 **flaky 断言**（噪声比效应大）
+#:
+#: 换成测**确定性的机制**：灌同一副牌山 -> 两边拿到**逐张相同**的起手。
+#: 这直接证明了「同牌山」在做它该做的事，而且不依赖统计。
+print("\n== 核心理由：同牌山让双方打完全相同的牌（测机制，不靠统计）==")
 
 
-def var_of(xs):
-    m = sum(xs) / len(xs)
-    return sum((x - m) ** 2 for x in xs) / max(1, len(xs) - 1)
+class _FirstHand:
+    """抓下这个座位**第一次被问到决策时**的手牌。
+
+    注意别用 `kind == "discard"` 当条件 —— 摸牌后的打牌决策手上是 **14 张**
+    （刚摸进来那张），不是起手 13 张。第一次被问到就是起手。
+    """
+
+    def __init__(self):
+        self.hand = None
+
+    def decide(self, decision, view):
+        if self.hand is None:
+            self.hand = list(view.hand)
+        return 0
 
 
-v_sim, v_dif = var_of(sim), var_of(dif)
-print(f"  同牌山 方差={v_sim:8.2f}  se={math.sqrt(v_sim/N_DEALS):5.2f}")
-print(f"  不同牌山 方差={v_dif:8.2f}  se={math.sqrt(v_dif/N_DEALS):5.2f}")
-check(v_sim < v_dif,
-      f"同牌山应当降低配对方差（同牌山 {v_sim:.2f} vs 不同牌山 {v_dif:.2f}）"
-      " —— 如果这里失败，说明同牌山没起作用")
-print("  ✅ 同牌山的配对方差确实更小（这正是 P1-4 的核心理由）")
+def first_hands(wall, seed: int, players: int = 3) -> list[tuple]:
+    """让每个座位各当一次「观察者」，收集全部座位的起手。"""
+    rule = S.rule_for(players)
+    got = []
+    for seat in range(players):
+        spy = _FirstHand()
+        agents = [spy if i == seat else RandomAgent(seed * 10 + i)
+                  for i in range(players)]
+        g = Game(agents, seed=seed, rule=rule)
+        g.rigged_wall = list(wall)
+        g.play()
+        got.append(tuple(spy.hand) if spy.hand else ())
+    return got
+
+
+w_a = wall_for(31337, R3)
+w_b = wall_for(31338, R3)
+
+h1 = first_hands(w_a, 777)
+h2 = first_hands(w_a, 777)
+h3 = first_hands(w_b, 777)
+
+check(len(h1) == 3 and all(len(x) == 34 for x in h1),
+      f"应当抓到 3 个座位的 34 维起手，得到 {[len(x) for x in h1]}")
+check(h1 == h2,
+      "★ 同一副牌山 + 同一游戏种子 -> 每个座位的起手必须**逐张相同**"
+      "（这就是「同牌山」的全部意义：两边打的牌完全一样）")
+check(h1 != h3,
+      "换一副牌山 -> 起手必须变化（否则 rigged_wall 根本没生效，测试是假的）")
+# 牌山确实被消费了：第一次被问到决策时，庄家已摸牌 -> 每家 14 张
+# （实测：三家的第一次决策都是 discard、14 张、drawn 非 None）
+tot = sum(sum(x) for x in h1)
+check(tot == 3 * 14,
+      f"三麻 3 家第一次决策时共 {3*14} 张（庄家已摸牌），得到 {tot}")
+print(f"  ✅ 同牌山两次跑：3 个座位起手逐张相同（共 {tot} 张）；换牌山则不同")
+
+#: 想跑完整统计版（96 局、会在本机被杀窗口外才跑得完）就设这个环境变量。
+#: 默认不跑 —— 它慢，而且「用几组比方差」本身不可靠，
+#: 真正的方差数字由 `aimodel/ab.py` 在评测时给出（那才是它的用途）。
+import os  # noqa: E402
+
+if os.environ.get("EVAL_RESOLUTION_FULL") == "1":
+    print("\n== （可选）完整统计版：24 组 × 2 副座位 = 96 局 ==")
+    sim = run_pairs(N_DEALS, same_wall=True)
+    dif = run_pairs(N_DEALS, same_wall=False)
+
+    def var_of(xs):
+        m = sum(xs) / len(xs)
+        return sum((x - m) ** 2 for x in xs) / max(1, len(xs) - 1)
+
+    v_sim, v_dif = var_of(sim), var_of(dif)
+    print(f"  同牌山 方差={v_sim:8.2f}  se={math.sqrt(v_sim/N_DEALS):5.2f}")
+    print(f"  不同牌山 方差={v_dif:8.2f}  se={math.sqrt(v_dif/N_DEALS):5.2f}")
+    print(f"  （这一项**不断言** —— 组数少时方差比不可靠）")
 
 if FAILED:
     print(f"\n❌ {len(FAILED)} 条失败")

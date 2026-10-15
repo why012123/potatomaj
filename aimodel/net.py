@@ -60,6 +60,14 @@ class Net:
         #: 加载时因「旧权重缺这个头」被零初始化补上的决策种类。
         #: MLAgent 见到它们会走启发式兜底，保证老模型行为不变。
         self.untrained_heads: set[str] = set()
+        #: **累计训过多少个 epoch**（跨 `--resume` 累加）。
+        #:
+        #: 为什么要存这个：`--resume` 只恢复**权重**，`train_bc` 里的
+        #: `for ep in range(epochs)` 永远从 0 开始 ✗ 于是
+        #: `--resume --epochs 30` 不是「训到第 30 轮」，而是
+        #: 「在现有权重上**再训 30 轮**」✓ 每跑一次就多加 30 轮 ✓
+        #: 存下来才能在续训时把「已经训了多少」显示出来 ✓
+        self.epochs_done: int = 0
         #: ``untrained_heads`` 的别名 —— 平台侧请求里用的名字是这个。
         #: 语义完全相同：**这些决策必须交给兜底策略，不要让零初始化的头参与**。
         self.missing_heads: tuple[str, ...] = ()
@@ -122,9 +130,17 @@ class Net:
         other = Net(self.dim, self.hidden, seed=0, lr=self.lr, l2=self.l2)
         for name, p in self.params():
             dict(other.params())[name][...] = p
+        # ⚠️ 这里**必须把「标量状态」全部搬过去** ✗
+        #    漏一个的后果是静默的：`cmd_bc` 存的是 `best_net`（copy 出来的副本），
+        #    漏了 `epochs_done` 就导致「续训时累计轮数显示不出来」✓
+        #    （实测踩过：加了这个字段之后 copy() 没跟上 ✓）
+        #    `test_net.py` 里有一条测试会**自动**抓出这类遗漏 ✓ 别再靠人记 ✓
         other.kinds = list(self.kinds)
         other.steps = self.steps
         other.total_steps = self.total_steps
+        other.epochs_done = self.epochs_done
+        other.untrained_heads = set(self.untrained_heads)
+        other.missing_heads = tuple(self.missing_heads)
         return other
 
     def n_params(self) -> int:
@@ -422,6 +438,7 @@ class Net:
                     "hidden": list(self.hidden),
                     "kinds": self.kinds,
                     "steps": self.total_steps,
+                    "epochs_done": self.epochs_done,
                     "lr": self.lr,
                     # l2 必须存档：BC 阶段用的 L2 比构造函数默认值大 10 倍，
                     # 不存的话 load() 会悄悄回落到 1e-5，RL 阶段的权重衰减
@@ -507,6 +524,7 @@ class Net:
         # 如果这里沿用原来的步数，前几步会变成 m/(1-0.9^t) ≈ m、v/(1-0.999^t) ≈ v，
         # 相当于把学习率放大 3 倍多 —— 一脚就能把行为克隆学的牌效踹散。
         net.total_steps = int(meta.get("steps", 0))
+        net.epochs_done = int(meta.get("epochs_done", 0))
         net.untrained_heads = set(added)
         net.missing_heads = tuple(added)
         net.steps = 0

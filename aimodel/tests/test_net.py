@@ -289,6 +289,58 @@ check(gmax2 > 1e-9, "ratio 低于下界且优势为正时应当照常给梯度�
 print(f"  ✅ 截断生效：超出上界时 max|g| = {gmax:.1e}；低于下界时 max|g| = {gmax2:.2e}")
 
 print()
+
+# ── copy() 必须搬走**所有标量状态** ──────────────────────────────
+# 为什么要有这条：`cmd_bc` 存的是 `best_net`（copy 出来的副本）✗
+# 所以 copy() 漏一个字段 = 那个字段**永远不会被存下来** ✓
+# 实测踩过：加了 `epochs_done` 之后 copy() 没跟上，续训时累计轮数显示不出来 ✓
+#
+# 这条测试**不写死字段名** —— 它遍历对象的全部属性，
+# 所以**以后再加字段也会被自动抓到** ✓ 不用靠人记得回来改测试 ✓
+print()
+print("== copy() 必须保留全部标量状态 ==")
+import numpy as _np
+
+_SKIP = {"rng", "ref_probs", "_ent_coef"}
+_ARRAYS = ("W", "b", "Wp", "bp", "Wa1", "ba1", "Wa2", "ba2", "Wv", "bv")
+
+
+def _lost_fields(src, dst) -> list[str]:
+    """列出「src 有标量状态、dst 没搬过去」的字段。"""
+    out = []
+    for k, v in vars(src).items():
+        if k in _SKIP or k in _ARRAYS or isinstance(v, _np.ndarray):
+            continue
+        if not hasattr(dst, k):
+            out.append(f"{k}（副本没这个属性）")
+        elif getattr(dst, k) != v:
+            out.append(f"{k}（{v!r} → {getattr(dst, k)!r}）")
+    return out
+
+
+_n1 = Net(dim=64, hidden=(8,), seed=0)
+_n1.epochs_done = 7
+_n1.untrained_heads = {"chi"}
+_n1.missing_heads = ("chi",)
+# ⚠️ **不要往对象上注入假字段**来验证这条检查 ✗
+#    `copy()` 只搬「它知道的」字段，注入的假字段必然搬不过去 → 测试必然失败 ✓
+#    （我第一版就是这么写的，白红了一次 ✓）
+#    真正的保障来自「遍历 vars()」这个做法本身：
+#    以后谁在 `__init__` 里加了状态字段，它**自动**进入这个循环 ✓ 不用改测试 ✓
+check(not _lost_fields(_n1, _n1.copy()),
+      f"copy() 漏了这些标量状态：{_lost_fields(_n1, _n1.copy())}")
+
+# 证明这条检查**真的有效**：蓄意破坏一个副本，它必须被报出来
+# （不然「检查通过」可能只是检查本身写错了 ✓）
+_broken = _n1.copy()
+_broken.epochs_done = 0
+check(bool(_lost_fields(_n1, _broken)),
+      "检查器自身失效了 —— 蓄意破坏的副本没被报出来")
+_n = sum(1 for k, v in vars(_n1).items()
+         if k not in _SKIP and k not in _ARRAYS and not isinstance(v, _np.ndarray))
+print(f"  ✅ {_n} 个标量状态全部搬过去了")
+print("  ✅ 且检查器本身经过验证（蓄意破坏能报出来）")
+
 if FAILED:
     print(f"❌ {len(FAILED)} 项失败：")
     for f in FAILED:
