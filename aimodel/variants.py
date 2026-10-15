@@ -200,8 +200,13 @@ def audit_weights(verbose: bool = True) -> dict:
     untrained: dict[str, list[str]] = {}
     import warnings as _w
 
+    missing_files: list[str] = []
     for spec in all_specs():
         if not spec.path.exists():
+            # ⚠️ 注册了但权重文件不存在 —— **必须报出来，不能静默跳过** ✗
+            # 自检的意义就是发现「模型在列表里但选不了」✓
+            # （maj-pro 刚注册时正是这个状态：天梯/平台选到它会失败）
+            missing_files.append(spec.name)
             continue
         try:
             # 缺头警告由本函数自己汇总，别让 44 条一样的警告淹掉输出
@@ -226,7 +231,13 @@ def audit_weights(verbose: bool = True) -> dict:
                   "（已零初始化，这些决策走启发式兜底；想让它自己学就重训）")
             for name in list(untrained)[:4]:
                 print(f"      {name}: {untrained[name]}")
-    return {"ok": ok, "failed": failed, "untrained": untrained}
+    if verbose and missing_files:
+        print(f"  ⚠️ {len(missing_files)} 个模型**注册了但权重文件不存在**"
+              "（选到它们会失败，先补文件或先别注册）：")
+        for name in missing_files:
+            print(f"      {name}")
+    return {"ok": ok, "failed": failed, "untrained": untrained,
+            "missing_files": missing_files}
 
 
 __all__ = [
@@ -242,7 +253,8 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     if args.audit:
         r = audit_weights()
-        raise SystemExit(1 if r["failed"] else 0)
+        bad = bool(r["failed"]) or bool(r.get("missing_files"))
+        raise SystemExit(1 if bad else 0)
     for spec in all_specs():
         mark = "✅" if spec.path.exists() else "—"
         print(f"  {mark} {spec.name:<22} {spec.players}麻  {spec.cn}")
