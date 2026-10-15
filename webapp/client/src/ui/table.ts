@@ -236,17 +236,20 @@ export class TableView {
     this.renderCenter(state);
     this.renderCurtain(state);
 
-    // 尺寸 / 座位数变了就无条件重排；否则每帧也排一次（很便宜，
-    // 而且手牌张数一变，这一家的盒子和牌河偏移都得跟着更新）。
+    // 每帧都推进一轮布局修正。
+    //
+    // **不能只在「尺寸变了」的时候做**：这一帧手牌 / 牌河刚被重建，上一帧存下来的
+    // `--fix-*` 就是按旧内容算的，不重跑就会一直偏着；而一帧里改完自定义属性
+    // 立刻量，读到的还是旧布局，所以必须**逐帧**迭代到收敛（见 fitEdge）。
+    // 代价很小：一帧几次 getBoundingClientRect，只在有帧推送时发生（服务端
+    // 30fps 合并过）。换视口尺寸时顺手重置收敛状态。
     const fitKey = `${window.innerWidth}x${window.innerHeight}:${n}:${state.seats.length}`;
     if (fitKey !== this.lastFit) {
       this.lastFit = fitKey;
-      this.fitLayout();
-    } else if (freshFrame) {
-      this.fitLayout();
-    } else {
-      this.scheduleRefit();
+      this.fitCount = 0;
     }
+    void freshFrame;
+    this.fitLayout();
   }
 
   /**
@@ -269,6 +272,9 @@ export class TableView {
   private renderSeat(s: SeatState, state: StateMsg, freshFrame: boolean): void {
     const v = this.seats.get(s.seat);
     if (!v) return;
+    // 这一家的内容变了（手牌 / 副露 / 牌河重建）→ 现在存着的 `--fix-*` 是按旧
+    // 内容算的。**必须重新收敛**，否则它会一直偏着，直到下一次恰好有帧推送。
+    let dirty = false;
     const mine = s.seat === state.viewer.seat;
     const active =
       state.round != null &&
@@ -311,6 +317,7 @@ export class TableView {
       v.hand.classList.toggle("is-mine", mine);
       if (s.hand) this.buildMyHand(v.hand, s, state, size);
       else v.hand.appendChild(buildHiddenHand(s.hand_count, size));
+      dirty = true;
     } else if (mine) {
       this.updateHandSelection(v.hand, state);
     }
@@ -330,6 +337,7 @@ export class TableView {
         if (grew) box.classList.add("is-meld-new");
         v.melds.appendChild(box);
       }
+      dirty = true;
     }
 
     // -- 牌河 --
@@ -337,7 +345,10 @@ export class TableView {
     if (v.sig.pond !== pondSig) {
       v.sig.pond = pondSig;
       this.rebuildPond(v, s, size, freshFrame);
+      dirty = true;
     }
+
+    if (dirty) this.scheduleRefit();
   }
 
   /**

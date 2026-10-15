@@ -461,10 +461,30 @@ input, select { font: inherit; }
   transition: box-shadow var(--anim), border-color var(--anim);
   z-index: 5;
 }
-.seat--bottom .seat__plate { left: 50%; bottom: calc(var(--hand-pad) * 0.28); transform: translateX(-50%); }
-.seat--top .seat__plate { left: 50%; top: calc(var(--hand-pad) * 0.28); transform: translateX(-50%); }
-.seat--right .seat__plate { top: 50%; right: calc(var(--hand-pad) * 0.28); transform: translateY(-50%); }
-.seat--left .seat__plate { top: 50%; left: calc(var(--hand-pad) * 0.28); transform: translateY(-50%); }
+/* 名牌：贴在桌子**外侧**那一条窄带里，也就是手牌背后（手牌在盒子的内侧一截）。
+   上家要特别小心 —— 它的手牌就在自己的下边（屏幕上方那一排），名牌要是也放在
+   下边就会**盖住手牌**（踩过）。所以四家统一：名牌离桌沿 `--hand-pad`，
+   朝桌子中心再让开一截，正好落在手牌与桌沿之间的空当里。 */
+.seat--bottom .seat__plate {
+  left: 50%;
+  bottom: calc(var(--hand-pad) * 0.9 + var(--tile-h));
+  transform: translateX(-50%);
+}
+.seat--top .seat__plate {
+  left: 50%;
+  top: calc(var(--hand-pad) * 0.9);
+  transform: translateX(-50%);
+}
+.seat--right .seat__plate {
+  top: 50%;
+  right: calc(var(--hand-pad) * 0.9);
+  transform: translateY(-50%);
+}
+.seat--left .seat__plate {
+  top: 50%;
+  left: calc(var(--hand-pad) * 0.9);
+  transform: translateY(-50%);
+}
 
 .seat.is-active .seat__plate {
   border-color: var(--gold);
@@ -774,8 +794,9 @@ input, select { font: inherit; }
 .toast {
   position: fixed;
   left: 50%;
-  /* 挂在**顶栏下方**：底部是自己手牌的地盘，压在那儿会挡牌 */
-  top: 46px;
+  /* 贴在**底部居中**：大厅里不挡卡片；牌桌上是观战提示，3.6 秒自动淡出。
+     中间上方是上家的手牌，绝不能压。 */
+  bottom: 26px;
   transform: translateX(-50%) translateY(20px);
   background: rgba(10, 24, 18, 0.96);
   border: 1px solid var(--line);
@@ -785,7 +806,7 @@ input, select { font: inherit; }
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--anim), transform var(--anim);
-  max-width: 80vw;
+  max-width: 70vw;
 }
 .toast.is-on { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.is-warn { border-color: #d9a03f; }

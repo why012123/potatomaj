@@ -36,7 +36,11 @@ $LogDir = Join-Path $Root 'logs'
 $PidFile = Join-Path $RunDir 'app.pid'
 $TunnelPidFile = Join-Path $RunDir 'frpc.pid'
 $Python = Join-Path $Root '.venv\Scripts\python.exe'
-$Frpc = 'E:\WHYidea\frp_0.61.1_windows_amd64\frpc.exe'
+# frpc 的位置：优先用仓库旁边的（这台机器的实际布局），
+# 找不到就退回 PATH 上的 frpc，再找不到就跳过隧道（服务本身照跑）。
+$Frpc = if (Test-Path 'E:\WHYidea\frp_0.61.1_windows_amd64\frpc.exe') {
+    'E:\WHYidea\frp_0.61.1_windows_amd64\frpc.exe'
+} else { 'frpc' }
 $FrpcConf = Join-Path $Root 'deploy\frpc-maj.toml'
 
 New-Item -ItemType Directory -Force -Path $RunDir, $LogDir | Out-Null
@@ -108,18 +112,23 @@ function Start-App {
 }
 
 function Start-Tunnel {
-    if ($NoTunnel) { Write-Host "  （--NoTunnel，跳过隧道）" -ForegroundColor DarkGray; return }
+    if ($NoTunnel) { Write-Host "  （-NoTunnel，跳过隧道）" -ForegroundColor DarkGray; return }
+    $exe = $Frpc
     if (-not (Test-Path $Frpc)) {
-        Write-Host "  ⚠ 找不到 frpc：$Frpc，跳过隧道" -ForegroundColor Yellow
-        return
+        $found = Get-Command frpc -ErrorAction SilentlyContinue
+        if (-not $found) {
+            Write-Host "  ⚠ 找不到 frpc（$Frpc），跳过隧道 —— 服务本身还在本机跑" -ForegroundColor Yellow
+            return
+        }
+        $exe = $found.Source
     }
     if (-not (Test-Path $FrpcConf)) {
         Write-Host "  ⚠ 找不到 $FrpcConf，跳过隧道" -ForegroundColor Yellow
         return
     }
     $out = Join-Path $LogDir 'frpc.log'
-    $p = Start-Process -FilePath $Frpc -ArgumentList @('-c', $FrpcConf) `
-        -WorkingDirectory (Split-Path $Frpc) `
+    $p = Start-Process -FilePath $exe -ArgumentList @('-c', $FrpcConf) `
+        -WorkingDirectory (Split-Path $exe) `
         -RedirectStandardOutput $out -RedirectStandardError $out `
         -PassThru -WindowStyle Hidden
     $p.Id | Set-Content $TunnelPidFile
