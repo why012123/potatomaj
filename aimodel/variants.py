@@ -115,6 +115,38 @@ def _register_pro(version: str = VERSION) -> None:
 
 _register_pro()
 
+
+def _register_pro_mac_rl() -> None:
+    """注册 ``maj-pro4v1.1_mac_rl`` —— **人类牌谱 BC + RL** 那一支（目前实测最强的四麻）。
+
+    ⚠️ **为什么必须在这里注册，而不是「文件名对就行」** ✗
+
+    平台有**两条不同的路径** ✓ 只看一条会漏：
+
+    * **载入**（``webapp/server/agents.py:85``）：
+      ``WEIGHTS_DIR / f"{name}.npz"`` ✓ —— 这条**只看文件名** ✓
+    * **列出可选**（``agents.py:200`` 的 ``add()``）：
+      ``spec = variants.get(name)`` ✗ —— 名字**没注册就 KeyError** ✓
+      而 ``add()`` 是 ``except KeyError: return`` ✗ -> **静默跳过** ✓
+      -> 后果：文件在、sha256 对、但**界面上选不到** ✗
+
+    所以「加一个可选模型」= **在这里注册** ✓（纯新增 ✓ 不改任何现有行为 ✓）
+
+    身份（2026-10-17 核实 ✓）：
+      · 人类牌谱 BC **2 轮** + RL **20 轮** ✓
+      · ⚠️ 那次 RL 的 ``kl_coef=0.1`` **从未生效** ✗（KL 锚定当时是死代码 ✓ 已确证 ✓）
+        -> 它是**无锚 RL** ✗ -> 对 AI 强 ✓ 但**人类可能觉得打得怪** ✗
+           （我们没有「人类偏好」的度量 ✓ 这是评测盲区 ✓）
+      · 实测：对 ``maj-pro4v1.1`` = **+8.609**（p≈0.001 ✓ 同牌山+SPRT ✓）
+              对 ``maj-pro4v1.1_mac_2ep`` = +1.893（p=0.030 ✓）
+      · ``kinds`` 含 ``chi`` ✓ **无未训练头** ✓（不会走启发式兜底 ✓）
+    """
+    name = f"maj-pro4{VERSION}_mac_rl"
+    MODELS[name] = ModelSpec(name, 4, "normal", "normal", VERSION)
+
+
+_register_pro_mac_rl()
+
 # 注册之后要重建别名表（下面那段是按 MODELS 生成的）
 
 #: 别名（不带版本、不带 maj- 前缀、下划线等写法都认，一律指向最新版）
