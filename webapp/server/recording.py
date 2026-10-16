@@ -599,8 +599,46 @@ def snapshot_view(view: Any) -> dict:
     }
 
 
-def iter_jsonl_gz(path: Path) -> Iterator[dict]:
+def _next_member(data: bytes, start: int) -> int | None:
+    """从一个坏点之后找**下一个真正能解压的** gzip 成员头。
+
+    ⚠️ ⑯：**不能只** ``data.find(b"\\x1f\\x8b\\x08", start)`` ✗
+    —— 那 3 个字节在压缩数据里可能偶然出现 ✓ 于是会「找到」一个假头 ✗
+    -> 每个候选都**试解一下** ✓ 真出数据才算数 ✓
+    """
+    total = len(data)
+    pos = max(start, 2)
+    while pos < total:
+        cand = data.find(b"\x1f\x8b\x08", pos)
+        if cand < 0:
+            return None
+        d = zlib.decompressobj(31)
+        try:
+            got = d.decompress(data[cand : cand + 4096])
+        except zlib.error:
+            got = b""
+        if got or d.eof:
+            return cand
+        pos = cand + 1
+    return None
+
+
+def iter_jsonl_gz(path: Path, stats: dict | None = None) -> Iterator[dict]:
     """读一个 gzip JSONL 分片，**容忍被截断的尾巴**。
+
+    ``stats``（可选）：传一个 dict 进来，函数会把**完整性信息**写进去 ✗。
+    这是⑯的正解 —— **「正常返回」≠「完整返回」** ✗：
+
+    ```python
+    st = {}
+    recs = list(iter_jsonl_gz(f, st))
+    if st["corrupt"]:            # ⭐ 中间有坏块 -> 数据缺了
+        ...                      # 必须处理，不能当读全了
+    elif st["tail_open"]:        # 最后一个成员没收尾 = 正在写，正常
+        ...
+    ```
+    键：``bytes_total`` / ``bytes_read`` / ``members_ok`` / ``members_corrupt``
+        / ``resyncs`` / ``records`` / ``complete`` / **``corrupt``** / ``tail_open``
 
     分片是**追加**写的（``gzip.open(path, "ab")``），gzip 的追加模式会往同一个
     文件里接一个新的 gzip 成员（member）。这带来两个必须处理的现实：
@@ -623,6 +661,10 @@ def iter_jsonl_gz(path: Path) -> Iterator[dict]:
     把它的全部输出切行**。成员用 ``unused_data`` 定位，不自己算偏移。
     """
     if not path.exists():
+        if stats is not None:
+            stats.update(bytes_total=0, bytes_read=0, members_ok=0,
+                         members_corrupt=0, resyncs=0, records=0,
+                         complete=True, corrupt=False, tail_open=False)
         return
     try:
         data = path.read_bytes()
@@ -630,6 +672,9 @@ def iter_jsonl_gz(path: Path) -> Iterator[dict]:
         return
     pos = 0
     total = len(data)
+    n_ok = n_bad = n_resync = n_rec = 0
+    corrupt = False
+    tail_open = False
     while pos < total:
         d = zlib.decompressobj(31)          # 31 = gzip 容器
         # **一块一块喂**，每块出来就立刻切行 —— 不能 `decompress(整段)`：
@@ -638,14 +683,19 @@ def iter_jsonl_gz(path: Path) -> Iterator[dict]:
         # 坏点在中间时能救回大半）。
         i = pos
         buf = b""
+        broke = False
         while i < total:
             piece = data[i : i + (1 << 16)]
             i += len(piece)
             try:
                 out = d.decompress(piece)
             except zlib.error:
-                out = b""
-                i = total                    # 这个成员废了，跳到下一个
+                # ⚠️ ⑯：这里**绝不能** `i = total` ✗
+                # 那会跳到文件末尾 -> 其后**每一个好成员**都被静默丢掉 ✗
+                # 实测代价：1.44 MB 的文件只读出 196,608 B（13.6%）✗
+                broke = True
+                corrupt = True
+                break
             buf += out
             while True:
                 nl = buf.find(b"\n")
@@ -656,6 +706,7 @@ def iter_jsonl_gz(path: Path) -> Iterator[dict]:
                 if line.strip():
                     try:
                         yield json.loads(line)
+                        n_rec += 1
                     except json.JSONDecodeError:
                         pass
             if d.eof or d.unused_data:
@@ -663,14 +714,35 @@ def iter_jsonl_gz(path: Path) -> Iterator[dict]:
         if buf.strip():
             try:
                 yield json.loads(buf)
+                n_rec += 1
             except json.JSONDecodeError:
                 pass
+        if broke:
+            n_bad += 1
+            # 从**本成员头之后**找下一个能解压的成员 ✓（不是从 i 找 ——
+            # 坏点可能落在块中间，从 i 找会漏掉紧邻的那个成员 ✗）
+            nxt = _next_member(data, pos + 2)
+            if nxt is None:
+                break                        # 真的没有下一个了
+            n_resync += 1
+            pos = nxt
+            continue
+        n_ok += 1
+        if not d.eof:
+            # 最后一个成员没到 eof：**正在写**的正常形态 ✓
+            # （不是损坏 ✓ 但也不能算 complete ✓）
+            tail_open = True
         if not d.unused_data:
-            # 没有下一个成员了（读完了，或者被截断 / 损坏在这里）
-            return
-        pos = total - len(d.unused_data)
-        if pos <= 0:                         # 保险：不许死循环
-            return
+            break
+        newpos = total - len(d.unused_data)
+        if newpos <= pos:                    # 保险：不许死循环
+            break
+        pos = newpos
+    if stats is not None:
+        stats.update(bytes_total=total, bytes_read=pos, members_ok=n_ok,
+                     members_corrupt=n_bad, resyncs=n_resync, records=n_rec,
+                     complete=not corrupt and not tail_open,
+                     corrupt=corrupt, tail_open=tail_open)
 
 
 @dataclass
