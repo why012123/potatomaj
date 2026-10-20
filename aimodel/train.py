@@ -754,6 +754,49 @@ def cmd_bc(args) -> Net:
                 f"维度不符：数据集 {data['X'].shape[1]} vs 网络 {net.dim}"
                 "（四麻 560 / 三麻 486 —— 拿错数据集了）"
             )
+        # --- 数据缩放实验：只保留其中一部分 -----------------------------
+        # 唯一变量是**数据量** ✓ 架构 / epoch / lr / l2 / 留出集来源全不变 ✓
+        #
+        # ⚠️⚠️ 抽样单位必须是「**局**」，不是「行」✗（2026-10-20 改过一次）
+        #
+        # 我第一版是**按行随机取** ✗ 事后发现那测的根本不是这件事 ✓：
+        #   40,000 局 × 每局约 57 个决策 ✓ 按行取 25% 之后
+        #   -> **40,000 局全都还在** ✓ 只是每局少看了 43 个决策 ✗
+        #   -> 那测的是「**每局看几个决策**」✗ 不是「**看几局**」✗
+        # 而「数据量是不是天花板」这个假设说的是**独立局数** ✓（每局是一个独立牌山 ✓）
+        #   -> 必须**整局整局地抽** ✓ 否则实验无效 ✗（server 指出了这点 ✓ 它对 ✓）
+        #
+        # 怎么在「不知道局边界」的数据上整局抽：
+        #   数据集没有局 id 列 ✗ 但行是**按抽取顺序连续**的 ✓ 每局约 57 行 ✓
+        #   -> 把行切成**等长连续块**（块长 = 总行数 / 局数 ✓）当作一局 ✓ 再整块抽 ✓
+        #   ⚠️ 这是**近似** ✓ 块长固定所以会有块跨两局 ✗ 但跨局的块只占少数 ✓
+        #      比「按行抽」忠实得多 ✓ 而且这个近似是**保守**方向：
+        #      跨局块会让子集稍微「多看一点局」✗ -> 若这样都测出明显变弱 ✓
+        #      真实差异只会更大 ✓
+        # ⚠️ 内存：大数组先切、切完立刻释放 ✓
+        #    （先切小数组的话，X 全量会一直挂到最后一刻 ✗
+        #      X 全量约 5.2 GB，再叠一份子集就顶到 8 GB 以上 ✗）
+        frac = float(getattr(args, "bc_frac", 1.0))
+        if 0.0 < frac < 1.0:
+            n_all = len(data["X"])
+            fseed = int(getattr(args, "bc_frac_seed", 0))
+            n_games = int(getattr(args, "bc_games", 0)) or 40000
+            block = max(1, n_all // n_games)          # 一行块 ≈ 一局
+            n_blocks = n_all // block
+            rng = _np.random.default_rng(fseed)
+            keep = _np.sort(
+                rng.choice(n_blocks, size=max(1, int(n_blocks * frac)), replace=False)
+            )
+            idx = (keep[:, None] * block + _np.arange(block)[None, :]).ravel()
+            for key in sorted(data, key=lambda kk: data[kk].nbytes, reverse=True):
+                data[key] = data[key][idx]
+            print(
+                f"  🔬 数据缩放实验：**整局抽** {frac:.0%} = {len(keep):,} 局"
+                f"（全量 {n_games:,} 局 × 每块 {block} 行 = {n_all:,} 行）\n"
+                f"     取出 {len(data['X']):,} 条决策，seed={fseed}\n"
+                "     唯一变量 = 局数 ✓ 架构 / epoch / lr / l2 / 留出集来源都不变 ✓\n"
+                "     ⚠️ 块长固定 -> 少数块会跨两局（近似）；方向偏保守 ✓"
+            )
     else:
         data = collect_bc(args.hands, seed=args.seed, spec=spec)
 
@@ -1042,6 +1085,29 @@ def main(argv: list[str] | None = None) -> None:
         "--bc-data", default=None, metavar="NPZ",
         help="用预先抽好的 BC 数据集代替教师自打（例如 "
              "aimodel/tenhou_bc.py 从天鳳牌谱抽出的那批）。此时 --hands 只影响留出集大小。",
+    )
+    # 数据缩放实验（2026-10-20 加）：**只问一件事** ——
+    #   数据变少之后模型会明显变弱吗？
+    # 为什么需要它：`_mac_2ep`（100% × 2 轮）已经实测比 16 轮强 5.7 段位分 ✓
+    # 于是「epoch 不是瓶颈」有了证据 ✓ 但「数据量是不是瓶颈」**还没有证据** ✗
+    # 判据：同样 2 轮，用 50% 数据训出来的如果明显更弱 ✓
+    #       -> **数据量确实是天花板** ✓ 值得投入扩数据 ✓
+    #       如果一样好 ✗ -> 说明数据已经饱和 ✓ 扩数据是白花钱 ✗
+    # 只切片、不落盘：省掉 1.8 GB 中间文件（数据集体积大，落盘没意义 ✗）
+    ap.add_argument(
+        "--bc-frac", type=float, default=1.0, metavar="F",
+        help="只用 --bc-data 的 F 比例（0<F<1）做**数据缩放实验**；"
+             "按**整局整块的连续段**取（不是按行取 ✗），seed 由 --bc-frac-seed 固定。"
+             "默认 1.0 = 全用。",
+    )
+    ap.add_argument(
+        "--bc-frac-seed", type=int, default=0,
+        help="--bc-frac 的随机种子（同种子 = 同一子集，可复现）",
+    )
+    ap.add_argument(
+        "--bc-games", type=int, default=0, metavar="N",
+        help="数据集中共有多少局（用于把行切成「一行块≈一局」；0 = 按 40000 推算）。"
+             "四麻默认数据集就是 40,000 局 ✓ 换数据集时要显式给。",
     )
     ap.add_argument("--matches", type=int, default=300, help="每轮自对弈的场数")
     ap.add_argument("--iters", type=int, default=20, help="自对弈轮数")
