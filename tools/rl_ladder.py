@@ -69,6 +69,27 @@ OUTDIR = ROOT / "_data" / "rl_ladder"
 LOG = OUTDIR / "ladder.log"
 
 
+def set_outdir(path: Path) -> None:
+    """换产物目录（**多 seed 必须各自一个** ✗ 否则 3 个种子互相覆盖 ✗）。
+
+    2026-10-21 07:1x：Mac 排「3 个种子」，而原来 ``OUTDIR`` 是**模块级常量** ✗
+    -> ``chunk01.npz`` / ``ladder.log`` / ``pair01.txt`` 全都会复用 ✗
+    -> 三个种子跑完只剩最后那个 ✓ 前面两个的证据被覆盖 ✗
+    """
+    global OUTDIR, LOG
+    OUTDIR = path
+    LOG = OUTDIR / "ladder.log"
+    # ⚠️ 多 seed 必须各自一个产物目录 ✗ 否则 chunk01.npz / ladder.log / pair01.txt 互相覆盖 ✗
+    #    默认路径保持不变（向后兼容 ✓）；显式给 --outdir 或 --seed 时按 seed 分开 ✓
+    if args.outdir:
+        set_outdir(Path(args.outdir))
+    elif args.seed:
+        set_outdir(ROOT / "_data" / f"rl_ladder_seed{args.seed}")
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    log(f"    产物目录: {OUTDIR}")
+    log(f"    训练种子: {args.seed}")
+
+
 def log(msg: str = "") -> None:
     print(msg, flush=True)
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -165,11 +186,17 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("iters", type=int, nargs="?", default=20, help="每块 RL 轮数")
     ap.add_argument("patience", type=int, nargs="?", default=2, help="连续几块不涨就停")
     ap.add_argument("--model", default="maj-pro4v1.1", help="规格名（只影响 dim/kinds/得分条件）")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="训练种子（透传给 train rl）；**多 seed 实验必须各自指定**")
+    ap.add_argument("--outdir", default=None,
+                    help="产物目录（默认 _data/rl_ladder）；多 seed 时**必须**各自一个，否则互相覆盖")
     ap.add_argument("--matches", type=int, default=300)
     ap.add_argument("--eval-matches", type=int, default=80)
     ap.add_argument("--ppo-epochs", type=int, default=3)
     ap.add_argument("--jobs", type=int, default=0, help="配对赛并行度（0=自动用满所有核）")
     ap.add_argument("--max-games", type=int, default=6000, help="配对赛最多多少组")
+    ap.add_argument("--eval-games", type=int, default=1500,
+                    help="块后配对赛**固定**跑多少组（关 SPRT）；默认 1500 组 -> MDE≈2.91 ≤ 门禁 3.24")
     ap.add_argument("--nice", type=int, default=10, help="POSIX 上降优先级；0 = 不降")
     args = ap.parse_args(argv)
 
@@ -221,6 +248,7 @@ def main(argv: list[str] | None = None) -> None:
                 "--iters", str(args.iters), "--matches", str(args.matches),
                 "--eval-matches", str(args.eval_matches),
                 "--ppo-epochs", str(args.ppo_epochs),
+                "--seed", str(args.seed),
                 "--out", str(ckpt), "--log", str(OUTDIR / f"chunk{tag}.json"),
             ],
             logpath=OUTDIR / f"chunk{tag}.stdout",
@@ -238,8 +266,13 @@ def main(argv: list[str] | None = None) -> None:
         out = run(
             [
                 py, "-m", "aimodel.arena_test", "--a", str(ckpt), "--b", str(best),
-                "--target-delta", "2", "--jobs", str(args.jobs),
-                "--max-games", str(args.max_games),
+                # ⚠️ 门禁是 **3.24**，而 SPRT 的目标是「有没有 +2」✗ 两者口径不同 ✗
+                #    2026-10-21 实测：SPRT 判明「不是 +2」就停在 **256 组** -> MDE ±8.96 ✗
+                #    而门禁 3.24 需要 MDE ≤ 3.24 -> σ≈45.3 时要 n ≥ 1,530 ✓
+                #    Mac 2026-10-21 07:1x 明确要求「1500 组，不是 256」✓
+                #    -> 关掉 SPRT、固定 1500 组 ✓（--games 与 --no-sprt 由 --eval-games 控制）
+                "--target-delta", "3.24", "--jobs", str(args.jobs),
+                "--games", str(args.eval_games), "--no-sprt",
             ],
             logpath=OUTDIR / f"pair{tag}.txt",
         )
