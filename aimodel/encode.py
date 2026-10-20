@@ -596,12 +596,31 @@ ENCODE_V2_SCALAR_DIM: dict[int, int] = {
 
 
 def action_mask(decision: Decision) -> np.ndarray:
-    """该决策下每个策略头位置的合法性。"""
+    """该决策下每个策略头位置的合法性。
+
+    ⚠️ **`chi` 是特例** —— 它的 options 不是 ``["pass","chi"]`` 而是
+       ``["pass", "chi:10:12", "chi:21:22", ...]``（每个吃法一个独立选项，
+       见 ``engine._chi_plan`` 的 docstring），而 ``ACTION_TABLE["chi"]``
+       仍然是二值的 ``("pass","chi")``。
+
+    2026-10-20 实测（四麻，官方 8 点那期的种子）：
+        options = ['pass', 'chi:10:12']
+        -> ``table.index("chi:10:12")`` 抛
+           ``ValueError: tuple.index(x): x not in tuple``
+        -> **整局崩掉**（RL 阶梯就是这么断的）
+
+    所以：**任何非 pass 的选项都映射到 head 1**。
+    （options 按「吃完后向听」升序排，所以 ``options[1]`` 就是最优吃法 ——
+      与 ``_chi_plan`` docstring 里「AI 的 decide() 照旧返回 1，行为不变」一致 ✓）
+    """
     size = HEAD_SIZE[decision.kind]
     m = np.zeros(size, dtype=np.float32)
     if decision.kind == "discard":
         for t in decision.options:
             m[int(t)] = 1.0
+    elif decision.kind == "chi":
+        for opt in decision.options:
+            m[0 if str(opt) == "pass" else 1] = 1.0
     else:
         table = ACTION_TABLE[decision.kind]
         for opt in decision.options:
@@ -612,9 +631,14 @@ def action_mask(decision: Decision) -> np.ndarray:
 
 
 def action_index(decision: Decision, choice: int) -> int:
-    """把「options 里的下标」换算成「策略头里的下标」。"""
+    """把「options 里的下标」换算成「策略头里的下标」。
+
+    ⚠️ ``chi`` 同 :func:`action_mask` 的特例：非 pass 一律算 head 1。
+    """
     if decision.kind == "discard":
         return int(decision.options[choice])
+    if decision.kind == "chi":
+        return 0 if str(decision.options[choice]) == "pass" else 1
     table = ACTION_TABLE[decision.kind]
     return table.index(str(decision.options[choice]))
 

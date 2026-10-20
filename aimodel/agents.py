@@ -487,6 +487,16 @@ class MLAgent(Agent):
                 return decision.options.index(head)
             except ValueError:
                 return 0
+        # ⚠️ **`chi` 是特例**：options 是 ["pass", "chi:10:12", "chi:21:22", ...]
+        #    （每个吃法一个独立选项），而 ACTION_TABLE["chi"] 是二值的 ("pass","chi")
+        #    -> 原来 `str(o) == "chi"` **永远不成立** ✗ -> 恒返回 0 = pass ✗
+        #       = **神经网络在四麻里永远不吃牌，而且完全静默**（不报错、不警告）
+        #    2026-10-20 发现。现在：head 0 -> pass，head 1 -> **最优吃法 options[1]**
+        #    （_chi_plan 已按「吃完后向听」升序排，所以 options[1] 就是最优 ✓）
+        if decision.kind == "chi":
+            if head == 0 or len(decision.options) <= 1:
+                return 0
+            return 1
         table = ACTION_TABLE[decision.kind]
         want = table[head]
         for i, o in enumerate(decision.options):
