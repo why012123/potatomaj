@@ -215,7 +215,7 @@ async function loadHist() {
     return;
   }
   tb.innerHTML = d.seasons.map(s => `<tr>
-      <td>${s.sid}</td>
+      <td>${s.sid}${s.note ? '<br><span class="s-missed" style="font-size:11px">已作废</span>' : ''}</td>
       <td>${champCell(s)}</td>
       <td>${s.pruned ? '<span class="dim">已精简</span>' : (s.done || 0)}</td>
       <td>${s.has_replay ? '<span class="s-done">有</span>' : '<span class="dim">无</span>'}</td>
@@ -251,7 +251,16 @@ async function showSeason(sid, offset = 0) {  CUR_SID = sid;
   const s = d.season, sc = d.scores || {};
   setFavButton(!!s.favorite);
   const rows = (sc.table || []).slice(0, 40);
-  let html = `<div class="row dim" style="margin-bottom:8px">
+  // ⚠️ note 非空 = 该期已作废（例如 2026-10-21 之前算番 bug 的期次）
+  //    标了却不显示，等于没标 —— 所以详情页把它放在最前面。
+  let html = (s.note
+      ? `<div style="border:1px solid #f85149;border-radius:8px;padding:9px 11px;`
+        + `margin-bottom:10px;background:#f8514911">`
+        + `<b class="s-missed">本期作废</b>`
+        + `<div class="dim" style="font-size:12px;margin-top:4px;line-height:1.7">`
+        + escapeHtml(s.note) + `</div></div>`
+      : "")
+    + `<div class="row dim" style="margin-bottom:8px">
       场次 ${s.done} · ${s.players} 麻 · 收藏 ${s.favorite ? "是" : "否"}` +
       `${s.pruned ? " · <b>已精简（回放数据已删）</b>" : ""}</div>`;
   if (rows.length) {
