@@ -258,8 +258,19 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         stats["both_win"] += 1
-        han_ok = our.han == ref.han
-        fu_ok = our.fu == ref.fu
+        # ⚠️ **役满要按倍数比，不能比 han/fu** ✗
+        #    我们的 `sanma.Agari` 对役满返回 `han=0, fu=0`，倍数放在 `yakuman` 字段里
+        #    （`base_points` 也走 `if yakuman: return 8000*mult`，所以**点数是对的** ✓）
+        #    而参照库对 1 倍役满给 `han=13`、2 倍给 26 ✓
+        #    -> 直接比 han/fu 会把**每一手役满**都记成「番不同 + 符不同」✗ 这是假阳性
+        #       （2026-10-21 实测：400 手里 2~5 次，正好是那 1% 的量级）
+        if our.yakuman > 0:
+            han_ok = (our.yakuman * 13) == ref.han
+            fu_ok = True          # 役满的点数只由倍数决定，fu 不参与
+            stats["yakuman"] = stats.get("yakuman", 0) + 1
+        else:
+            han_ok = our.han == ref.han
+            fu_ok = our.fu == ref.fu
         if not han_ok:
             stats["han_mismatch"] += 1
         if not fu_ok:
@@ -267,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         if (not han_ok or not fu_ok) and shown < args.show:
             yau = [k for k, _ in our.yaku]
             print(f"  🔴 暗牌{concealed} 副露{called} 和{win}")
-            print(f"      我们 {our.han}番{our.fu}符 {yau}")
+            print(f"      我们 {our.han}番{our.fu}符 yakuman={our.yakuman} {yau}")
             print(f"      参照 {ref.han}番{ref.fu}符 {[y.name for y in (ref.yaku or [])]}")
             shown += 1
 
