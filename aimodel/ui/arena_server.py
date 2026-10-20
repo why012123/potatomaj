@@ -383,18 +383,28 @@ class Handler(BaseHTTPRequestHandler):
             # ⚠️ meta 里的 done 只在收尾时才写 ✗ -> 跑到一半是陈旧的（会是 0）✗
             #    与 /api/elo/seasons 用同一口径：**实际行数** ✓
             #    （这个不一致是收证据时抓出来的：列表页对了、详情页还是 0 ✗）
+            q2 = parse_qs(u.query)
+            try:
+                offset = max(0, int((q2.get("offset") or ["0"])[0]))
+            except ValueError:
+                offset = 0
+            try:
+                limit = min(2000, max(1, int((q2.get("limit") or ["200"])[0])))
+            except ValueError:
+                limit = 200
             matches = []
             real = 0
             for i, m in enumerate(E.iter_matches(s)):
                 real += 1
-                if i >= 200:
-                    continue          # 只给前 200 局的摘要，别把 4000 行一次吐给前端
+                if i < offset or i >= offset + limit:
+                    continue          # 分页 ✓ 一期 4000 局也能逐段翻
                 matches.append({"index": i, "seed": m.get("seed"),
                                 "group": m.get("group"), "ranks": m.get("ranks"),
                                 "scores": m.get("scores")})
             sd = s.as_dict()
             sd["done"] = real
             self._json({"ok": True, "season": sd, "matches": matches,
+                        "offset": offset, "limit": limit, "total": real,
                         "scores": E.load_scores(sid)})
             return
         if u.path == "/api/elo/replay":
