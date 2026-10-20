@@ -108,6 +108,24 @@ class Session:
                     self.season = E.open_season(
                         sid, players=self.arena.players, copies=self.copies,
                         seed_base=seed, target=matches)
+                    # ⚠️ **把该期的分数读回来** ✗ —— 否则每次重启 arena 的分数都归零 ✓
+                    #    -> 期未跑完就重启 => 最终 ELO 表只反映**最后一次跑**的那段 ✗
+                    #       （2026-10-20 实测：同一期重启三次，冠军变了三次 ✓ 那是假的 ✓）
+                    st_path = self.season.dir / "arena.json"
+                    if st_path.exists():
+                        try:
+                            loaded = Arena.load(st_path)
+                            if loaded is not None and loaded.players == self.arena.players \
+                                    and len(loaded.participants) == len(self.arena.participants):
+                                self.arena = loaded
+                                self.arena.seed = seed
+                                log(f"↩️ 读回 {sid} 的分数状态："
+                                    f"{self.arena.n_matches} 场、"
+                                    f"{len(self.arena.participants)} 个参战者")
+                            else:
+                                log("⚠️ 存档的 arena 与当前阵容不符，忽略它（从零开始）")
+                        except Exception as exc:  # noqa: BLE001
+                            log(f"⚠️ 读回分数失败（从零开始）：{type(exc).__name__}: {exc}")
                 except Exception as exc:  # noqa: BLE001 - 存档失败不能拖垮跑局
                     log(f"⚠️ 开期失败（不影响跑局）：{type(exc).__name__}: {exc}")
                     self.season = None
@@ -168,6 +186,13 @@ class Session:
                 except Exception as exc:  # noqa: BLE001
                     with self.lock:
                         self.error = f"存档失败：{type(exc).__name__}: {exc}"
+            # 周期性存盘：崩 / 重启最多丢 200 局 ✓ 否则一期跑一半被重启就前功尽弃 ✗
+            if season is not None and self.done and self.done % 200 == 0:
+                try:
+                    self.arena.save(season.dir / "arena.json")
+                except Exception as exc:  # noqa: BLE001
+                    with self.lock:
+                        self.error = f"周期存盘失败：{type(exc).__name__}: {exc}"
             if pace > 0:
                 time.sleep(pace)
         self._finish()
@@ -196,6 +221,10 @@ class Session:
             E.save_season(season)
             E.save_scores(season.sid, table, {"players": arena.players,
                                               "matches": arena.n_matches})
+            try:
+                arena.save(season.dir / "arena.json")   # 分数状态跟着期一起存 ✓
+            except Exception as exc:  # noqa: BLE001
+                log(f"⚠️ 存分数状态失败：{type(exc).__name__}: {exc}")
         except Exception as exc:  # noqa: BLE001
             log(f"⚠️ 收尾存表失败：{type(exc).__name__}: {exc}")
 
@@ -368,6 +397,17 @@ class Handler(BaseHTTPRequestHandler):
                     real = 0
                 d["done"] = real
                 d["has_replay"] = (s.dir / "matches.jsonl").exists() and not s.pruned
+                # ⚠️ 有 ELO 表却没有冠军 —— 会真实发生 ✗ 两种情况：
+                #    ① 那期跑在「冠军按均分算」这个逻辑之前（2026-10-20 之前）✗
+                #    ② `_finish()` 只在**跑完**时才写 -> 中途重启就没有冠军 ✗
+                #    -> 有表就**现算**一个 ✓ 保证列表和详情都不出现「有分无冠」
+                if (not d.get("champion")) or ("#" in str(d.get("champion"))) \
+                        or not d.get("champion_avg"):
+                    sc = E.load_scores(s.sid)
+                    if sc and sc.get("table"):
+                        (d["champion"], d["champion_avg"],
+                         d["champion_inst"], d["champion_inst_score"]) = \
+                            E.champion_by_model(sc["table"])
                 rows.append(d)
             self._json({"ok": True, "seasons": rows, "stats": E.stats()})
             return
@@ -403,6 +443,13 @@ class Handler(BaseHTTPRequestHandler):
                                 "scores": m.get("scores")})
             sd = s.as_dict()
             sd["done"] = real
+            if (not sd.get("champion")) or ("#" in str(sd.get("champion"))) \
+                    or not sd.get("champion_avg"):
+                sc0 = E.load_scores(sid)
+                if sc0 and sc0.get("table"):
+                    (sd["champion"], sd["champion_avg"],
+                     sd["champion_inst"], sd["champion_inst_score"]) = \
+                        E.champion_by_model(sc0["table"])
             self._json({"ok": True, "season": sd, "matches": matches,
                         "offset": offset, "limit": limit, "total": real,
                         "scores": E.load_scores(sid)})
