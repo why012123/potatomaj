@@ -79,15 +79,6 @@ def set_outdir(path: Path) -> None:
     global OUTDIR, LOG
     OUTDIR = path
     LOG = OUTDIR / "ladder.log"
-    # ⚠️ 多 seed 必须各自一个产物目录 ✗ 否则 chunk01.npz / ladder.log / pair01.txt 互相覆盖 ✗
-    #    默认路径保持不变（向后兼容 ✓）；显式给 --outdir 或 --seed 时按 seed 分开 ✓
-    if args.outdir:
-        set_outdir(Path(args.outdir))
-    elif args.seed:
-        set_outdir(ROOT / "_data" / f"rl_ladder_seed{args.seed}")
-    OUTDIR.mkdir(parents=True, exist_ok=True)
-    log(f"    产物目录: {OUTDIR}")
-    log(f"    训练种子: {args.seed}")
 
 
 def log(msg: str = "") -> None:
@@ -199,6 +190,14 @@ def main(argv: list[str] | None = None) -> None:
                     help="块后配对赛**固定**跑多少组（关 SPRT）；默认 1500 组 -> MDE≈2.91 ≤ 门禁 3.24")
     ap.add_argument("--nice", type=int, default=10, help="POSIX 上降优先级；0 = 不降")
     args = ap.parse_args(argv)
+
+    # ⚠️ 多 seed 必须各自一个产物目录 ✗ 否则 chunk01.npz / ladder.log / pair01.txt 互相覆盖 ✗
+    #    默认路径保持不变（向后兼容 ✓）；显式给 --outdir 或用非零 --seed 时按 seed 分开 ✓
+    if args.outdir:
+        set_outdir(Path(args.outdir))
+    elif args.seed:
+        set_outdir(ROOT / "_data" / f"rl_ladder_seed{args.seed}")
+    OUTDIR.mkdir(parents=True, exist_ok=True)
 
     start = Path(args.start)
     if not start.is_file():
