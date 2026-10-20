@@ -32,6 +32,7 @@ import argparse
 import json
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -65,21 +66,37 @@ def _get(url: str, timeout: float = 20.0) -> tuple[int, bytes]:
         raise RuntimeError(f"{type(e).__name__}: {e}") from e
 
 
-def check_public() -> dict:
-    """公网入口必须 200，且模型数对得上。"""
-    out = {"name": "public", "ok": False, "detail": ""}
-    try:
-        st, body = _get(f"{PUBLIC}/api/models")
-        if st != 200:
-            out["detail"] = f"/api/models -> HTTP {st}"
-            return out
-        d = json.loads(body)
-        ms = d.get("models") or []
-        out["models"] = len(ms)
-        out["detail"] = f"HTTP 200, {len(ms)} 个模型"
-        out["ok"] = len(ms) > 0
-    except Exception as e:                       # noqa: BLE001
-        out["detail"] = str(e)
+def check_public(retries: int = 3) -> dict:
+    """公网入口必须 200，且模型数对得上。
+
+    ⚠️ **要重试** ✗ —— 2026-10-20 实测：一次 TimeoutError 之后连拉三次全成功
+       （2.7s / 1.6s / 6.7s）-> 那条单次超时是**瞬时抖动**，不是故障。
+       把抖动报成故障，会让人开始忽略这个检查 —— 那才是最坏的结果。
+    -> 三次全失败才判红；中间成功一次即可（并写明第几次才成 ✓）
+    """
+    out = {"name": "public", "ok": False, "detail": "", "tries": []}
+    last = ""
+    for i in range(retries):
+        try:
+            st, body = _get(f"{PUBLIC}/api/models")
+            if st != 200:
+                last = f"/api/models -> HTTP {st}"
+                out["tries"].append(last)
+                continue
+            ms = json.loads(body).get("models") or []
+            out["tries"].append(f"HTTP 200, {len(ms)} 个模型")
+            if ms:
+                out["models"] = len(ms)
+                out["ok"] = True
+                out["detail"] = (f"HTTP 200, {len(ms)} 个模型"
+                                 + ("" if i == 0
+                                    else f"（第 {i + 1} 次才成，前 {i} 次失败）"))
+                return out
+            last = "模型数为 0"
+        except Exception as e:                   # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+            out["tries"].append(last)
+    out["detail"] = f"{retries} 次都失败：{last}"
     return out
 
 
@@ -199,6 +216,66 @@ def check_roster() -> dict:
     return out
 
 
+def check_scheduler() -> dict:
+    """官方档位调度：**该跑的那一期，是不是真的在跑**。
+
+    为什么需要（2026-10-20 的现场）：
+      官方 20:00 那期开了 4000 局的目标，但**第一局就崩**（chi 的 ValueError）
+      -> ``running=False``、``done_run=0``、``error`` 有值
+      -> 而其余五项检查**全部通过** ✗（公网 200、端口在、名册正常 ……）
+      -> 于是**"平台看起来全好"** ✗ 但**那一期一局都没跑** ✗
+    => 「服务活着」和「活干成了」是两件事 ✓ 这条检查专门看后者 ✓
+    """
+    out = {"name": "scheduler", "ok": False, "detail": "", "slots": []}
+    try:
+        sys.path.insert(0, str(ROOT))
+        from aimodel import elo_store as E
+        from aimodel.ui import elo_schedule as S
+
+        # 该跑但没跑满的期（判重口径与调度器一致：done >= target 才算跑过 ✓）
+        existing = set()
+        for s in E.list_seasons():
+            want = s.target or S.MATCHES_PER_SLOT
+            if s.pruned or (s.done and s.done >= want):
+                existing.add(s.sid)
+        now = time.time()
+        rows = S.today_slots(now, existing)
+        out["slots"] = [{"slot": r.slot, "state": r.state, "sid": r.season_id}
+                        for r in rows]
+        due = [r for r in rows if r.state == "due"]
+
+        # 天梯服务的实时状态
+        st, body = _get("http://127.0.0.1:8964/api/arena", timeout=10)
+        live = json.loads(body) if st == 200 else {}
+        out["running"] = bool(live.get("running"))
+        out["done_run"] = live.get("done_run")
+        out["target"] = live.get("target")
+        err = (live.get("error") or "").strip()
+
+        if err:
+            # **报错就是失败** ✓ 不管 due 不 due
+            out["detail"] = f"天梯报错: {err[:90]}"
+            return out
+        if live.get("running"):
+            out["ok"] = True
+            out["detail"] = (f"在跑 {live.get('done_run')}/{live.get('target')} 局"
+                             f"（今日待跑档位 {len(due)} 个）")
+            return out
+        if due:
+            # 该跑却没在跑 -> 失败（这正是今天那个现场）
+            out["detail"] = (f"**该跑却没在跑**：档位 "
+                             f"{[r.slot for r in due]} 处于补跑窗口内，"
+                             f"但 running=False")
+            return out
+        out["ok"] = True
+        out["detail"] = ("空闲（当前没有处于补跑窗口的档位）"
+                         f"· 今日档位 "
+                         + ",".join(f"{r.slot:02d}:{r.state}" for r in rows))
+    except Exception as e:                       # noqa: BLE001
+        out["detail"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def check_elo_storage() -> dict:
     """ELO 存档的用量（对照 100 GB 配额）。"""
     out = {"name": "elo_storage", "ok": False, "detail": ""}
@@ -216,7 +293,8 @@ def check_elo_storage() -> dict:
     return out
 
 
-CHECKS = (check_public, check_tunnel, check_local_ports, check_roster, check_elo_storage)
+CHECKS = (check_public, check_tunnel, check_local_ports, check_roster,
+          check_scheduler, check_elo_storage)
 
 
 def main(argv: list[str] | None = None) -> int:

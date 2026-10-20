@@ -242,11 +242,11 @@ function champCell(s) {
   return out;
 }
 
-async function showSeason(sid) {  CUR_SID = sid;
+async function showSeason(sid, offset = 0) {  CUR_SID = sid;
   $("detail").style.display = "block";
   $("dTitle").textContent = sid;
   $("dBody").innerHTML = '<span class="dim">读取中…</span>';
-  const d = await (await fetch(`/api/elo/season?id=${encodeURIComponent(sid)}`)).json();
+  const d = await (await fetch(`/api/elo/season?id=${encodeURIComponent(sid)}&offset=${offset}`)).json();
   if (!d.ok) { $("dBody").innerHTML = `<span style="color:#f85149">${d.error}</span>`; return; }
   const s = d.season, sc = d.scores || {};
   setFavButton(!!s.favorite);
@@ -268,7 +268,11 @@ async function showSeason(sid) {  CUR_SID = sid;
     html += '<div class="dim">没有该期的 ELO 表（可能还没收尾）</div>';
   }
   if ((d.matches || []).length) {
-    html += `<div class="dim" style="margin-top:12px">对局（点开看回放）：</div><div style="max-height:200px;overflow:auto">`;
+    const from = (d.offset || 0) + 1;
+    const to = (d.offset || 0) + (d.matches || []).length;
+    html += `<div class="dim" style="margin-top:12px">对局 ${from}–${to} / 共 `
+          + `${d.total !== undefined ? d.total : "?"} 局（点开看回放）：</div>`
+          + `<div style="max-height:200px;overflow:auto">`;
     d.matches.forEach(m => {
       const g = (m.group || []).map(x => x.replace(/#\d+$/, "")).join(" / ");
       html += `<div class="mv" onclick="location.href='/replay?season=${sid}&index=${m.index}'"
@@ -277,8 +281,17 @@ async function showSeason(sid) {  CUR_SID = sid;
         · 名次 ${(m.ranks || []).map(x => x + 1).join(" ")}</div>`;
     });
     html += "</div>";
+    const more = (d.total || 0) - (d.offset || 0) - (d.matches || []).length;
+    if (more > 0) {
+      html += `<div style="margin-top:8px"><button id="dMore">加载更多（还有 `
+            + `${more} 局）</button></div>`;
+    }
   }
   $("dBody").innerHTML = html;
+  const btnMore = $("dMore");
+  if (btnMore) {
+    btnMore.onclick = () => showSeason(sid, (d.offset || 0) + (d.matches || []).length);
+  }
 }
 
 $("dClose").onclick = () => { $("detail").style.display = "none"; };
