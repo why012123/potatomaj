@@ -356,9 +356,19 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/elo/seasons":
             from aimodel import elo_store as E
 
-            rows = [s.as_dict() for s in E.list_seasons()]
-            for r, s in zip(rows, E.list_seasons()):
-                r["has_replay"] = (s.dir / "matches.jsonl").exists()
+            se = E.list_seasons()
+            rows = []
+            for s in se:
+                d = s.as_dict()
+                # ⚠️ meta 里的 done 只在**收尾时**才写 ✗ -> 跑到一半时它是陈旧的 ✗
+                #    权威口径是 matches.jsonl 的**实际行数** ✓（调度器也用这个 ✓）
+                try:
+                    real = sum(1 for _ in E.iter_matches(s))
+                except OSError:
+                    real = 0
+                d["done"] = real
+                d["has_replay"] = (s.dir / "matches.jsonl").exists() and not s.pruned
+                rows.append(d)
             self._json({"ok": True, "seasons": rows, "stats": E.stats()})
             return
         if u.path == "/api/elo/season":

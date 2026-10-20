@@ -65,6 +65,24 @@
     </div>
   </div>
 
+  <!-- 当期实时榜（手动池那张表的同款 ✓ 5 秒一刷） -->
+  <div class="card">
+    <h2>当期实时榜 <span class="dim" style="font-weight:400;font-size:12px">
+      —— 和手动池同一套渲染 ✓ 每 5 秒刷新</span></h2>
+    <div style="max-height:420px;overflow:auto">
+      <table id="live"><thead><tr>
+        <th>#</th><th>参战者</th><th>段位分</th><th>场数</th>
+        <th>一位率</th><th>和了率</th><th>放铳率</th><th>状态</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div style="margin-top:10px">
+      <div class="dim" style="font-size:12px;margin-bottom:4px">最近对局</div>
+      <div id="liveLog" class="dim" style="font-size:12px;font-family:ui-monospace,monospace;
+           max-height:150px;overflow:auto;background:#0d1117;border:1px solid var(--line);
+           border-radius:6px;padding:6px 8px"></div>
+    </div>
+  </div>
+
   <!-- 今天五个档位 -->
   <div class="card">
     <h2>今天的档位（每天 08 / 11 / 14 / 17 / 20 点各一期，每期 4000 局）</h2>
@@ -141,6 +159,46 @@ async function loadCurrent() {
       + (LAST && LAST.current_season ? ` · 上一期 <b>${LAST.current_season}</b>` : "");
   }
   $("curMeta").textContent = `${d.alive}/${d.total} 个参战者存活 · 种子 ${d.seed}`;
+  renderLive(d);
+}
+
+/**
+ * 当期实时榜 —— 渲染 `/api/arena` 的 table + log。
+ * ⚠️ `Arena.table()` 的字段是**中文**（名/模型/分数/场数/一位率/…）✗
+ *    不是 rating/games 那套 ✗（这里踩过一次：按英文键取会全是 undefined）
+ */
+function renderLive(d) {
+  const rows = d.table || [];
+  const tb = $("live").querySelector("tbody");
+  if (!rows.length) {
+    tb.innerHTML = `<tr><td colspan="8" class="dim">还没有数据（开跑后就会出现）</td></tr>`;
+  } else {
+    const pct = v => (v === undefined || v === null || isNaN(v))
+      ? "—" : (v * 100).toFixed(1) + "%";
+    tb.innerHTML = rows.map((r, i) => {
+      const atFloor = (r["状态"] || "") !== "存活";
+      return `<tr>
+        <td>${i + 1}</td>
+        <td>${r["名"] || r["模型"] || ""}</td>
+        <td>${r["分数"] ?? "—"}</td>
+        <td>${r["场数"] ?? 0}</td>
+        <td>${pct(r["一位率"])}</td>
+        <td>${pct(r["和了率"])}</td>
+        <td>${pct(r["放铳率"])}</td>
+        <td>${atFloor ? `<span class="s-missed">${r["状态"]}</span>`
+                       : `<span class="dim">存活</span>`}</td>
+      </tr>`;
+    }).join("");
+  }
+  const lg = d.log || [];
+  $("liveLog").innerHTML = lg.length
+    ? lg.map(x => `<div>${escapeHtml(x)}</div>`).join("")
+    : '<span style="color:#8b949e">（最近对局会显示在这里）</span>';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
 async function loadHist() {
