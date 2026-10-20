@@ -751,14 +751,22 @@ def _score_normal_one(
     # 一盃口 / 二盃口（门清）
     if menzen:
         dup = 0
+        # ⚠️ 要按「**对数**」数，不能按「重复个数」数 ✗
+        #   反例（2026-10-21 实测）：222s333s444s 可以解释成 **234s × 3** ✓
+        #     按重复个数数 -> dup = 2 -> **白送二盃口 3 番** ✗
+        #     但「3 个相同顺子」= 一对 + 一个多余 ✗ 不是「两对」✗
+        #   正确：每个顺子型出现 n 次就贡献 n//2 对 ✓
+        #     ryanpeikou 需要 **>= 2 对** ✓  iipeikou 需要 **== 1 对** ✓
+        from collections import Counter as _C
+        _pairs = sum(n // 2 for n in _C(seqs).values())
         seen: set[int] = set()
         for s in seqs:
             if s in seen:
                 dup += 1
             seen.add(s)
-        if dup >= 2:
+        if _pairs >= 2:
             yaku["ryanpeikou"] = 3
-        elif dup == 1:
+        elif _pairs == 1:
             yaku["iipeikou"] = 1
 
     # 三色同顺：三麻万子凑不出顺子，所以这条永远不会触发；四麻是常规役

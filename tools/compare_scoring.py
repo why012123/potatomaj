@@ -170,7 +170,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     calc = HandCalculator()
     rules = OptionalRules(has_aka_dora=False, has_open_tanyao=True,
-                          has_double_yakuman=False, kazoe_limit=0)
+                          # 我们（雀魂规则）四暗刻单骑/国士十三面 算**双倍**役满 ✓
+                          # 参照库默认关掉 -> 不比的话会误报「番不同」✗（server 2026-10-21 指出 ✓）
+                          has_double_yakuman=True, kazoe_limit=0)
     rng = random.Random(args.seed)
     rule4 = S.rule_for(4)
 
@@ -226,9 +228,12 @@ def main(argv: list[str] | None = None) -> int:
                 ref_melds.append(RMeld(RMeld.CHI, ids, opened=True, called_tile=ids[-1],
                                        who=0, from_who=1))
             meld_ids.extend(ids)
-        tiles136 = meld_ids + [i for t in range(34) for i in take(t, concealed[t])]
-        # 被和的那张：从整手牌里找一张同牌型的 ✓
-        wt = next(x for x in tiles136 if x // 4 == win)
+        concealed_ids = [i for t in range(34) for i in take(t, concealed[t])]
+        tiles136 = meld_ids + concealed_ids
+        # ⚠️ 和了牌**只能从暗牌里取** —— 原来从含副露的 tiles136 里取第一张，
+        #    可能指到副露里那张；副露的牌不可能被和成，参照库会算出完全不同的结果。
+        #    （server 2026-10-21 指出 ✓ 对的 ✓）
+        wt = next(x for x in concealed_ids if x // 4 == win)
         try:
             ref = calc.estimate_hand_value(
                 tiles136, wt, melds=ref_melds or None,
