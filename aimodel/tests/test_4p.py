@@ -156,7 +156,11 @@ print("\n== 吃的手牌判定 ==")
 melds = [S.Meld("chi", S.parse_hand("2m").index(1), 3)]
 a = ev("567m567p555z88s", "8s", melds=melds)
 check(a is not None and "yakuhai_haku" in [k for k, _ in a.yaku], "吃 234m + 白白白 应是役牌·白")
-check(a is not None and a.fu == 40, f"符数应为 40，得到 {a.fu if a else None}")
+# ⚠️ 这里原先是 **40** ✗ —— 那个值是「吃的顺子也被按刻子加符」算出来的 ✓
+#    2026-10-21 修掉 `_compute_fu` 不判 kind 的 bug 之后，正确答案是 **30** ✓
+#    手算：底 20 + 白(555z 暗刻,三元) 8 + 单骑(88s 雀头) 2 + 吃(顺子) 0 = **30**
+#    -> 这个断言**曾经把 bug 锁死** ✓ 所以修 bug 必须先改测试 ✓
+check(a is not None and a.fu == 30, f"符数应为 30，得到 {a.fu if a else None}")
 print("  ✅ 吃的顺子能正确参与和牌判定与符计算")
 
 print()

@@ -124,6 +124,30 @@ def main() -> int:
     check("pinfu" not in yaku_keys(a), "有副露时不该给平和")
 
     print()
+    print("─" * 74)
+    print("⑤ 符：**吃（顺子）不加符** —— 和「没吃」的对照组符数必须相同")
+    print("─" * 74)
+    # 底：20 + 幺九暗刻(111s) 8 + 自風雀头(南) 2 + 两面 0 = 30 符
+    def fu_of(melds, wait="ryanmen"):
+        ctx = S.WinContext(win_tile=tile_of("2z"), is_tsumo=False,
+                           round_wind=S.EAST, seat_wind=S.SOUTH, rule=S.rule_for(4))
+        return S._compute_fu(menzen=False, tsumo=False, pinfu=False, melds=list(melds),
+                             shape_melds=[("tri", tile_of("1s"))], pair=tile_of("2z"),
+                             wait_type=wait, ctx=ctx)
+
+    f0 = fu_of([])
+    f1 = fu_of([mk("chi", "2s")])
+    f2 = fu_of([mk("chi", "1s")])       # 含幺九的顺子：**仍然是顺子**，也不加符
+    print(f"    无吃 {f0} 符 / 吃234s {f1} 符 / 吃123s {f2} 符")
+    check(f0 == 30, f"对照组应当是 30 符（实际 {f0}）")
+    check(f1 == f0, f"吃中张顺子不该改变符数（{f1} vs {f0}）")
+    check(f2 == f0, f"含幺九的顺子也不该加符（{f2} vs {f0}）")
+
+    # 真刻子必须加符：碰一个三元牌 -> +4
+    f3 = fu_of([mk("pon", "5z")])
+    check(f3 > f0, f"碰三元牌应当加符（{f3} vs {f0}）")
+
+    print()
     if failed:
         print(f"🔴 {len(failed)} 项未通过：")
         for f in failed:

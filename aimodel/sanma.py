@@ -898,6 +898,11 @@ def _compute_fu(
         concealed = not (not tsumo and tile == ctx.win_tile)
         fu += _triplet_fu(tile, concealed, kan=False)
     for m in melds:
+        # ⚠️ **顺子（吃）没有符** ✗ —— 原来不判 kind，把吃也当成刻子加符 ✗
+        # 实测（2026-10-21）：111s(幺九暗刻 8) + 自風雀头(2) + 底 20 = 30 符，
+        #   吃 234s 被加了 2 符 -> 32 -> 切上 40 ✗ 正确应当是 30 ✓
+        if m.is_chi:
+            continue
         fu += _triplet_fu(m.tile, m.is_concealed, kan=m.is_kan)
 
     if pair in DRAGONS:
