@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>官方 ELO · 土豆麻将</title>
+<style>
+  :root { --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#30363d;
+          --acc:#3fb950; --warn:#d29922; --bad:#f85149; --card:#161b22; --hi:#1f6feb; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:13px 18px; border-bottom:1px solid var(--line);
+           display:flex; gap:18px; align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; }
+  .dim { color:var(--dim); } a { color:#58a6ff; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  main { padding:16px 18px; max-width:1180px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+          padding:12px 14px; margin-bottom:14px; }
+  h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; font-size:13px; }
+  th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; font-size:12px; }
+  .slots { display:flex; gap:10px; flex-wrap:wrap; }
+  .slot { flex:1; min-width:110px; border:1px solid var(--line); border-radius:8px;
+          padding:9px 11px; background:#0d1117; }
+  .slot .h { font-size:17px; font-weight:600; }
+  .slot .s { font-size:12px; margin-top:3px; }
+  .s-done{color:var(--acc)} .s-due{color:var(--warn)} .s-upcoming{color:var(--dim)}
+  .s-missed{color:var(--bad)}
+  .bar { height:7px; background:#21262d; border-radius:4px; overflow:hidden; margin-top:7px; }
+  .bar > i { display:block; height:100%; background:var(--hi); width:0; transition:width .3s; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:baseline; }
+  button { background:#21262d; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:4px 11px; cursor:pointer; font-size:12px; }
+  button:hover { background:#30363d; }
+  button:disabled { opacity:.4; cursor:default; }
+  .star { color:var(--warn); }
+  .tag { font-size:11px; padding:1px 6px; border-radius:9px; background:#21262d;
+         color:var(--dim); margin-left:6px; }
+  .tag.p { background:#f8514922; color:var(--bad); }
+  #detail { display:none; }
+  .mv { cursor:pointer; } .mv:hover { background:#1f6feb22; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🏆 官方 ELO（四麻）</h1>
+  <span id="next" class="dim">—</span>
+  <span style="flex:1"></span>
+  <a href="/">← 门户</a>
+  <a href="/arena">手动四麻</a>
+</header>
+
+<main>
+  <!-- 当期 -->
+  <div class="card">
+    <h2>当期</h2>
+    <div id="cur" class="dim">读取中…</div>
+    <div class="bar" id="curbar"><i></i></div>
+    <div class="row" style="margin-top:10px">
+      <button id="btnRefresh">刷新</button>
+      <span id="curMeta" class="dim"></span>
+    </div>
+  </div>
+
+  <!-- 今天五个档位 -->
+  <div class="card">
+    <h2>今天的档位（每天 08 / 11 / 14 / 17 / 20 点各一期，每期 4000 局）</h2>
+    <div class="slots" id="slots"></div>
+  </div>
+
+  <!-- 历史各期 -->
+  <div class="card">
+    <h2>历史各期</h2>
+    <div class="dim" style="margin-bottom:8px;font-size:12px">
+      3 天前、且**没有收藏**的期会自动精简成「只留冠军名字」（回放数据删掉以省空间）。
+      最终 ELO 表长期保留。
+    </div>
+    <table id="hist"><thead><tr>
+      <th>期号</th><th>冠军（按模型均分）</th><th>场次</th><th>回放</th><th>收藏</th><th></th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+
+  <!-- 某期详情 -->
+  <div class="card" id="detail">
+    <div class="row" style="justify-content:space-between">
+      <h2 id="dTitle" style="margin:0">—</h2>
+      <div>
+        <button id="dFav">☆ 收藏</button>
+        <button id="dClose">关闭</button>
+      </div>
+    </div>
+    <div id="dBody" style="margin-top:10px"></div>
+  </div>
+
+  <div class="card">
+    <h2>存储</h2>
+    <div id="stat" class="dim">读取中…</div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let LAST = null;
+
+function fmtState(s) {
+  return { done: "已完成", due: "待跑（补跑窗口内）", upcoming: "未到时间",
+           missed: "已错过（不补）" }[s] || s;
+}
+
+async function loadSchedule() {
+  const d = await (await fetch("/api/elo/schedule")).json();
+  LAST = d;
+  const box = $("slots");
+  box.innerHTML = (d.slots || []).map(r => `
+    <div class="slot">
+      <div class="h">${String(r.slot).padStart(2, "0")}:00</div>
+      <div class="s s-${r.state}">${fmtState(r.state)}</div>
+      <div class="dim" style="font-size:11px">${r.season_id}</div>
+    </div>`).join("");
+  $("next").textContent = `下次 ${d.next}`;
+  return d;
+}
+
+async function loadCurrent() {
+  const d = await (await fetch("/api/arena")).json();
+  const bar = $("curbar").firstElementChild;
+  if (d.running) {
+    const pct = d.target ? Math.min(100, (d.done_run / d.target) * 100) : 0;
+    bar.style.width = pct.toFixed(1) + "%";
+    $("cur").innerHTML = `<b class="s-due">正在跑</b> · ${d.players} 麻 · `
+      + `已完成 <b>${d.done_run}</b> / ${d.target} 局`
+      + ` · 已用 ${d.elapsed}s`
+      + (d.error ? ` · <span class="bad">${d.error}</span>` : "");
+  } else {
+    bar.style.width = "0%";
+    $("cur").innerHTML = `<span class="dim">空闲</span>`
+      + (d.error ? ` · <span style="color:#f85149">${d.error}</span>` : "")
+      + (LAST && LAST.current_season ? ` · 上一期 <b>${LAST.current_season}</b>` : "");
+  }
+  $("curMeta").textContent = `${d.alive}/${d.total} 个参战者存活 · 种子 ${d.seed}`;
+}
+
+async function loadHist() {
+  const d = await (await fetch("/api/elo/seasons")).json();
+  const st = d.stats || {};
+  $("stat").innerHTML = `回放数据 <b>${st.replay_human}</b>（${st.matches} 局，`
+    + `每局 ${st.per_match_bytes} B）· ELO 表 <b>${st.scores_human}</b> · `
+    + `合计 <b>${st.human}</b> / ${st.quota_human}（已用 ${(st.used_pct || 0).toFixed(4)}%）`
+    + `<br>按当前每局大小，配额还能装 <b>${(st.matches_capacity || 0).toLocaleString()}</b> 局`;
+
+  const tb = $("hist").querySelector("tbody");
+  if (!(d.seasons || []).length) {
+    tb.innerHTML = `<tr><td colspan="6" class="dim">还没有任何一期</td></tr>`;
+    return;
+  }
+  tb.innerHTML = d.seasons.map(s => `<tr>
+      <td>${s.sid}</td>
+      <td>${champCell(s)}</td>
+      <td>${s.pruned ? '<span class="dim">已精简</span>' : (s.done || 0)}</td>
+      <td>${s.has_replay ? '<span class="s-done">有</span>' : '<span class="dim">无</span>'}</td>
+      <td>${s.favorite ? '<span class="star">★</span>' : ""}</td>
+      <td><button class="mv" data-sid="${s.sid}">查看</button></td>
+    </tr>`).join("");
+  tb.querySelectorAll("button.mv").forEach(b => b.onclick = () => showSeason(b.dataset.sid));
+}
+
+/**
+ * 冠军单元格：**以「模型均分」为准** ✓ 单实例最高只作附注 ✗
+ * 为什么：每个模型派 copies 份参赛者（默认 3），单实例第一名噪声很大
+ *         （三份同权重的模型，谁运气好谁高）。用户要求两者都显示。
+ */
+function champCell(s) {
+  if (!s.champion) return '<span class="dim">—</span>';
+  let out = `<b>${s.champion}</b>`;
+  if (s.champion_avg) out += ` <span class="dim">均分 ${s.champion_avg}</span>`;
+  const instModel = (s.champion_inst || "").replace(/#\d+$/, "");
+  if (s.champion_inst && instModel !== s.champion) {
+    out += `<br><span class="dim" style="font-size:11px">单实例最高：`
+         + `${s.champion_inst}（${s.champion_inst_score}）</span>`;
+  }
+  return out;
+}
+
+async function showSeason(sid) {  CUR_SID = sid;
+  $("detail").style.display = "block";
+  $("dTitle").textContent = sid;
+  $("dBody").innerHTML = '<span class="dim">读取中…</span>';
+  const d = await (await fetch(`/api/elo/season?id=${encodeURIComponent(sid)}`)).json();
+  if (!d.ok) { $("dBody").innerHTML = `<span style="color:#f85149">${d.error}</span>`; return; }
+  const s = d.season, sc = d.scores || {};
+  setFavButton(!!s.favorite);
+  const rows = (sc.table || []).slice(0, 40);
+  let html = `<div class="row dim" style="margin-bottom:8px">
+      场次 ${s.done} · ${s.players} 麻 · 收藏 ${s.favorite ? "是" : "否"}` +
+      `${s.pruned ? " · <b>已精简（回放数据已删）</b>" : ""}</div>`;
+  if (rows.length) {
+    html += `<table><thead><tr><th>#</th><th>参战者</th><th>段位分</th>
+      <th>场数</th><th>一位率</th><th>和了率</th></tr></thead><tbody>`;
+    rows.forEach((r, i) => {
+      html += `<tr><td>${i + 1}</td><td>${r["名"] || r["模型"] || ""}</td>
+        <td>${r["分数"]}</td><td>${r["场数"]}</td>
+        <td>${(r["一位率"] * 100).toFixed(1)}%</td>
+        <td>${(r["和了率"] * 100).toFixed(1)}%</td></tr>`;
+    });
+    html += "</tbody></table>";
+  } else {
+    html += '<div class="dim">没有该期的 ELO 表（可能还没收尾）</div>';
+  }
+  if ((d.matches || []).length) {
+    html += `<div class="dim" style="margin-top:12px">对局（点开看回放）：</div><div style="max-height:200px;overflow:auto">`;
+    d.matches.forEach(m => {
+      const g = (m.group || []).map(x => x.replace(/#\d+$/, "")).join(" / ");
+      html += `<div class="mv" onclick="location.href='/replay?season=${sid}&index=${m.index}'"
+        style="padding:3px 6px;border-radius:4px;font-size:12px">
+        <span class="dim">#${m.index + 1}</span> 种子 ${m.seed} · ${g}
+        · 名次 ${(m.ranks || []).map(x => x + 1).join(" ")}</div>`;
+    });
+    html += "</div>";
+  }
+  $("dBody").innerHTML = html;
+}
+
+$("dClose").onclick = () => { $("detail").style.display = "none"; };
+$("btnRefresh").onclick = () => refresh();
+
+// 收藏：只有管理员能改（服务端要 MAJ_ELO_ADMIN_KEY 环境变量 ✓ 没设就 403 并说明 ✓）
+// 口令只用在**这一次请求**里，不落 localStorage ✓（这是本机管理动作，不是用户登录 ✓）
+let CUR_SID = "";
+$("dFav").onclick = async () => {
+  const key = prompt("管理员口令（服务端环境变量 MAJ_ELO_ADMIN_KEY 的值）：");
+  if (!key) return;
+  const wantFav = !($("dFav").textContent || "").includes("取消");
+  try {
+    const r = await fetch("/api/elo/favorite", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid: CUR_SID, key, favorite: wantFav }),
+    });
+    const d = await r.json();
+    if (!d.ok) { alert("失败：" + (d.error || ("HTTP " + r.status))); return; }
+    setFavButton(d.favorite);
+    await loadHist();
+  } catch (e) { alert("请求失败：" + e); }
+};
+function setFavButton(fav) {
+  $("dFav").textContent = fav ? "★ 取消收藏" : "☆ 收藏";
+  $("dFav").style.color = fav ? "#d29922" : "";
+}
+
+async function refresh() {
+  await loadSchedule();
+  await loadCurrent();
+  await loadHist();
+}
+refresh();
+setInterval(loadCurrent, 5000);   // 进度 5 秒一刷 ✓
+setInterval(refresh, 60000);      // 期次/历史 1 分钟一刷 ✓
+</script>
+</body>
+</html>
