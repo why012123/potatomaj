@@ -689,7 +689,10 @@ def _score_normal_one(
     # 暗刻数（含暗杠）；荣和时被和了牌补成的那组刻子不算暗刻
     concealed_tri = sum(1 for k, _ in shape_melds if k == "tri")
     concealed_tri += sum(1 for m in melds if m.is_concealed)
-    if not ctx.is_tsumo and any(k == "tri" and t == win for k, t in shape_melds):
+    # 和了牌只补一个搭子；若它同时出现在顺子里，就不能认定刻子是被补成的
+    _win_in_seq = any(k == "seq" and t <= win <= t + 2 for k, t in shape_melds)
+    if (not ctx.is_tsumo and not _win_in_seq
+            and any(k == "tri" and t == win for k, t in shape_melds)):
         concealed_tri -= 1
 
     # ⚠️ 顺子必须从 **shapes**（暗牌 + 副露）里数，不能只看 shape_melds（暗牌）✗
@@ -892,10 +895,12 @@ def _compute_fu(
     if tsumo and not pinfu:
         fu += 2
 
+    _win_in_seq_fu = any(k == "seq" and t <= ctx.win_tile <= t + 2
+                        for k, t in shape_melds)
     for kind, tile in shape_melds:
         if kind != "tri":
             continue
-        concealed = not (not tsumo and tile == ctx.win_tile)
+        concealed = not (not tsumo and tile == ctx.win_tile and not _win_in_seq_fu)
         fu += _triplet_fu(tile, concealed, kan=False)
     for m in melds:
         # ⚠️ **顺子（吃）没有符** ✗ —— 原来不判 kind，把吃也当成刻子加符 ✗
