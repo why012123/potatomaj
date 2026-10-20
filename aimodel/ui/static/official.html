@@ -79,7 +79,7 @@
       最终 ELO 表长期保留。
     </div>
     <table id="hist"><thead><tr>
-      <th>期号</th><th>冠军</th><th>场次</th><th>回放</th><th>收藏</th><th></th>
+      <th>期号</th><th>冠军（按模型均分）</th><th>场次</th><th>回放</th><th>收藏</th><th></th>
     </tr></thead><tbody></tbody></table>
   </div>
 
@@ -158,7 +158,7 @@ async function loadHist() {
   }
   tb.innerHTML = d.seasons.map(s => `<tr>
       <td>${s.sid}</td>
-      <td>${s.champion ? `<b>${s.champion}</b>` : '<span class="dim">—</span>'}</td>
+      <td>${champCell(s)}</td>
       <td>${s.pruned ? '<span class="dim">已精简</span>' : (s.done || 0)}</td>
       <td>${s.has_replay ? '<span class="s-done">有</span>' : '<span class="dim">无</span>'}</td>
       <td>${s.favorite ? '<span class="star">★</span>' : ""}</td>
@@ -167,8 +167,24 @@ async function loadHist() {
   tb.querySelectorAll("button.mv").forEach(b => b.onclick = () => showSeason(b.dataset.sid));
 }
 
-async function showSeason(sid) {
-  CUR_SID = sid;
+/**
+ * 冠军单元格：**以「模型均分」为准** ✓ 单实例最高只作附注 ✗
+ * 为什么：每个模型派 copies 份参赛者（默认 3），单实例第一名噪声很大
+ *         （三份同权重的模型，谁运气好谁高）。用户要求两者都显示。
+ */
+function champCell(s) {
+  if (!s.champion) return '<span class="dim">—</span>';
+  let out = `<b>${s.champion}</b>`;
+  if (s.champion_avg) out += ` <span class="dim">均分 ${s.champion_avg}</span>`;
+  const instModel = (s.champion_inst || "").replace(/#\d+$/, "");
+  if (s.champion_inst && instModel !== s.champion) {
+    out += `<br><span class="dim" style="font-size:11px">单实例最高：`
+         + `${s.champion_inst}（${s.champion_inst_score}）</span>`;
+  }
+  return out;
+}
+
+async function showSeason(sid) {  CUR_SID = sid;
   $("detail").style.display = "block";
   $("dTitle").textContent = sid;
   $("dBody").innerHTML = '<span class="dim">读取中…</span>';

@@ -73,8 +73,11 @@ class Season:
     finished_at: float = 0.0
     target: int = 0  #: 计划场次
     done: int = 0  #: 实际完成场次
-    champion: str = ""  #: 冠军显示名（清理后**只留这个** ✓）
+    champion: str = ""  #: 冠军**模型名**（按模型均分 ✓ 不是某个实例 ✗）
     champion_key: str = ""
+    champion_avg: float = 0.0       #: 冠军模型的**均分**
+    champion_inst: str = ""         #: 单实例里分最高的那个（参考 ✓ 噪声大 ✗）
+    champion_inst_score: float = 0.0
     pruned: bool = False  #: True = 回放数据已删，只剩冠军
     favorite: bool = False  #: 被管理员收藏 -> 永不清理
     note: str = ""
@@ -89,12 +92,62 @@ class Season:
             "seed_base": self.seed_base, "started_at": self.started_at,
             "finished_at": self.finished_at, "target": self.target, "done": self.done,
             "champion": self.champion, "champion_key": self.champion_key,
+            "champion_avg": self.champion_avg,
+            "champion_inst": self.champion_inst,
+            "champion_inst_score": self.champion_inst_score,
             "pruned": self.pruned, "favorite": self.favorite, "note": self.note,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Season":
         return cls(**{k: d[k] for k in cls.__dataclass_fields__ if k in d})
+
+
+def seed_from_sid(sid: str) -> int:
+    """从**期号**派生牌山种子。
+
+    ⚠️ 每期必须换种子 ✗ —— 否则每期都打**同一副牌**（用户 2026-10-20 指出）
+    ⚠️ 但不能用纯随机 ✗ —— 补跑 / 续跑同一期要能**复现**
+    -> 用期号的哈希：同一期恒定 ✓ 不同期不同 ✓
+    """
+    import hashlib
+
+    h = hashlib.sha256(sid.encode("utf-8")).hexdigest()
+    return int(h[:8], 16) % 2_000_000_000
+
+
+def model_of(key: str) -> str:
+    """参战者 key -> **模型名**（去掉 ``#N`` 实例后缀）。"""
+    return key.split("#", 1)[0]
+
+
+def champion_by_model(table: list[dict]) -> tuple[str, float, str, float]:
+    """从 ``Arena.table()`` 的行算出冠军 —— **按模型均分**。
+
+    为什么不能只看单个实例：每个模型派 ``copies`` 个参赛者（默认 3 个），
+    各自记分。单个实例的第一名**噪声很大**（三份同权重，谁运气好谁高）。
+    用户要求「**模型的均分第一也要显示**」，所以这里以均分为准。
+
+    返回 ``(模型名, 均分, 单实例第一名, 该实例分)``。
+    """
+    if not table:
+        return "", 0.0, "", 0.0
+    agg: dict[str, list[float]] = {}
+    inst_name, inst_score = "", float("-inf")
+    for r in table:
+        model = str(r.get("模型") or "")
+        score = float(r.get("分数") or 0.0)
+        if not model:
+            continue
+        agg.setdefault(model, []).append(score)
+        if score > inst_score:
+            inst_name, inst_score = str(r.get("名") or model), score
+    if not agg:
+        return "", 0.0, inst_name, (0.0 if inst_score == float("-inf") else inst_score)
+    # 均分最高者；并列时取「份数更少也照样高」的那个（更可信）
+    top = max(agg, key=lambda m: (sum(agg[m]) / len(agg[m]), -len(agg[m])))
+    avg = sum(agg[top]) / len(agg[top])
+    return top, round(avg, 1), inst_name, round(0.0 if inst_score == float("-inf") else inst_score, 1)
 
 
 def season_id(when: float | None = None, slot_hour: int | None = None) -> str:
@@ -338,10 +391,10 @@ def _champion_from_scores(sid: str) -> tuple[str, str] | None:
     rows = d.get("table") or []
     if not rows:
         return None
-    # ⚠️ `Arena.table()` 的字段名是**中文**（"名"/"模型"/"分数"）✗ 不是 label/key/rating ✓
-    rows = sorted(rows, key=lambda r: -(r.get("分数") or 0))
-    top = rows[0]
-    return str(top.get("名") or top.get("模型") or ""), str(top.get("模型") or "")
+    # `Arena.table()` 的字段名是**中文**（"名"/"模型"/"分数"），不是 label/key/rating。
+    # 冠军按**模型均分**（不是单个实例）—— 见 champion_by_model。
+    m, _avg, _inst, _is = champion_by_model(rows)
+    return m, m
 
 
 def save_scores(sid: str, table: list[dict], summary: dict | None = None) -> None:

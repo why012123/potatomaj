@@ -86,9 +86,28 @@ class Session:
                     if sid is None:
                         sid = (f"{E.season_id()}-{self.arena.players}p"
                                f"-{int(time.time()) % 100000}")
+                    # ⚠️ **每期换一个牌山种子** ✗ —— 否则每期都打**同一副牌**
+                    #    （用户 2026-10-20 指出：seed_base 恒为 0 ✗）
+                    #    从**期号**派生：同一期恒定 ✓（补跑/续跑可复现）不同期不同 ✓
+                    prev = E.load_season(sid)
+                    if prev is not None and prev.seed_base:
+                        seed = prev.seed_base      # 补跑/续跑：沿用该期种子
+                    else:
+                        seed = E.seed_from_sid(sid)
+                    self.arena.seed = seed
+                    # ⚠️ **续跑要把场次序号接上** ✗ 否则 seed_of(index) 会重复发出
+                    #    同一批种子 -> 补跑出来的前几局和已有的**一模一样** ✗（重复数据）
+                    if prev is not None:
+                        try:
+                            have = sum(1 for _ in E.iter_matches(prev))
+                        except OSError:
+                            have = 0
+                        if have:
+                            self.arena.n_matches = have
+                            log(f"↩️ 续跑 {sid}：已有 {have} 局，场次序号从 {have} 接着数")
                     self.season = E.open_season(
                         sid, players=self.arena.players, copies=self.copies,
-                        seed_base=self.arena.seed, target=matches)
+                        seed_base=seed, target=matches)
                 except Exception as exc:  # noqa: BLE001 - 存档失败不能拖垮跑局
                     log(f"⚠️ 开期失败（不影响跑局）：{type(exc).__name__}: {exc}")
                     self.season = None
@@ -167,11 +186,13 @@ class Session:
             season.done = arena.n_matches
             table = arena.table()
             if table:
-                # ⚠️ `Arena.table()` 的字段名是**中文**（"名"/"模型"/"分数"）✗
-                #    第一版按 "label"/"key"/"rating" 取 -> 全取到空 ✗ 已修 ✓
-                top = sorted(table, key=lambda r: -(r.get("分数") or 0))[0]
-                season.champion = str(top.get("名") or top.get("模型") or "")
-                season.champion_key = str(top.get("模型") or "")
+                # ⚠️ 冠军按**模型均分** ✓ 不是单个实例 ✗（用户 2026-10-20 要求）
+                #    每个模型有 copies 份参赛者（默认 3），单个第一名噪声大 ✗
+                #    两个都记：champion = 均分第一的模型 ✓ champion_inst = 单实例第一 ✓
+                (season.champion, season.champion_avg,
+                 season.champion_inst, season.champion_inst_score) = \
+                    E.champion_by_model(table)
+                season.champion_key = season.champion
             E.save_season(season)
             E.save_scores(season.sid, table, {"players": arena.players,
                                               "matches": arena.n_matches})
@@ -496,12 +517,28 @@ def start_official(session: "Session", *, interval: float = 45.0,
             try:
                 if session.running:
                     continue
-                existing = {s.sid for s in E.list_seasons()}
+                # ⚠️ 判重只看**跑满**的期（done >= target）✗ 不能只看"期号存在" ✗
+                #    否则：某一期跑到一半被重启打断 -> 期号存在 -> 调度器认为已完成
+                #    -> **那一期永远补不上**（用户 2026-10-20 的 8 点档就是这样丢的）
+                existing = set()
+                for s in E.list_seasons():
+                    want = s.target or target
+                    if s.pruned or (s.done and s.done >= want):
+                        existing.add(s.sid)
                 due = S.due_slot(time.time(), existing, busy=False)
                 if due is not None:
                     slot, sid = due
-                    log(f"🕗 官方档位 {slot:02d}:00 -> 开一期 {sid}（{target} 局）")
-                    session.start(target, sid=sid)
+                    prev = E.load_season(sid)
+                    have = 0
+                    if prev is not None:
+                        try:
+                            have = sum(1 for _ in E.iter_matches(prev))
+                        except OSError:
+                            have = 0
+                    todo = max(1, target - have)
+                    log(f"🕗 官方档位 {slot:02d}:00 -> 开一期 {sid}"
+                        f"（已有 {have} 局，本次再跑 {todo} 局）")
+                    session.start(todo, sid=sid)
                 if time.time() - last_prune > prune_every:
                     last_prune = time.time()
                     gone = E.prune()
