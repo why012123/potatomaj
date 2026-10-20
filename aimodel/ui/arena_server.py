@@ -380,15 +380,21 @@ class Handler(BaseHTTPRequestHandler):
             if s is None:
                 self._json({"ok": False, "error": f"没有这一期: {sid}"}, 404)
                 return
-            # 只给前 200 局的摘要，别把 4000 行一次吐给前端
+            # ⚠️ meta 里的 done 只在收尾时才写 ✗ -> 跑到一半是陈旧的（会是 0）✗
+            #    与 /api/elo/seasons 用同一口径：**实际行数** ✓
+            #    （这个不一致是收证据时抓出来的：列表页对了、详情页还是 0 ✗）
             matches = []
+            real = 0
             for i, m in enumerate(E.iter_matches(s)):
+                real += 1
                 if i >= 200:
-                    break
+                    continue          # 只给前 200 局的摘要，别把 4000 行一次吐给前端
                 matches.append({"index": i, "seed": m.get("seed"),
                                 "group": m.get("group"), "ranks": m.get("ranks"),
                                 "scores": m.get("scores")})
-            self._json({"ok": True, "season": s.as_dict(), "matches": matches,
+            sd = s.as_dict()
+            sd["done"] = real
+            self._json({"ok": True, "season": sd, "matches": matches,
                         "scores": E.load_scores(sid)})
             return
         if u.path == "/api/elo/replay":

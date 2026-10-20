@@ -369,7 +369,9 @@ def prune(*, keep_days: int = KEEP_DAYS, now: float | None = None,
             if not s.champion:
                 champ = _champion_from_scores(s.sid)
                 if champ:
-                    s.champion, s.champion_key = champ
+                    (s.champion, s.champion_avg,
+                     s.champion_inst, s.champion_inst_score) = champ
+                    s.champion_key = s.champion
             mf = s.dir / "matches.jsonl"
             if mf.exists():
                 mf.unlink()
@@ -380,7 +382,11 @@ def prune(*, keep_days: int = KEEP_DAYS, now: float | None = None,
     return pruned
 
 
-def _champion_from_scores(sid: str) -> tuple[str, str] | None:
+def _champion_from_scores(sid: str) -> tuple[str, float, str, float] | None:
+    """从 ``scores/<sid>.json`` 里算冠军（**按模型均分**，与 ``prune`` 之外的口径一致）。
+
+    返回 ``(模型名, 均分, 单实例第一名, 该实例分)``，没有表就返回 ``None``。
+    """
     p = SCORES_DIR / f"{sid}.json"
     if not p.exists():
         return None
@@ -392,9 +398,7 @@ def _champion_from_scores(sid: str) -> tuple[str, str] | None:
     if not rows:
         return None
     # `Arena.table()` 的字段名是**中文**（"名"/"模型"/"分数"），不是 label/key/rating。
-    # 冠军按**模型均分**（不是单个实例）—— 见 champion_by_model。
-    m, _avg, _inst, _is = champion_by_model(rows)
-    return m, m
+    return champion_by_model(rows)
 
 
 def save_scores(sid: str, table: list[dict], summary: dict | None = None) -> None:
