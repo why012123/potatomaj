@@ -58,7 +58,18 @@ def make_third(spec: str, seed: int):
         return RandomAgent(seed)
     if spec == "teacher":
         return HeuristicAgent(seed)
+    # 打法风格陪练（见 aimodel/styles.py）：--third style:speed / style:defense / ...
+    if spec.startswith("style:") or spec in _style_names():
+        from .styles import make as _make_style
+
+        return _make_style(spec, seed)
     raise SystemExit(f"未知的第三方: {spec}")
+
+
+def _style_names() -> set[str]:
+    from .styles import STYLES
+
+    return set(STYLES)
 
 
 def wall_for(seed: int, rule: S.Rule) -> list[tuple[int, int]]:
