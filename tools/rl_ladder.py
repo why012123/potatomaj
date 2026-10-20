@@ -168,7 +168,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--matches", type=int, default=300)
     ap.add_argument("--eval-matches", type=int, default=80)
     ap.add_argument("--ppo-epochs", type=int, default=3)
-    ap.add_argument("--jobs", type=int, default=4, help="配对赛并行度")
+    ap.add_argument("--jobs", type=int, default=0, help="配对赛并行度（0=自动用满所有核）")
     ap.add_argument("--max-games", type=int, default=6000, help="配对赛最多多少组")
     ap.add_argument("--nice", type=int, default=10, help="POSIX 上降优先级；0 = 不降")
     args = ap.parse_args(argv)
