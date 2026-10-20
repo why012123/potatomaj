@@ -595,6 +595,31 @@ ENCODE_V2_SCALAR_DIM: dict[int, int] = {
 # ---------------------------------------------------------------------------
 
 
+def option_head_index(kind: str, option) -> int | None:
+    """选项 -> 策略头下标；对不上返回 ``None``。
+
+    正常情况下选项就是 :data:`ACTION_TABLE` 里的字面量（``"pass"`` / ``"pon"``
+    / ``"chi"`` …）。这里额外容忍 ``"chi:10:12"`` / ``"pon:5p"`` 这种
+    「逐吃法 / 带牌信息」的写法 —— 只看冒号前的动作名。
+
+    为什么要容忍：引擎现在给的是字面量，但外部调用方（回放、UI、别的引擎）
+    完全可能把**每一种吃法**作为独立选项传进来。老代码在 ``action_mask`` 里
+    直接 ``table.index(str(opt))``，遇到这种写法会抛 ``ValueError``；而
+    ``MLAgent._head_to_option`` 更糟，找不到就静默返回 0（= pass），
+    表现就是「永远不鸣牌」。
+    """
+    table = ACTION_TABLE[kind]
+    s = str(option)
+    try:
+        return table.index(s)
+    except ValueError:
+        pass
+    try:
+        return table.index(s.split(":", 1)[0])
+    except ValueError:
+        return None
+
+
 def action_mask(decision: Decision) -> np.ndarray:
     """该决策下每个策略头位置的合法性。"""
     size = HEAD_SIZE[decision.kind]
@@ -603,9 +628,13 @@ def action_mask(decision: Decision) -> np.ndarray:
         for t in decision.options:
             m[int(t)] = 1.0
     else:
-        table = ACTION_TABLE[decision.kind]
         for opt in decision.options:
-            m[table.index(str(opt))] = 1.0
+            head = option_head_index(decision.kind, opt)
+            if head is None:
+                raise ValueError(
+                    f"{decision.kind} 的选项 {opt!r} 不在动作表 "
+                    f"{ACTION_TABLE[decision.kind]} 里")
+            m[head] = 1.0
     if m.sum() == 0:  # 兜底，避免 softmax 全零
         m[0] = 1.0
     return m
@@ -615,8 +644,12 @@ def action_index(decision: Decision, choice: int) -> int:
     """把「options 里的下标」换算成「策略头里的下标」。"""
     if decision.kind == "discard":
         return int(decision.options[choice])
-    table = ACTION_TABLE[decision.kind]
-    return table.index(str(decision.options[choice]))
+    head = option_head_index(decision.kind, decision.options[choice])
+    if head is None:
+        raise ValueError(
+            f"{decision.kind} 的选项 {decision.options[choice]!r} 不在动作表 "
+            f"{ACTION_TABLE[decision.kind]} 里")
+    return head
 
 
 def action_label(decision: Decision, choice: int) -> str:

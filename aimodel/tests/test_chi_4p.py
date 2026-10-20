@@ -211,7 +211,17 @@ def main() -> int:
     check(action_index(d, 1) == 1, "options[1]=chi -> 头下标 1")
     m1 = action_mask(Decision("chi", ["chi"], tile=T1P))
     check(m1[0] == 0.0 and m1[1] == 1.0, "只给 chi 时掩码应只开第 1 位")
-    print("  ✅ chi 掩码 2 维 / 下标映射正确")
+    # 外部引擎可能把「每一种吃法」作为独立选项传进来（"chi:10:12"）。
+    # 动作空间仍是二值，看冒号前的动作名。老代码在这里会把 head=1 静默变成 0（过）。
+    dm = Decision("chi", ["pass", "chi:10:12", "chi:21:22"], tile=T1P)
+    mm = action_mask(dm)
+    check(mm.tolist() == [1.0, 1.0], f"逐吃法选项的掩码应是 [1,1]，得到 {mm.tolist()}")
+    check(action_index(dm, 1) == 1 and action_index(dm, 2) == 1,
+          "逐吃法选项都应映射到 chi 头（下标 1）")
+    probe = MLAgent(Net(dim=560, hidden=(8,), seed=0), seed=0)
+    check(probe._head_to_option(dm, 1) == 1,
+          "head=1 必须映射到第一个吃法选项，不能静默变成 0（pass）")
+    print("  ✅ chi 掩码 2 维 / 下标映射正确（含逐吃法写法）")
 
     print("\n== 旧权重（没有 chi 头）必须被安全处理，且不能静默 ==")
     with tempfile.TemporaryDirectory() as td:

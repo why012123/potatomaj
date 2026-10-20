@@ -208,22 +208,37 @@ def _meld_objects(melds: list[dict] | None, players: int, my_seat: int):
                 "kan": "minkan", "kita": "kita"}.get(m.get("type"), "pon")
         # 牌名 -> 牌型下标。注意 aimodel 只提供 tile_id(下标->名字)，没有反函数，
         # 所以直接查 TILE_IDS。赤 5（0p/0s/0m）要先归到普通 5 上。
-        first = tiles[0]
-        if first.startswith("0"):
-            first = "5" + first[1]
-        try:
-            idx = S.TILE_IDS.index(first)
-        except ValueError:
+        #
+        # **吃**：`S.Meld.tile` 约定是顺子里**最小**的那张（engine 的 `_do_chi`
+        # 就是 `start = min(tile, a, b)`），而协议给的 `tiles` **不是升序** ——
+        # 实测吃 6s 时它是 `["7s","8s","6s"]`。老代码直接拿 `tiles[0]` 当起点，
+        # 于是这组吃被记成 7-8-9s（实际是 6-7-8s），模型看到的副露和可见牌全错。
+        # 这是「吃完之后建议突然不对」的另一半原因（手牌跟踪那边的 bug 见
+        # electron/lib/gamestate.js）。
+        idxs = []
+        for t in tiles:
+            base = ("5" + t[1:]) if t.startswith("0") else t
+            try:
+                idxs.append(S.TILE_IDS.index(base))
+            except ValueError:
+                idxs = []
+                break
+        if not idxs:
             continue
+        idx = min(idxs) if kind == "chi" else idxs[0]
         aka = sum(1 for t in tiles if t.startswith("0"))
         # 哪张是别家给的：froms 里有和副露者座位不同的那一张
         from_player = -1
+        called = -1
         froms = m.get("froms") or []
         for i, f in enumerate(froms):
             if f != seat and i < len(tiles):
                 from_player = (f - seat) % n
+                if kind == "chi":
+                    called = idxs[i]
                 break
-        out.append(S.Meld(kind=kind, tile=int(idx), from_player=from_player, aka=int(aka)))
+        out.append(S.Meld(kind=kind, tile=int(idx), from_player=from_player,
+                          aka=int(aka), called=int(called)))
     return out
 
 
@@ -377,28 +392,38 @@ def build_view(
     hc, red = counts_from_ids(hand, n)
     my_melds = _meld_objects(melds, n, seat)
 
-    # 赤 5：**把副露里的也算进来**。
+    # 赤 5：**只把「吃」里、来自我手牌的那两张补回来**，而且要补到红 5
+    # 真正的那一种牌上。
     #
-    # 反直觉，但这是引擎的行为（View.hand_red 直接取 pl.red，而 pl.red 是
-    # 「这个人一共有几张赤 5」，副露里的没被扣掉）。模型是拿引擎自己的 view
-    # 训练的，所以必须对齐 —— 少算一张，aka 那块特征就和训练分布不一样了。
+    # 引擎的行为不一致（这是实测，不是猜的）：
+    #   * `_do_chi`      **不扣** pl.red —— 手牌里的赤 5 进了顺子，pl.red 里还留着它；
+    #   * `_do_pon` / 槓  会把 pl.red 扣到「手里还剩几张」为止 —— 赤 5 进了
+    #                      碰/槓就不再算。
+    # 模型是拿引擎的 view 训练的，所以这里必须照抄这个奇怪的口径。
     #
-    # 抓到这个的场景：手里 6m 8p 8p 3s 3s 3s 4s 1z 2z 4z 7z（没有 5m），
-    # 副露是吃 4m（=4m5m6m，赤 5m 在这组吃里），引擎的 hand_red[4] 仍然是 1。
-    # 赤 5：**把副露里的也算进来**。
-    #
-    # 反直觉，但引擎就是这样：``View.hand_red`` 直接取 ``pl.red``，而
-    # ``pl.red`` 记的是「这个人一共有过几张赤 5」—— 那张 5 后来被吃/碰进副露，
-    # 它也不会扣（引擎里只有拔北那条路会扣）。
-    #
-    # 模型是拿引擎自己的 view 训练的，所以必须对齐：少算一张，
-    # ``aka`` 那块特征就和训练分布不一样了。
-    #
-    # 抓到的场景：吃 4m（=4m5m6m，赤 5m 在这组吃里），手里根本没有 5m，
-    # 而引擎的 hand_red[4] 仍然是 1。
-    for mm in my_melds:
-        if mm.aka:
-            red[mm.tile] = red[mm.tile] + int(mm.aka)
+    # 两个坑：
+    #   1. 老代码 `red[mm.tile] += aka` 把赤 5 的个数加到了**顺子起点**上。
+    #      吃 4m5m6m（赤 5m 在中间）会记成 hand_red[4m]=1，而引擎是 hand_red[5m]=1。
+    #   2. 被吃的那张如果是赤 5，它来自**别人**，本来就不在我的 pl.red 里 ——
+    #      不能补。所以先用 froms 找出「别人给的那张」，只补另外两张。
+    for m in (melds or []):
+        if m.get("type") != "chi":
+            continue
+        tiles = list(m.get("tiles") or [])
+        froms = m.get("froms") or []
+        gave = -1
+        if len(froms) == len(tiles):
+            gave = next((i for i, f in enumerate(froms) if f != seat), -1)
+        if gave < 0 and tiles:          # froms 缺失时和 gamestate 同口径：最后一张是被叫的
+            gave = len(tiles) - 1
+        for i, t in enumerate(tiles):
+            if i == gave:
+                continue
+            if str(t).startswith("0"):
+                try:
+                    red[tile_index(t)] += 1
+                except ValueError:
+                    pass
 
     def pond_list(tiles):
         """牌河 -> 牌型下标列表，**保留出牌先后**。

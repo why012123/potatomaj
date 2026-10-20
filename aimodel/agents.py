@@ -28,9 +28,10 @@ from .encode import (
     action_label,
     action_mask,
     encode,
+    option_head_index,
     visible_counts,
 )
-from .engine import ACTION_TABLE, Decision, View, dora_from_index
+from .engine import Decision, View, dora_from_index
 from .fastshanten import shanten, ukeire_count, useful_tiles
 
 
@@ -481,18 +482,27 @@ class MLAgent(Agent):
         self.temperature = temperature
         self.counts: dict[str, int] = {}
 
-    def _head_to_option(self, decision: Decision, head: int) -> int:
+    def _head_to_option(self, decision: Decision, head: int) -> int | None:
+        """策略头下标 -> ``decision.options`` 下标；对不上返回 ``None``。
+
+        **不能找不到就返回 0**。以前这里 `return 0`，而 ``call`` / ``chi`` 的
+        选项表第一项是 ``"pass"`` —— 只要选项的写法有一点对不上（比如外部
+        引擎把「每一种吃法」作为独立选项传进来），网络选中的「吃」就会
+        静默变成「过」，表现正是「永远不鸣牌」，而且不报错、日志里也看不出来。
+
+        现在对不上就交给 :meth:`decide` 走兜底教师（教师按规则判断），
+        至少不会把「鸣」悄悄吞成「过」。
+        """
         if decision.kind == "discard":
             try:
                 return decision.options.index(head)
             except ValueError:
-                return 0
-        table = ACTION_TABLE[decision.kind]
-        want = table[head]
-        for i, o in enumerate(decision.options):
-            if str(o) == want:
-                return i
-        return 0
+                return None
+        return next(
+            (i for i, o in enumerate(decision.options)
+             if option_head_index(decision.kind, o) == head),
+            None,
+        )
 
     def decide(self, decision: Decision, view: View) -> int:
         kind = decision.kind
@@ -509,6 +519,11 @@ class MLAgent(Agent):
                 x, kind, mask[:size], self.rng, greedy=self.greedy, actfeat=actfeat
             )
         choice = self._head_to_option(decision, head)
+        if choice is None:
+            # 网络选中的动作在本次合法选项里不存在（选项写法/动作空间不一致）。
+            # 不记进 Tracker（那一手的头下标没法对应到选项），交给兜底教师。
+            self.counts[kind] = self.counts.get(kind, 0) + 1
+            return self.fallback.decide(decision, view)
         self.counts[kind] = self.counts.get(kind, 0) + 1
         if self.tracker is not None:
             self.tracker.record(
