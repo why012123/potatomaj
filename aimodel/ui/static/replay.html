@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>对局回放 · 土豆麻将 ELO</title>
+<style>
+  :root { --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#30363d;
+          --acc:#3fb950; --warn:#d29922; --bad:#f85149; --card:#161b22; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line);
+           display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; }
+  .dim { color:var(--dim); }
+  a { color:#58a6ff; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  main { padding:16px 18px; max-width:1100px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+          padding:12px 14px; margin-bottom:14px; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th,td { text-align:left; padding:5px 9px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; font-size:12px; }
+  .ok { color:var(--acc); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  .ctrl { display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+  button { background:#21262d; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:5px 12px; cursor:pointer; font-size:13px; }
+  button:hover { background:#30363d; }
+  button:disabled { opacity:.4; cursor:default; }
+  input[type=range] { flex:1; min-width:200px; }
+  #step { font-variant-numeric:tabular-nums; color:var(--dim); min-width:120px; }
+  #now { font-size:15px; padding:10px 12px; background:#0d1117;
+         border:1px solid var(--line); border-radius:6px; min-height:44px; }
+  #list { max-height:340px; overflow:auto; font-variant-numeric:tabular-nums; }
+  #list div { padding:2px 6px; border-radius:4px; }
+  #list div.cur { background:#1f6feb33; outline:1px solid #1f6feb; }
+  .tile { display:inline-block; min-width:30px; text-align:center; padding:1px 5px;
+          border:1px solid var(--line); border-radius:4px; background:#21262d; margin:0 1px; }
+  .p0{color:#f0883e} .p1{color:#58a6ff} .p2{color:#3fb950} .p3{color:#db61a2}
+</style>
+</head>
+<body>
+<header>
+  <h1>🀄 对局回放</h1>
+  <span id="meta" class="dim">载入中…</span>
+  <span style="flex:1"></span>
+  <a href="/">← 回到天梯</a>
+</header>
+
+<main>
+  <div class="card" id="summary">载入中…</div>
+
+  <div class="card">
+    <div class="ctrl">
+      <button id="first" title="第一步">⏮</button>
+      <button id="prev"  title="上一步">◀</button>
+      <button id="play"  title="自动播放">▶ 播放</button>
+      <button id="next"  title="下一步">▶</button>
+      <button id="last"  title="最后一步">⏭</button>
+      <input id="seek" type="range" min="0" max="0" value="0">
+      <span id="step"></span>
+    </div>
+    <div id="now" class="dim">—</div>
+  </div>
+
+  <div class="card">
+    <div class="dim" style="margin-bottom:6px">全部动作（点击跳转）</div>
+    <div id="list"></div>
+  </div>
+</main>
+
+<script>
+const TILES = "1m2m3m4m5m6m7m8m9m1p2p3p4p5p6p7p8p9p1s2s3s4s5s6s7s8s9s1z2z3z4z5z6z7z"
+  .match(/../g);
+const WINDS = { 27:"东", 28:"南", 29:"西", 30:"北" };
+const CALLS = { chi:"吃", pon:"碰", kan:"杠", ankan:"暗杠", kakan:"加杠" };
+
+const $ = id => document.getElementById(id);
+let ACTIONS = [], GROUPS = [], cur = 0, timer = 0;
+
+function tileName(t) {
+  if (typeof t !== "number" || t < 0 || t > 33) return String(t);
+  return TILES[t] || (t + "?");
+}
+function pname(p) {
+  const g = GROUPS[p];
+  return g ? g.replace(/#\d+$/, "") + (g.match(/#\d+$/) || [""])[0] : ("座位" + p);
+}
+function pspan(p) { return `<b class="p${p % 4}">${pname(p)}</b>`; }
+
+function describe(a) {
+  switch (a.kind) {
+    case "start_hand":
+      return `—— 第 <b>${a.hand_no}</b> 局开始 · 庄家 ${pspan(a.dealer)} · `
+        + `自风 ${WINDS[a.round_wind] || a.round_wind} · 宝牌指示 `
+        + (a.dora || []).map(d => `<span class="tile">${tileName(d)}</span>`).join(" ")
+        + ` · 点数 ${(a.scores || []).join(" / ")}`;
+    case "draw":
+      return `${pspan(a.player)} 摸 <span class="tile">${tileName(a.tile)}</span>`
+        + (a.red ? " <span class='warn'>赤</span>" : "")
+        + (a.rinshan ? "（岭上）" : "");
+    case "discard":
+      return `${pspan(a.player)} 打 <span class="tile">${tileName(a.tile)}</span>`
+        + (a.tsumogiri ? " <span class='dim'>摸切</span>" : " <span class='dim'>手切</span>")
+        + (a.riichi ? " <b class='bad'>立直！</b>" : "");
+    case "call": {
+      const c = CALLS[a.call] || a.call;
+      return `${pspan(a.player)} <b>${c}</b> <span class="tile">${tileName(a.tile)}</span>`
+        + (a.from_player !== undefined && a.from_player !== null && a.from_player >= 0
+            ? `（来自 ${pspan(a.from_player)}）` : "")
+        + (a.consumed && a.consumed.length
+            ? " 用 " + a.consumed.map(t => `<span class="tile">${tileName(t)}</span>`).join(" ") : "");
+    }
+    case "win":
+      return `<b class="ok">${pspan(a.winner)} ${a.tsumo ? "自摸" : "荣和"}！</b> `
+        + `<span class="tile">${tileName(a.tile)}</span>`
+        + (!a.tsumo && a.loser !== undefined && a.loser !== null && a.loser >= 0
+            ? ` <span class="bad">（${pspan(a.loser)} 放铳）</span>` : "");
+    case "ryukyoku":
+      return `<b class="warn">流局</b> · 听牌：`
+        + (a.tenpai || []).map((t, i) => `${pspan(i)}${t ? "✓" : "✗"}`).join(" ")
+        + ` · 点数变动 ${(a.deltas || []).join(" / ")}`;
+    default:
+      return `<span class="dim">${a.kind}</span> ${JSON.stringify(a).slice(0, 120)}`;
+  }
+}
+
+function render(force) {
+  const a = ACTIONS[cur];
+  $("now").innerHTML = a ? `<span class="dim">#${cur + 1}</span> ${describe(a)}` : "—";
+  $("step").textContent = `${cur + 1} / ${ACTIONS.length}`;
+  $("seek").value = cur;
+  const list = $("list");
+  [...list.children].forEach((d, i) => d.classList.toggle("cur", i === cur));
+  const el = list.children[cur];
+  if (el) el.scrollIntoView({ block: "nearest" });
+  $("prev").disabled = $("first").disabled = cur <= 0;
+  $("next").disabled = $("last").disabled = cur >= ACTIONS.length - 1;
+}
+
+function goto(i) {
+  cur = Math.max(0, Math.min(ACTIONS.length - 1, i));
+  render();
+}
+function stopPlay() {
+  if (timer) { clearInterval(timer); timer = 0; $("play").textContent = "▶ 播放"; }
+}
+
+async function main() {
+  const q = new URLSearchParams(location.search);
+  const sid = q.get("season") || "";
+  const idx = parseInt(q.get("index") || "0", 10);
+  $("meta").textContent = `${sid} · 第 ${idx} 局`;
+  if (!sid) { $("summary").innerHTML = '<span class="bad">地址里缺 season 参数</span>'; return; }
+
+  let d;
+  try {
+    d = await (await fetch(`/api/elo/replay?season=${encodeURIComponent(sid)}&index=${idx}`)).json();
+  } catch (e) {
+    $("summary").innerHTML = `<span class="bad">请求失败：${e}</span>`; return;
+  }
+  if (!d.ok) { $("summary").innerHTML = `<span class="bad">${d.error || "回放失败"}</span>`; return; }
+
+  ACTIONS = d.actions || [];
+  GROUPS = d.group || [];
+  const A = d.archived || {}, R = d.replayed || {};
+  const same = d.match === true;
+  $("summary").innerHTML = `
+    <div style="display:flex;gap:20px;flex-wrap:wrap">
+      <div><span class="dim">种子</span> <b>${d.seed}</b></div>
+      <div><span class="dim">人数</span> <b>${d.players}</b></div>
+      <div><span class="dim">动作</span> <b>${ACTIONS.length}</b></div>
+      <div><span class="dim">复现</span>
+        ${same ? '<b class="ok">✅ 与存档逐项一致</b>' : '<b class="bad">✗ 与存档不一致（复现性坏了）</b>'}</div>
+    </div>
+    <table style="margin-top:10px">
+      <tr><th>座位</th><th>参战者</th><th>名次</th><th>点数</th></tr>
+      ${GROUPS.map((g, i) => `<tr>
+          <td>${i}</td><td>${pspan(i)}</td>
+          <td>${(A.ranks || [])[i] !== undefined ? (A.ranks[i] + 1) + " 位" : "?"}</td>
+          <td>${(A.scores || [])[i] !== undefined ? A.scores[i] : "?"}</td></tr>`).join("")}
+    </table>
+    ${same ? "" : `<div class="bad" style="margin-top:8px">
+        存档名次 ${JSON.stringify(A.ranks)} ｜ 重跑名次 ${JSON.stringify(R.ranks)}</div>`}`;
+
+  const list = $("list");
+  list.innerHTML = "";
+  ACTIONS.forEach((a, i) => {
+    const div = document.createElement("div");
+    div.innerHTML = `<span class="dim">${String(i + 1).padStart(3, " ")}</span> ${describe(a)}`;
+    div.onclick = () => { stopPlay(); goto(i); };
+    list.appendChild(div);
+  });
+
+  $("seek").max = Math.max(0, ACTIONS.length - 1);
+  $("first").onclick = () => { stopPlay(); goto(0); };
+  $("prev").onclick  = () => { stopPlay(); goto(cur - 1); };
+  $("next").onclick  = () => { stopPlay(); goto(cur + 1); };
+  $("last").onclick  = () => { stopPlay(); goto(ACTIONS.length - 1); };
+  $("seek").oninput  = e => { stopPlay(); goto(+e.target.value); };
+  $("play").onclick  = () => {
+    if (timer) { stopPlay(); return; }
+    $("play").textContent = "⏸ 暂停";
+    timer = setInterval(() => {
+      if (cur >= ACTIONS.length - 1) { stopPlay(); return; }
+      goto(cur + 1);
+    }, 420);
+  };
+  document.addEventListener("keydown", e => {
+    if (e.key === "ArrowLeft")  { stopPlay(); goto(cur - 1); }
+    if (e.key === "ArrowRight") { stopPlay(); goto(cur + 1); }
+    if (e.key === " ") { e.preventDefault(); $("play").click(); }
+  });
+  goto(0);
+}
+main();
+</script>
+</body>
+</html>

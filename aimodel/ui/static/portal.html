@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>土豆麻将 · ELO 天梯</title>
+<style>
+  :root { --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#30363d;
+          --acc:#3fb950; --card:#161b22; --hi:#1f6feb; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; background:var(--bg); color:var(--fg);
+         font:15px/1.65 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  h1 { font-size:30px; margin:0 0 6px; letter-spacing:.5px; }
+  .sub { color:var(--dim); margin-bottom:34px; font-size:14px; }
+  .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(250px,1fr));
+          width:min(880px,92vw); }
+  a.card { display:block; background:var(--card); border:1px solid var(--line);
+           border-radius:12px; padding:22px 24px; color:var(--fg); text-decoration:none;
+           transition:border-color .15s, transform .15s; }
+  a.card:hover { border-color:var(--hi); transform:translateY(-2px); }
+  a.card h2 { margin:0 0 8px; font-size:19px; }
+  a.card p { margin:0; color:var(--dim); font-size:13px; line-height:1.7; }
+  .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px;
+         background:#21262d; color:var(--dim); margin-left:8px; vertical-align:middle; }
+  .tag.auto { background:#1f6feb33; color:#79c0ff; }
+  footer { margin-top:38px; color:var(--dim); font-size:12px; text-align:center; line-height:1.9; }
+  footer a { color:#58a6ff; text-decoration:none; }
+</style>
+</head>
+<body>
+  <h1>🀄 土豆麻将 · ELO 天梯</h1>
+  <div class="sub">让不同模型互相打，打出段位分</div>
+
+  <div class="grid">
+    <a class="card" href="/official">
+      <h2>🏆 官方<span class="tag auto">自动</span></h2>
+      <p>四麻。每天 <b>08 / 11 / 14 / 17 / 20</b> 点各一期，每期 4000 局。<br>
+         可查看当期进度、历史各期结果与对局回放。</p>
+    </a>
+    <a class="card" href="/arena">
+      <h2>🀄 四麻<span class="tag">手动</span></h2>
+      <p>自己填场次、随时开跑。和官方用同一套 ELO 规则，
+         但分数独立（不影响官方榜）。</p>
+    </a>
+    <a class="card" id="link3" href="/arena">
+      <h2>🎴 三麻<span class="tag">手动</span></h2>
+      <p>三麻池。自己填场次、随时开跑。</p>
+    </a>
+  </div>
+
+  <footer>
+    <div id="stat">正在读取…</div>
+    <div style="margin-top:6px">
+      <a href="/replay">回放</a> ·
+      <a href="/api/elo/seasons">期次数据 (JSON)</a> ·
+      <a href="/api/arena">当前池子 (JSON)</a>
+    </div>
+  </footer>
+
+<script>
+// 三麻是**另一个进程**（Arena 的 players 是构造参数，一个进程只能是一种 ✓）
+// 所以门户里把三麻链接指到 3p 端口；同机另一个端口浏览器能直接访问 ✓
+// 若那个端口没起，点进去会失败 —— 所以这里先探一下，探不到就把卡片灰掉 ✓
+const PORT_3P = 8965;
+
+async function probe3p() {
+  const card = document.getElementById("link3");
+  try {
+    const r = await fetch(`http://${location.hostname}:${PORT_3P}/api/arena`,
+                          { mode: "cors", cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    card.href = `http://${location.hostname}:${PORT_3P}/arena`;
+  } catch (e) {
+    card.style.opacity = ".45";
+    card.style.pointerEvents = "none";
+    card.querySelector("p").innerHTML +=
+      `<br><span style="color:#d29922">（三麻服务未启动：端口 ${PORT_3P}）</span>`;
+  }
+}
+
+async function loadStat() {
+  const el = document.getElementById("stat");
+  try {
+    const d = await (await fetch("/api/elo/seasons")).json();
+    const st = d.stats || {};
+    const n = (d.seasons || []).length;
+    el.innerHTML = `已存档 <b>${n}</b> 期 · 回放数据 <b>${st.replay_human || "0 B"}</b>`
+      + ` · 每局约 <b>${st.per_match_bytes || 0}</b> B`
+      + ` · 配额 ${st.quota_human || "100 GB"} 已用 <b>${(st.used_pct || 0).toFixed(4)}%</b>`;
+  } catch (e) {
+    el.textContent = "读取期次失败：" + e;
+  }
+}
+probe3p();
+loadStat();
+</script>
+</body>
+</html>
