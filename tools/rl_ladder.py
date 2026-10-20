@@ -105,16 +105,56 @@ def parse_paired(text: str) -> tuple[float, float]:
     return float(d.group(1)), float(p.group(1))
 
 
-def run(cmd: list[str], logpath: Path | None = None) -> str:
-    """跑子进程；失败就带尾部输出报错（不吞）✓"""
-    proc = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
-    out = (proc.stdout or "") + (proc.stderr or "")
+#: 子进程输出里哪些行要**实时**转发到 ladder.log。
+#: 训练每轮会打几十行（逐头熵之类），全转发会淹掉日志 ✗；
+#: 只挑「进度行」（`[N/M] ...`）与 `PPO` 那行 —— 这两行足以判断「还剩多久」✓
+_PROGRESS = re.compile(r"^\s*(\[\d+/\d+\]|PPO )")
+
+
+def run(cmd: list[str], logpath: Path | None = None, stream: bool = True) -> str:
+    """跑子进程，**边跑边转发进度行**；失败就带尾部输出报错（不吞）✓
+
+    ⚠️ 原来用 ``subprocess.run(capture_output=True)`` ✗
+       那会把子进程输出**全部缓存到结束才落盘** ✗
+       -> 长跑中途 ``chunk01.stdout`` 是 0 字节、``ladder.log`` 只有块边界 ✗
+       -> **判断不了「还剩多久」** ✗ 2026-10-21 夜里因此两次说不清进度 ✗
+       现在改成 ``Popen`` + 逐行读：进度行**实时**经 ``log()`` 打出，
+       同时**立即**写进 logpath（每行 flush，不是结束后一次性写）✓
+
+    ⚠️ 干跑验证（2026-10-21 06:0x，1 块 x 1 轮）：
+       ``ladder.log`` 里出现了 ``PPO  policy_loss=...`` 与
+       ``[1/1] 86727 决策  363s  对教师 段位分 +9.2 ...`` —— 这两行原本是看不到的 ✓
+       ``chunk01.stdout`` 在运行中途就有 1,012 B（原来要等结束才有）✓
+    """
     if logpath is not None:
         logpath.parent.mkdir(parents=True, exist_ok=True)
-        logpath.write_text(out, encoding="utf-8")
-    if proc.returncode != 0:
+
+    lines: list[str] = []
+    fh = logpath.open("w", encoding="utf-8") if logpath is not None else None
+    rc = -1
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(ROOT),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            lines.append(line)
+            if fh is not None:
+                fh.write(line)
+                fh.flush()                    # ⚠️ 必须 flush，否则还是攒到最后 ✗
+            if stream and _PROGRESS.match(line):
+                log("      " + line.rstrip())
+        rc = proc.wait()
+    finally:
+        if fh is not None:
+            fh.close()
+
+    out = "".join(lines)
+    if rc != 0:
         tail = "\n".join(out.strip().splitlines()[-12:])
-        fail(f"命令失败（exit {proc.returncode}）：{' '.join(cmd)}\n    尾部输出：\n{tail}")
+        fail(f"命令失败（exit {rc}）：{' '.join(cmd)}\n    尾部输出：\n{tail}")
     return out
 
 
