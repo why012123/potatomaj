@@ -124,7 +124,12 @@ def main() -> int:
     check("② 未收藏的期：pruned=True", a0.pruned is True, str(a0.pruned))
     check("② 未收藏的期：回放数据被删",
           not (a0.dir / "matches.jsonl").exists(), "")
-    check("② 未收藏的期：**留住了冠军名**", a0.champion == "甲", repr(a0.champion))
+    # ⚠️ 冠军口径在 2026-10-20 被用户改过：从「单实例第一」改成「**模型均分第一**」✓
+    #    所以这里断言的是**模型名**（"a"）而不是显示名（"甲"）✗
+    #    这是**需求变了**跟着改 ✓ 不是「为了让测试通过而改断言」✗
+    check("② 未收藏的期：**留住了冠军模型名**（按均分口径 ✓）",
+          a0.champion == "a", repr(a0.champion))
+    check("② 未收藏的期：均分也留住了", a0.champion_avg > 0, str(a0.champion_avg))
     check("③ 已收藏的期：pruned=False", a1.pruned is False, str(a1.pruned))
     check("③ 已收藏的期：**回放数据完整保留**",
           (a1.dir / "matches.jsonl").exists(), "")
@@ -135,6 +140,23 @@ def main() -> int:
     # 再清理一次：已精简的不应重复处理 ✓
     gone2 = E.prune(keep_days=3, now=now)
     check("⑤ 重复清理不会重复动（幂等 ✓）", gone2 == [], str(gone2))
+
+    # ---- ⑤b 冠军口径：均分第一 != 单实例第一 ---------------------------
+    print("\\n⑤b 冠军口径（按模型均分）")
+    demo = [
+        {"名": "A #3", "模型": "A", "分数": 900.0},
+        {"名": "B #1", "模型": "B", "分数": 800.0},
+        {"名": "B #2", "模型": "B", "分数": 790.0},
+        {"名": "A #1", "模型": "A", "分数": 600.0},
+        {"名": "A #2", "模型": "A", "分数": 580.0},
+        {"名": "B #3", "模型": "B", "分数": 780.0},
+    ]
+    m, avg, inst, isc = E.champion_by_model(demo)
+    check("单实例第一是 A #3（900）", inst == "A #3" and isc == 900.0, f"{inst} {isc}")
+    check("**冠军按均分是 B**（790 vs 693.3）", m == "B", f"{m} {avg}")
+    check("冠军均分 = 790.0", abs(avg - 790.0) < 0.05, str(avg))
+    m2, a2, _, _ = E.champion_by_model([])
+    check("空表不炸", (m2, a2) == ("", 0.0), f"{m2} {a2}")
 
     # ---- ⑥ 配额统计的分母 -------------------------------
     print("\n⑥ 配额统计")
