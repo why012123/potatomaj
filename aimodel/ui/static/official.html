@@ -87,7 +87,10 @@
   <div class="card" id="detail">
     <div class="row" style="justify-content:space-between">
       <h2 id="dTitle" style="margin:0">—</h2>
-      <button id="dClose">关闭</button>
+      <div>
+        <button id="dFav">☆ 收藏</button>
+        <button id="dClose">关闭</button>
+      </div>
     </div>
     <div id="dBody" style="margin-top:10px"></div>
   </div>
@@ -165,12 +168,14 @@ async function loadHist() {
 }
 
 async function showSeason(sid) {
+  CUR_SID = sid;
   $("detail").style.display = "block";
   $("dTitle").textContent = sid;
   $("dBody").innerHTML = '<span class="dim">读取中…</span>';
   const d = await (await fetch(`/api/elo/season?id=${encodeURIComponent(sid)}`)).json();
   if (!d.ok) { $("dBody").innerHTML = `<span style="color:#f85149">${d.error}</span>`; return; }
   const s = d.season, sc = d.scores || {};
+  setFavButton(!!s.favorite);
   const rows = (sc.table || []).slice(0, 40);
   let html = `<div class="row dim" style="margin-bottom:8px">
       场次 ${s.done} · ${s.players} 麻 · 收藏 ${s.favorite ? "是" : "否"}` +
@@ -204,6 +209,29 @@ async function showSeason(sid) {
 
 $("dClose").onclick = () => { $("detail").style.display = "none"; };
 $("btnRefresh").onclick = () => refresh();
+
+// 收藏：只有管理员能改（服务端要 MAJ_ELO_ADMIN_KEY 环境变量 ✓ 没设就 403 并说明 ✓）
+// 口令只用在**这一次请求**里，不落 localStorage ✓（这是本机管理动作，不是用户登录 ✓）
+let CUR_SID = "";
+$("dFav").onclick = async () => {
+  const key = prompt("管理员口令（服务端环境变量 MAJ_ELO_ADMIN_KEY 的值）：");
+  if (!key) return;
+  const wantFav = !($("dFav").textContent || "").includes("取消");
+  try {
+    const r = await fetch("/api/elo/favorite", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid: CUR_SID, key, favorite: wantFav }),
+    });
+    const d = await r.json();
+    if (!d.ok) { alert("失败：" + (d.error || ("HTTP " + r.status))); return; }
+    setFavButton(d.favorite);
+    await loadHist();
+  } catch (e) { alert("请求失败：" + e); }
+};
+function setFavButton(fav) {
+  $("dFav").textContent = fav ? "★ 取消收藏" : "☆ 收藏";
+  $("dFav").style.color = fav ? "#d29922" : "";
+}
 
 async function refresh() {
   await loadSchedule();

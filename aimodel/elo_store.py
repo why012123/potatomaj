@@ -256,11 +256,16 @@ def replay(match: dict, *, on_action: Callable[[dict], None] | None = None):
 def _kind_and_source(name: str) -> tuple[str, str]:
     """把参战者名解析成 ``(kind, 权重来源)``。
 
-    ``teacher`` / ``random`` 是内置基线 ✓ 其余当模型 ✓
+    ⚠️ 基线参战者的 key 是 ``teacher4#1`` / ``random4#1`` ✗ —— **带人数后缀** ✗
+       （由 ``arena.loose_participants`` 生成 ✓）
+       所以必须按**前缀**判 ✓ 只匹配精确的 ``teacher`` / ``random`` 会漏掉全部基线 ✗
+       —— 这个 bug 是 ``test_elo_store.py`` 抓出来的 ✓ 代价是含基线的对局一律回放不了 ✗
     """
     low = name.lower()
-    if low in ("teacher", "random"):
-        return low, ""
+    if low.startswith("teacher"):
+        return "teacher", ""
+    if low.startswith("random"):
+        return "random", ""
     return "model", name
 
 
