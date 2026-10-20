@@ -21,7 +21,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from aimodel import elo_store as E
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from aimodel import elo_store as E  # noqa: E402
 
 
 PASS = 0

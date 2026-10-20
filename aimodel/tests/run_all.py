@@ -13,6 +13,11 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+#: `aimodel/` 根 —— 发现测试时要**递归到子目录** ✓
+#: 2026-10-20 的教训：原来只 `HERE.glob("test_*.py")` 不递归 ✗
+#: -> 放在 `aimodel/ui/` 下的三个测试**从来没被跑过** ✗
+#:    而套件照样报「25 个文件全部通过」✗ —— 又一次「测试通过 != 测试没跑」✗
+AIMODEL = HERE.parent
 #: 登记表只用来写「这个测试是干什么的」，**不再决定跑哪些** ✗
 #:
 #: 之前这里是硬编码列表，只有列进来的才会跑 ✓ 后果：新增一个 test_*.py
@@ -45,9 +50,20 @@ SKIP: set[str] = set()
 
 
 def discover() -> list[str]:
-    """**自动发现**所有 `test_*.py` —— 新增测试不会再被静默漏掉 ✓"""
-    found = sorted(p.name for p in HERE.glob("test_*.py") if p.name not in SKIP)
-    unknown = [n for n in found if n not in DOCS]
+    """**自动发现**所有 ``test_*.py`` —— 新增测试不会再被静默漏掉。
+
+    ⚠️ **必须递归**到子目录，不能只扫 ``HERE``：
+       2026-10-20 的教训 —— 原来只 ``HERE.glob("test_*.py")``（不递归），
+       而放在 ``aimodel/ui/`` 下的三个测试（elo_store / elo_schedule / chi_options）
+       **从来没被跑过**，套件却照样报「25 个文件全部通过」。
+       又一次「测试通过」≠「测试没跑」。
+    """
+    found = sorted(
+        p.relative_to(AIMODEL).as_posix()
+        for p in AIMODEL.rglob("test_*.py")
+        if "__pycache__" not in p.parts and p.name not in SKIP
+    )
+    unknown = [n for n in found if Path(n).name not in DOCS]
     if unknown:
         print("⚠️ 这些测试还没有说明（不影响运行，但请补进 DOCS）：")
         for n in unknown:
@@ -62,9 +78,9 @@ TESTS = discover()
 def main() -> int:
     failed: list[str] = []
     for name in TESTS:
-        path = HERE / name
+        path = AIMODEL / name
         print("=" * 68)
-        print(f"▶ {name}" + (f"  —— {DOCS[name]}" if name in DOCS else ""))
+        print(f"▶ {name}" + (f"  —— {DOCS[Path(name).name]}" if Path(name).name in DOCS else ""))
         print("=" * 68)
         r = subprocess.run([sys.executable, str(path)])
         if r.returncode != 0:
