@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .encode import ACTION_DIM, DIM, HEAD_SIZE
+from .encode import ACTION_DIM, DIM, HEAD_SIZE, layout_for
 
 #: 打牌用的动作塔宽度（每张候选牌先变成一个分数，再加到打牌头的 logit 上）
 ACTION_HIDDEN = 32
@@ -38,6 +38,14 @@ KINDS: tuple[str, ...] = (
 _NEW_HEADS: dict[str, str] = {
     "chi": "四麻的「吃」头（老版本完全没记录过 chi，见 P0-2）",
 }
+
+#: 特征维度 -> 人数 ✓ 用来判「某个缺失的决策头在这个人数下**根本不可达**吗」✗
+#: 与 ``train.build_net`` 同一个来源（``encode.layout_for``）✓
+#: —— 不在这里另写 486/560 常数 ✗（写死就会和布局定义各走一条路 ✓）
+_DIM_TO_PLAYERS: dict[int, int] = {layout_for(3)[1]: 3, layout_for(4)[1]: 4}
+
+#: **只有四麻才有**的动作头 ✓ —— 三麻的规则里没有「吃」✗
+_FOUR_ONLY_HEADS: frozenset[str] = frozenset({"chi"})
 
 
 class Net:
@@ -563,7 +571,23 @@ class Net:
         #     四麻继续用兜底规则吃牌，跟以前一样）；
         #   · 重训之后的权重里有这个头，就不再是 untrained，正常使用。
         saved_kinds = list(meta.get("kinds", ()))
-        added = [k for k in KINDS if k not in saved_kinds]
+        added_all = [k for k in KINDS if k not in saved_kinds]
+        # ⚠️ 「缺头」必须**分两种**，混在一起会天天误报 ✗：
+        #
+        #   ① **可达**的头缺了  -> 真是缺陷 ✓ 必须报 ✓（原有行为，不变 ✓）
+        #   ② **不可达**的头缺了 -> **不是缺陷** ✓ 例如三麻规则里没有「吃」✗
+        #
+        # 为什么必须分开（实测）✗：
+        #   三麻权重一律只有 8 个头 ✓ 若把 chi 也算成「缺头」✓ 那么：
+        #     · **每次**加载三麻权重都报一次「已零初始化、走启发式兜底」✗
+        #     · ``missing_heads`` 变成 ``('chi',)`` ✗
+        #       -> 平台把它显示成「**这个模型坏了**」✗（23 个三麻权重全中 ✗）
+        #   -> 用户看到一个**根本不存在的问题** ✓ 而真正的缺头反而被淹没 ✗
+        #
+        # 判据用**人数**（由特征维度反推 ✓ 与 ``layout_for`` 同源 ✓）
+        _players = _DIM_TO_PLAYERS.get(int(meta.get("dim", DIM)), 4)
+        _unreachable = _FOUR_ONLY_HEADS if _players == 3 else frozenset()
+        added = [k for k in added_all if k not in _unreachable]
         if added and strict:
             why = "；".join(f"{k}: {_NEW_HEADS[k]}" for k in added if k in _NEW_HEADS)
             raise ValueError(
@@ -606,7 +630,10 @@ class Net:
                 missing.append(name)
         # 补上的新头必须**显式清零** —— 留着随机初始化的话，万一哪天被走到，
         # 输出就是噪声（这正是当初写那句报错要防的事）。
-        for k in added:
+        # ⚠️ 这里用 `added_all`（**含不可达的头**）✗
+        #    它们不进 `params()`、也不进 `net.kinds` ✓ 所以平时完全参与不到计算 ✓
+        #    但万一哪天被走到 ✓ 随机权重就是噪声 ✗ -> 一律清零最安全 ✓
+        for k in added_all:
             if k in net.Wp:
                 net.Wp[k][...] = 0.0
                 net.bp[k][...] = 0.0

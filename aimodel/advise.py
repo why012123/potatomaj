@@ -12,7 +12,10 @@
     python -m aimodel.advise --json 识别结果.json
 
     # 手写牌型（不依赖截图，方便试）
-    python -m aimodel.advise --hand "1m 2p 3p 8p 8p 9p 0s 6s 6s 8s 1z 6z 6z"
+    # ⚠️ 要 **14 张**才出「打哪张」的建议 ✓
+    #    13 张是**等摸牌**的形态 ✗ 那种局面给不出弃牌建议 ✓ 只会列进张 ✓
+    #    （我用 13 张当例子试过 ✓ 结果只打印牌效、一条建议都没有 ✓ 已改成 14 张 ✓）
+    python -m aimodel.advise --hand "1m 1m 2p 3p 8p 8p 9p 0s 6s 6s 8s 1z 6z 6z"
 
 说明：截图里读不到的场况（点数、巡目、谁立直了）只能按默认值假设，
 所以建议只当作「牌效参考」，不能代替读牌。
@@ -173,6 +176,14 @@ def report(view: View, net: Net | None, unknown: int = 0) -> str:
         ups = ukeire(view.hand, _visible(view), n_melds)
         wait = "".join(f"{S.tile_cn(t)}×{c} " for t, c in sorted(ups.items()))
         lines.append(f"向听 {sh}" + (f"，进张 {wait}" if ups else ""))
+        # ⚠️ 这里原来**什么都不说** ✗ -> 用户拿着 13 张试 ✓ 只看到牌效 ✓
+        #    会以为「建议功能没做」✗（我自己就这么误会了一次 ✓ 见模块 docstring）
+        #    -> 明确告诉他这是等摸牌的形态 ✓ 以及要怎么看建议 ✓
+        if n < 14:
+            lines.append(
+                f"（{n} 张 = 等摸牌的形态，没有「打哪张」可建议；"
+                f"想看出牌建议请给 14 张）"
+            )
     return "\n".join(lines)
 
 
