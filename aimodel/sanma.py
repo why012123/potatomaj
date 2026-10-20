@@ -692,7 +692,14 @@ def _score_normal_one(
     if not ctx.is_tsumo and any(k == "tri" and t == win for k, t in shape_melds):
         concealed_tri -= 1
 
-    seqs = [t for k, t in shape_melds if k == "seq"]
+    # ⚠️ 顺子必须从 **shapes**（暗牌 + 副露）里数，不能只看 shape_melds（暗牌）✗
+    # 原来写成 shape_melds，导致**「吃」副露被当成刻子** ✗：
+    #   n_seq 少算一个 -> n_tri = len(shapes) - n_seq 多算一个
+    #   -> 任何**有吃**的手都会被判成「四组全是刻子」-> 白送 対々和(2 番) ✗
+    # 实测（2026-10-21，用户截图那手）：碰白+碰發+吃345m+111p+55s 荣1p
+    #   改前 4 番 40 符，役 = toitoi + 白 + 發（顺子手被判対々和 ✗）
+    # 同一个 seqs 还被三色同顺 / 一气通贯 / 混老头分支用 ✓ 一处错会连累多个役 ✗
+    seqs = [t for k, t in shapes if k == "seq"]
     n_seq = len(seqs)
     n_tri = len(shapes) - n_seq
 
