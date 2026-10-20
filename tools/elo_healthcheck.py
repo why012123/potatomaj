@@ -66,21 +66,37 @@ def _get(url: str, timeout: float = 20.0) -> tuple[int, bytes]:
         raise RuntimeError(f"{type(e).__name__}: {e}") from e
 
 
-def check_public() -> dict:
-    """公网入口必须 200，且模型数对得上。"""
-    out = {"name": "public", "ok": False, "detail": ""}
-    try:
-        st, body = _get(f"{PUBLIC}/api/models")
-        if st != 200:
-            out["detail"] = f"/api/models -> HTTP {st}"
-            return out
-        d = json.loads(body)
-        ms = d.get("models") or []
-        out["models"] = len(ms)
-        out["detail"] = f"HTTP 200, {len(ms)} 个模型"
-        out["ok"] = len(ms) > 0
-    except Exception as e:                       # noqa: BLE001
-        out["detail"] = str(e)
+def check_public(retries: int = 3) -> dict:
+    """公网入口必须 200，且模型数对得上。
+
+    ⚠️ **要重试** ✗ —— 2026-10-20 实测：一次 TimeoutError 之后连拉三次全成功
+       （2.7s / 1.6s / 6.7s）-> 那条单次超时是**瞬时抖动**，不是故障。
+       把抖动报成故障，会让人开始忽略这个检查 —— 那才是最坏的结果。
+    -> 三次全失败才判红；中间成功一次即可（并写明第几次才成 ✓）
+    """
+    out = {"name": "public", "ok": False, "detail": "", "tries": []}
+    last = ""
+    for i in range(retries):
+        try:
+            st, body = _get(f"{PUBLIC}/api/models")
+            if st != 200:
+                last = f"/api/models -> HTTP {st}"
+                out["tries"].append(last)
+                continue
+            ms = json.loads(body).get("models") or []
+            out["tries"].append(f"HTTP 200, {len(ms)} 个模型")
+            if ms:
+                out["models"] = len(ms)
+                out["ok"] = True
+                out["detail"] = (f"HTTP 200, {len(ms)} 个模型"
+                                 + ("" if i == 0
+                                    else f"（第 {i + 1} 次才成，前 {i} 次失败）"))
+                return out
+            last = "模型数为 0"
+        except Exception as e:                   # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+            out["tries"].append(last)
+    out["detail"] = f"{retries} 次都失败：{last}"
     return out
 
 
