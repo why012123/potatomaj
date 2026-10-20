@@ -17,10 +17,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import sys
 import time
 
-from . import elo_schedule as S
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from aimodel.ui import elo_schedule as S  # noqa: E402
 
 
 def _at(day: str, hh: int, mm: int) -> float:
