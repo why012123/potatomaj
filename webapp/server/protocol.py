@@ -68,6 +68,37 @@ OPTION_CN = {
     "chi": "吃",
 }
 
+#: ★ 光有上面那张表不够：`yes/no` 是**通用**选项字，拔北 / 立直 / 和了 都用它，
+#: 译成「要 / 不要」谁看得懂？（用户原话：「只显示 yes/no 干嘛？」）
+#: 所以按**决策类型**再给一层标签：同一个 "yes"，在拔北里是「拔北」，
+#: 在立直里是「立直」，在荣和里是「荣和」。
+OPTION_CN_BY_KIND = {
+    "kita": {"yes": "拔北", "no": "不拔"},
+    "riichi": {"yes": "立直", "no": "不立直"},
+    "ron": {"yes": "荣和", "no": "过"},
+    "tsumo": {"yes": "自摸", "no": "过"},
+    "kyuushu": {"yes": "九种九牌·流局", "no": "继续打"},
+    "kan": {"pass": "不杠", "kan": "杠", "yes": "杠", "no": "不杠"},
+    "call": {"pass": "过", "pon": "碰", "kan": "杠", "chi": "吃"},
+}
+
+
+def option_cn(kind: str, option: object) -> str:
+    """一个选项按钮上该写什么字（先按决策类型查，再退回通用表）。
+
+    吃的选项长这样：``chi:21:22``（引擎用**牌下标**编码「吞哪两张」）。
+    这里翻成「吃 4s5s」—— 手里 12345s 遇到 3s 时，按钮就能一眼分清是吃
+    12s 还是吃 45s（以前只有一个「吃」，等于引擎替玩家做了决定）。
+    """
+    key = str(option)
+    if key.startswith("chi:"):
+        try:
+            _, a, b = key.split(":")
+            return "吃 " + T.index_to_id(int(a)) + T.index_to_id(int(b))
+        except (ValueError, IndexError):
+            return "吃"
+    return (OPTION_CN_BY_KIND.get(kind) or {}).get(key) or OPTION_CN.get(key) or key
+
 WIND_CN = {27: "东", 28: "南", 29: "西", 30: "北"}
 ROUND_WIND_CN = {27: "东", 28: "南"}
 
@@ -131,6 +162,8 @@ def seat_view(
         "ai": info.get("ai"),
         "online": bool(info.get("online", True)),
         "host": bool(info.get("host")),
+        # 局间「已确认下一局」—— 客户端据此显示「还等谁确认」
+        "next_ack": bool(info.get("next_ack")),
         "score": game.scores[seat],
         "score_delta": game.scores[seat] - scores_before[seat],
         "hand_count": pl.hand_size,
@@ -169,21 +202,32 @@ def action_view(pending: Any, viewer: int, now: float) -> dict | None:
     """把一次待决策转成前端能用的按钮列表。
 
     不是自己的决策就给 ``null``（真人房）；观战者能看到内容但没按钮。
+
+    ``pending.deadline is None`` = **这一手不计时**（房里只有一个真人，
+    服务端会一直等）—— 这时把 ``deadline``/``ms_left`` 都给 null，
+    前端据此不画思考条、不显示倒计时。
     """
     if pending is None:
         return None
+    if pending.deadline is None:
+        clock = {"deadline": None, "ms_left": None, "no_timeout": True}
+    else:
+        clock = {
+            "deadline": round(pending.deadline, 3),
+            "ms_left": max(0, int((pending.deadline - now) * 1000)),
+        }
     if pending.seat != viewer:
         if viewer >= 0:
             return None
-        return {
+        base = {
             "kind": pending.kind,
             "seat": pending.seat,
             "kind_cn": KIND_CN.get(pending.kind, pending.kind),
             "options": [],
             "waiting": True,
-            "deadline": round(pending.deadline, 3),
-            "ms_left": max(0, int((pending.deadline - now) * 1000)),
         }
+        base.update(clock)
+        return base
 
     opts: list[dict] = []
     if pending.kind == "discard":
@@ -202,10 +246,10 @@ def action_view(pending: Any, viewer: int, now: float) -> dict | None:
             opts.append({
                 "index": i,
                 "label": str(o),
-                "cn": OPTION_CN.get(str(o), str(o)),
+                "cn": option_cn(pending.kind, o),
             })
 
-    return {
+    mine = {
         "kind": pending.kind,
         "seat": pending.seat,
         "kind_cn": KIND_CN.get(pending.kind, pending.kind),
@@ -213,11 +257,11 @@ def action_view(pending: Any, viewer: int, now: float) -> dict | None:
         "tile": T.index_to_id(int(pending.tile)) if pending.tile is not None else None,
         "tile_cn": T.tile_cn(int(pending.tile)) if pending.tile is not None else None,
         "waiting": False,
-        "deadline": round(pending.deadline, 3),
-        "ms_left": max(0, int((pending.deadline - now) * 1000)),
-        "timeout": round(pending.timeout, 1),
+        "timeout": None if pending.timeout is None else round(pending.timeout, 1),
         "fallback": pending.fallback,
     }
+    mine.update(clock)
+    return mine
 
 
 # ---------------------------------------------------------------------------
@@ -258,8 +302,6 @@ def hand_result_view(game: Game) -> dict | None:
     agaris = list(h.agaris or ((h.agari,) if h.agari else ()))
     for i, q in enumerate(winners):
         a = agaris[i] if i < len(agaris) else None
-        if a is None:
-            continue
         pl = game.players[q]
         win_tile = None
         # 引擎在 _mark_agari 里记了「和的是哪张」，回放 / 结算要标红它
@@ -267,22 +309,26 @@ def hand_result_view(game: Game) -> dict | None:
             win_tile = T.index_to_id(int(game.last_agari["tile"]))
         elif pl.drawn is not None and h.kind == "tsumo":
             win_tile = T.index_to_id(pl.drawn)
+        # ★ 这里**绝不能 continue**：这一手明明是荣和/自摸，只要 agari 明细缺一条
+        #   （双响、winners 与 agaris 长度对不上等），老代码就把整条跳过 ——
+        #   客户端拿到 agari=[] 就会把赢牌显示成「流局」（用户看到的那个 bug）。
+        #   明细缺了也要出一条：座位、手牌、和了牌都在，役种给空数组即可。
         base["agari"].append({
             "seat": q,
             "tsumo": h.kind == "tsumo",
             "hand": T.hand_list(pl.hand, pl.red),
             "melds": [T.meld_json(m, -1) for m in pl.melds],
             "win_tile": win_tile,
-            "yaku": [{"key": k, "name": S.YAKU_CN.get(k, k), "han": v}
-                     for k, v in a.yaku],
-            "dora": [{"key": k, "name": S.YAKU_CN.get(k, k), "han": v}
-                     for k, v in a.dora_detail.items() if v],
-            "han": a.han,
-            "dora_han": a.dora_han,
-            "total_han": a.total_han,
-            "fu": a.fu,
-            "yakuman": a.yakuman,
-            "describe": a.describe(),
+            "yaku": ([{"key": k, "name": S.YAKU_CN.get(k, k), "han": v}
+                      for k, v in a.yaku] if a is not None else []),
+            "dora": ([{"key": k, "name": S.YAKU_CN.get(k, k), "han": v}
+                      for k, v in a.dora_detail.items() if v] if a is not None else []),
+            "han": getattr(a, "han", 0),
+            "dora_han": getattr(a, "dora_han", 0),
+            "total_han": getattr(a, "total_han", 0),
+            "fu": getattr(a, "fu", 0),
+            "yakuman": bool(getattr(a, "yakuman", False)),
+            "describe": a.describe() if a is not None else "",
             "gain": h.deltas[q] if q < len(h.deltas) else 0,
         })
     return base
@@ -389,8 +435,13 @@ def build_state(
         return out
 
     out["round"] = {
-        "hand_no": len(game.hands) + (0 if phase in ("hand_end", "finished") else 1),
+        # ★ 「第几局」不能用累计手数：连庄也 +1，会打出「东五局」这种东西。
+        #   局数 = 庄家轮转次数 + 1（引擎的 `seat_rounds`，老引擎没有就退回手数），
+        #   连庄次数 = `honba`（本场）。
+        "hand_no": min(game.rounds, max(1, getattr(game, "seat_rounds", len(game.hands))
+                                       + (0 if phase in ("hand_end", "finished") else 1))),
         "hands_played": len(game.hands),
+        "honba": getattr(game, "honba", 0),
         "dealer": game.dealer,
         "round_wind": round_wind_cn(game.round_wind),
         "round_wind_idx": game.round_wind,

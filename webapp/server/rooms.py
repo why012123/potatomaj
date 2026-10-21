@@ -62,6 +62,8 @@ class RoomManager:
         host_uid: str,
         host_name: str,
         rounds: int = 0,
+        hanchan: bool = False,
+        team: dict | None = None,
         ai_delay: float | None = None,
         seats: Iterable[tuple[str, str]] | None = None,
         spectator_reveal: bool = True,
@@ -73,7 +75,8 @@ class RoomManager:
             room = Room(
                 rid, self.cfg, loop=self.loop, name=name or f"{host_name} 的牌桌",
                 players=players, host_uid=host_uid, host_name=host_name,
-                rounds=rounds, ai_delay=ai_delay, seats=seats,
+                rounds=rounds, hanchan=hanchan, team=team, ai_delay=ai_delay,
+                seats=seats,
                 spectator_reveal=spectator_reveal,
                 writer=self.writer, profiles=self.profiles,
             )
@@ -100,9 +103,16 @@ class RoomManager:
         out = []
         for r in rooms:
             try:
-                out.append(r.summary())
+                s = r.summary()
             except Exception:  # noqa: BLE001
                 log.exception("房间 %s 摘要生成失败", r.id)
+                continue
+            # ★ **打完的房间不再出现在大厅列表里**（用户要求）：
+            #   牌局结束（phase == "finished"）之后还挂着，列表只会越来越长；
+            #   房内的人不受影响 —— 他们手里有房间号，`/room/{id}` 照样能看结算。
+            if s.get("phase") == "finished":
+                continue
+            out.append(s)
         out.sort(key=lambda x: (-x["humans"], -x["conns"], x["created_at"]))
         return out
 
