@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -49,6 +50,11 @@ PHASE_LOBBY = "lobby"
 PHASE_PLAYING = "playing"
 PHASE_HAND_END = "hand_end"
 PHASE_FINISHED = "finished"
+
+#: 团体战四个角色轮次（每轮一个半庄，四队各出一人）
+TEAM_ROLES = ("先锋", "次锋", "副将", "大将")
+#: 团体战初始点数（用户定的 100000；普通局仍按规则里的 25000/35000）
+TEAM_START = 100000
 
 
 class RoomError(Exception):
@@ -110,6 +116,8 @@ class Conn:
     #: 等条件满足（真人退光了）再自动生效 —— 愿望和现状要分开存。
     reveal_want: bool = False
     spectator: bool = True
+    #: 局间「下一局」：观战者也要点确认（纯 AI 房靠这个放行）
+    next_ack: bool = False
     ws: Any = None
     uid: str = ""
     name: str = ""
@@ -133,6 +141,8 @@ class Room:
         host_uid: str = "",
         host_name: str = "房主",
         rounds: int = 0,
+        hanchan: bool = False,
+        team: dict | None = None,
         ai_delay: float | None = None,
         seats: Iterable[tuple[str, str]] | None = None,
         spectator_reveal: bool = True,
@@ -145,10 +155,28 @@ class Room:
         self.name = name or f"房间 {room_id}"
         self.players = 4 if players == 4 else 3
         self.rounds = rounds or self.players
+        # ★ 半荘（东 + 南）：引擎那边 `Rule.hanchan` 为真时东风打满无条件南入。
+        #   房间这一层只负责把开关传下去（见 engine.play 的注释）。
+        self.hanchan = bool(hanchan)
+        # ★ 团体战：4 队 × 4 角色，先锋→次锋→副将→大将各打一个半庄，
+        #   分数跨半场继承，不击飞、不中途流局。`team` = {teams: [...], roster: [...]}
+        self.team = team if isinstance(team, dict) else None
+        self.team_names = list((self.team or {}).get("teams") or
+                               [f"{i + 1} 队" for i in range(self.players)])
+        self.team_round = 0
+        self.team_lineup: list[dict] = []
+        self.team_round_scores: list[dict] = []
         self.ai_delay = cfg.ai_delay if ai_delay is None else ai_delay
         self.spectator_reveal = spectator_reveal
 
-        self.rule = S.rule_for(self.players)
+        self.rule = (dataclasses.replace(S.rule_for(self.players), hanchan=True)
+                     if self.hanchan else S.rule_for(self.players))
+        # ★ 团体战的起始点数要等 `self.rule` 有了才能取（这里以前写在 rule 之前，
+        #   启动即 AttributeError: 'Room' object has no attribute 'rule'）
+        #   团体战按 100000 起（用户规格），普通局按规则里的 25000/35000。
+        self.team_scores = [
+            TEAM_START if self.team else self.rule.start_score
+        ] * self.players
         self.phase = PHASE_LOBBY
         self.created_at = time.time()
         self.last_active = time.time()
@@ -176,6 +204,10 @@ class Room:
         self._hand_started = False
         #: 引擎报了「和了 / 流局」，等安全点去落盘
         self._pending_hand_end = False
+        #: 事件到达那一刻的**点数快照**（见 `_on_event` 里的注释）
+        self._hand_end_scores: list[int] = []
+        #: 快照时已经打完几手（= 那手在 `game.hands` 里的下标 + 1）
+        self._hand_end_index = 0
 
         self._stop = threading.Event()
         self._between_evt = threading.Event()
@@ -307,6 +339,10 @@ class Room:
         """按座位表造 agent（真人座位 / AI 座位）。"""
         seat_agents: list[Any] = []
         seed0 = abs(hash(self.id)) % 100000
+        # ★ 房里**只有一个真人**时不计时：等他等到天荒地老，也不让教师替他打。
+        #   多人房还是要计时 —— 一个人挂机不能把整桌卡死。
+        humans = sum(1 for s in self.seats if s is not None and s.kind == "human")
+        never_timeout = humans <= 1
         for i in range(self.players):
             s = self.seats[i]
             if s is None:
@@ -319,6 +355,7 @@ class Room:
                     on_pending=self._on_pending,
                     on_resolved=self._on_resolved,
                     recorder=self.recorder,
+                    never_timeout=never_timeout,
                 )
                 self.human_seats[i] = hs
                 seat_agents.append(hs)
@@ -355,7 +392,9 @@ class Room:
                     "uid": uid,
                     "name": s.name,
                     "kind": s.kind,
-                    "ai": s.ai,
+                    # 只有真的是 AI 才写模型名 —— 真人座位接过 AI 位之后
+                    # 那个字段要清掉，否则真人的决策会被标成某个模型打的
+                    "ai": (s.ai if s.kind == "ai" else None),
                     "host": s.host,
                     "elo": round(prof.elo, 2),
                     "games": prof.games,
@@ -397,6 +436,9 @@ class Room:
     def _run(self) -> None:
         gamelog.info("=== 房间 %s 开打 人数=%d 局数=%d AI节拍=%.1fs ===",
                      self.id, self.players, self.rounds, self.ai_delay)
+        if self.team:
+            self._run_team()
+            return
         try:
             game = Game(
                 self._agents,
@@ -450,11 +492,143 @@ class Room:
                     s.next_ack = False
             self.broadcast_later()
 
-    # -- 引擎回调（都在引擎线程里）--------------------------------------
+    # -- 团体战 ---------------------------------------------------------
+    def _team_rule(self) -> Any:
+        """团体战规则：半庄 + **无击飞** + **无中途流局** + 初始 100000。"""
+        return dataclasses.replace(
+            self.rule,
+            hanchan=True,
+            # 团体战从 100000 起算（引擎用 rule.start_score 兜底发牌）
+            start_score=TEAM_START,
+            return_score=TEAM_START,
+            bust_score=-(10 ** 9),      # 引擎判 s < bust_score 才结束 → 压到极低=永不击飞
+            abort_four_kans=False,      # 四槓散了 不流局
+            kyuushu_kyuuhai=False,      # 九种九牌 不许宣告
+        )
+
+    def _team_lineup(self, rd: int) -> list[dict]:
+        """第 ``rd`` 个半庄上场的四个角色（每队一个）。
+
+        roster 是 4 队 × 4 角色的 16 项，索引 = ``角色轮 * 4 + 队号``。
+        """
+        roster = (self.team or {}).get("roster") or []
+        out = []
+        for team in range(self.players):
+            idx = rd * self.players + team
+            item = roster[idx] if idx < len(roster) else {}
+            out.append({
+                "team": team,
+                "team_name": self.team_names[team] if team < len(self.team_names) else f"{team} 队",
+                "role": TEAM_ROLES[rd] if rd < len(TEAM_ROLES) else f"第{rd}战",
+                "name": item.get("name") or "",
+                "kind": item.get("kind") or "ai",
+                "ai": item.get("ai") or "",
+            })
+        return out
+
+    def _apply_lineup(self, rd: int) -> None:
+        """把本轮四个角色的名字/真人orAI 写到四个座位上，并重建 agent。"""
+        lineup = self._team_lineup(rd)
+        with self.lock:
+            self.team_round = rd
+            self.team_lineup = lineup
+            for seat, who in enumerate(lineup):
+                s = self.seats[seat]
+                if s is None:
+                    continue
+                s.name = who["name"] or f"{who['team_name']}·{who['role']}"
+                s.kind = "human" if who["kind"] == "human" else "ai"
+                s.ai = "" if s.kind == "human" else (who["ai"] or "")
+                s.ai_degraded = False
+                s.ai_degrade_reason = ""
+        self.human_seats.clear()
+        self.ai_seats.clear()
+        self._agents = self._build_agents()
+        self.broadcast_later()
+
+    def _run_team(self) -> None:
+        """团体战：**4 个半庄**依次打，分数跨半庄继承。
+
+        每一战换一组角色（先锋→次锋→副将→大将）；不击飞、不中途流局
+        （规则层面已关）；半庄之间停下来等真人确认（复用 `_between` 那套
+        next_ack 闸门，普通局的局间确认也是它）。
+        """
+        try:
+            for rd in range(len(TEAM_ROLES)):
+                if self._stop.is_set():
+                    return
+                self._apply_lineup(rd)
+                lineup = self.team_lineup
+                gamelog.info("[%s] === %s战开始（分数 %s）===",
+                             self.id, TEAM_ROLES[rd], self.team_scores)
+                self._push_event(None, {
+                    "type": "team_round", "round": rd, "role": TEAM_ROLES[rd],
+                    "lineup": lineup, "scores": list(self.team_scores),
+                })
+                game = Game(
+                    self._agents,
+                    # 每一战换牌山：seed 混进轮次，不然四战同一副牌
+                    seed=(abs(hash(self.id)) + rd * 7919) % (2 ** 31 - 1),
+                    rule=self._team_rule(),
+                    rounds=self.players,
+                    dealer=0,
+                    scores=list(self.team_scores),
+                    on_event=self._on_engine_log,
+                    on_between=self._between,
+                )
+                game.on_action = self._on_action
+                with self.lock:
+                    self.game = game
+                self._drain_events()
+                self.broadcast_later()
+                result = game.play()
+                self._record_hand_end(game)
+                with self.lock:
+                    # ★ 分数继承：下一战的初始点数 = 这一战结束的点数
+                    self.team_scores = list(result.scores)
+                    self.team_round_scores.append({
+                        "role": TEAM_ROLES[rd],
+                        "scores": list(result.scores),
+                        "rank": list(result.ranks),
+                        "match": P.match_result_view(result),
+                    })
+                gamelog.info("[%s] %s战结束 scores=%s",
+                             self.id, TEAM_ROLES[rd], result.scores)
+            with self.lock:
+                # 终局：前端用 team_round_scores 汇总四队总分，match 给最后一战用
+                self.match_result = (
+                    self.team_round_scores[-1]["match"] if self.team_round_scores else None
+                )
+                self.phase = PHASE_FINISHED
+                self.finished_at = time.time()
+            self.broadcast_later()
+        except Exception as exc:  # noqa: BLE001
+            self.error = f"{type(exc).__name__}: {exc}"
+            log.exception("房间 %s 团体战异常", self.id)
+            with self.lock:
+                self.phase = PHASE_FINISHED
+                self.finished_at = time.time()
+            self._push_event(None, {"type": "error",
+                                    "message": f"引擎异常：{self.error}"})
+
     def _on_engine_log(self, msg: str) -> None:
         gamelog.info("[%s] %s", self.id, msg)
+        text = msg.rstrip()
+        # ★ 引擎日志形如 `[P0(东)] 摸九万（剩 69）`。这里顺手标出**座位号**和
+        #   **是不是摸牌** —— 发给客户端时要按 viewer 过滤掉别家的摸牌行，
+        #   否则一桌真人里谁都能从右侧日志看到别人摸了什么、牌山还剩几张
+        #   （用户抓到的严重信息泄露）。不解析文本就没法过滤，所以在这一层标。
+        seat, kind = -1, ""
+        if text.startswith("[P"):
+            head = text[2:].split("(", 1)[0]
+            if head.isdigit():
+                seat = int(head)
+                body = text.split("]", 1)[1].strip() if "]" in text else ""
+                if body.startswith("摸"):
+                    kind = "draw"
         with self.lock:
-            self.log_lines.append({"at": round(time.time(), 2), "text": msg.rstrip()})
+            self.log_lines.append({"at": round(time.time(), 2), "text": text,
+                                   "seat": seat, "kind": kind})
 
     def _on_action(self, ev: dict) -> None:
         """引擎结构化动作流（引擎线程）。
@@ -495,6 +669,17 @@ class Room:
         elif kind in ("win", "ryukyoku"):
             # 和了 / 流局：盘面还完整，趁现在把这一局记下来
             self._pending_hand_end = True
+            # ⚠️ **必须在这里快照点数** ✗
+            #    2026-10-21 用户报「记录有问题」的根因：
+            #      `_record_hand_end` 的 while 循环一次批记多手，
+            #      每手都读 `game.scores` -> 整批手共用**调用那一刻**的分数 ✗
+            #    -> VRJPH 那局 8 手的 `scores_after` 全是同一个数组 ✗
+            #    为什么不能用「起始 + 逐手 deltas」重算 ✗：
+            #      实测会差 1000（**立直棒不在 deltas 里** ✗，它在 `game.sticks` ✓）
+            #    -> 唯一可靠的是**在这个事件到达的瞬间**把 `game.scores` 抄下来 ✓
+            #       （实测此刻 `game.hands` 已 append、`game.scores` 已更新 ✓）
+            self._hand_end_scores = list(getattr(self.game, "scores", []) or [])
+            self._hand_end_index = len(getattr(self.game, "hands", []) or [])
         with self.lock:
             self.last_event = ev
         self.broadcast_later()
@@ -567,13 +752,32 @@ class Room:
         if rec is None:
             return
         total = len(game.hands)
+        # ⚠️ **`scores_after` 用事件到达那一刻的快照** ✓
+        #    2026-10-21 用户报「记录有问题」：VRJPH 那局 8 手的 `scores_after`
+        #    全是同一个数组 ✗ 因为一次批记多手时每手都读 `game.scores` ✗
+        #    快照只在 `_on_event` 里、且只对**最后一手**有效 ✓；
+        #    更早的手没法补（立直棒不在 deltas 里，重算会差 1000 ✗）
+        #    -> 那种情况退回 `game.scores` 并留一条日志，别静默 ✗
+        snap_idx = self._hand_end_index
+        snap_scores = list(self._hand_end_scores)
         while self._hand_recorded < total:
             idx = self._hand_recorded
             self._hand_recorded += 1
             try:
                 h = game.hands[idx]
                 detail = (P.hand_result_view(game) if idx == total - 1 else None)
-                rec.end_hand(hand_no=idx + 1, game=game, result=h, detail=detail)
+                if idx == snap_idx - 1 and snap_scores:
+                    scores_after = list(snap_scores)
+                else:
+                    scores_after = list(game.scores)
+                    if snap_idx and idx != snap_idx - 1:
+                        log.warning(
+                            "房间 %s 第 %d 手拿不到精确点数快照"
+                            "（快照只在第 %d 手），已退回 game.scores",
+                            self.id, idx + 1, snap_idx,
+                        )
+                rec.end_hand(hand_no=idx + 1, game=game, result=h, detail=detail,
+                             scores_after=scores_after)
             except Exception:  # noqa: BLE001
                 log.exception("房间 %s 记录第 %d 局失败", self.id, idx + 1)
 
@@ -585,25 +789,50 @@ class Room:
         """
         if self._stop.is_set():
             return
+        # ⚠️ **在这里把刚打完的那手记下来** ✓ —— 这是唯一 `game.scores` 准确的时刻 ✓
+        #    2026-10-21 用户报「记录有问题」的根因：
+        #      `_record_hand_end` 原来只在 `_drain_events`（引擎线程的安全点）被调 ✓
+        #      而那时 `play()` 可能已经往后跑了好几手 ✗
+        #      -> 一次批记多手时每手都读同一个 `game.scores` ✗
+        #      -> VRJPH 那局 8 手的 `scores_after` 全是同一个数组 ✗
+        #    `_between(done)` 的时机是唯一的正解 ✓：
+        #      它在 L363（`play()` 的循环里、下一手开打之前）被调用 ✓
+        #      -> 此刻 `game.hands` 有 done 条 ✓、`game.scores` 正是「打完 done 手」的点数 ✓
+        #      （`_hand_recorded` 保证幂等 ✓ 所以 `_drain_events` 那条路仍然安全 ✓）
+        if self.game is not None:
+            self._record_hand_end(self.game)
         with self.lock:
             self.phase = PHASE_HAND_END
+            # ★ **必须擦掉上一局的结算缓存**（用户的 bug：只有第一局结算是对的，
+            #   后面每局都跟第一局一模一样）。`_state_payload` 里是
+            #   `result = self.result_view`，而 `result_view` 只在 None 时才重新
+            #   计算 —— 不清就会把第一局那份一直发下去（round 是另算的，
+            #   所以局号照走，看着就像「结算页没重绘」）。
+            self.result_view = None
             for s in self.seats:
                 if s:
                     s.next_ack = False
+            for c in self.conns.values():
+                c.next_ack = False
             self.scores_before = list(self.game.scores) if self.game else self.scores_before
             self.sticks_before = self.game.sticks if self.game else 0
         gamelog.info("[%s] 第 %d 局结束，等玩家确认下一局（最多 %.0fs）",
                      self.id, done, self.cfg.between_timeout)
         self.broadcast_later()
 
-        deadline = time.time() + self.cfg.between_timeout
+        # ★ 超时策略（踩过坑）：
+        #   - 房里有真人座位、而且不止一个 → 还是按 `between_timeout` 走，
+        #     一个人挂机不能把整桌卡死；
+        #   - 只有自己一个真人 → 不设超时，等多久都行（用户要求）；
+        #   - **纯 AI 房等观战者确认**：也必须有超时！否则有人开着直播页
+        #     不点确认，这桌 AI 就永远停在结算页上 —— 表现就是「怎么老是
+        #     那一个流局」（用户亲眼看到的，我上一版就是这么冻住的）。
+        humans = sum(1 for s in self.seats if s and s.kind == "human")
+        deadline = (float("inf") if humans == 1
+                    else time.time() + self.cfg.between_timeout)
         while not self._stop.is_set():
-            with self.lock:
-                pending_humans = [
-                    s for s in self.seats
-                    if s and s.kind == "human" and s.online and not s.next_ack
-                ]
-            if not pending_humans:
+            waiting = self._pending_acks()
+            if not waiting:
                 break
             remain = deadline - time.time()
             if remain <= 0:
@@ -617,17 +846,46 @@ class Room:
             for s in self.seats:
                 if s:
                     s.next_ack = False
+            for c in self.conns.values():
+                c.next_ack = False
         self.broadcast_later()
 
-    def ack_next(self) -> None:
+    def ack_next(self, conn: "Conn | None" = None) -> None:
+        """有人点了「下一局」。
+
+        ★ **只记这一条连接**（坐在位子上就记座位，观战就记这条观战连接）。
+        以前这里是把所有真人座位一次性全标成已确认 —— 一个人点，别人也
+        跟着算确认了，「所有真人都确认」形同虚设。
+        """
         with self.lock:
-            for c in self.conns.values():
-                if 0 <= c.seat < len(self.seats):
-                    s = self.seats[c.seat]
-                    if s:
-                        s.next_ack = True
+            if conn is None:
+                for c in self.conns.values():
+                    c.next_ack = True
+                    if 0 <= c.seat < len(self.seats) and self.seats[c.seat]:
+                        self.seats[c.seat].next_ack = True
+            else:
+                conn.next_ack = True
+                if 0 <= conn.seat < len(self.seats) and self.seats[conn.seat]:
+                    self.seats[conn.seat].next_ack = True
         self._between_evt.set()
         self.broadcast_later()
+
+    def _pending_acks(self) -> list[str]:
+        """局间还在等谁点「下一局」（返回给日志/前端看的名字列表）。
+
+        规则：**房里有真人座位就等座位**（观战者不拦），
+        **纯 AI 房就等观战的人**（用户要的「AI 局也要所有观战真人确认」）。
+        掉线的连接不算 —— 关掉页面不该把整桌卡死。
+        """
+        with self.lock:
+            seats = [
+                s for s in self.seats
+                if s and s.kind == "human" and s.online and not s.next_ack
+            ]
+            if seats:
+                return [s.name or f"座位{s.seat}" for s in seats]
+            return [c.name or "观众" for c in self.conns.values()
+                    if c.seat < 0 and not c.next_ack]
 
     # ------------------------------------------------------------------
     # 连接 / 座位
@@ -652,6 +910,24 @@ class Room:
         with self.lock:
             if len(self.conns) >= self.cfg.max_conns_per_room:
                 raise RoomError("这个房间连接数满了")
+            # ⚠️ **幂等**：同一个连接重复 `room.join` 时，绝不能把自己降级成观战 ✗
+            #
+            # 为什么需要（2026-10-20 用户现场报「每次听牌就突然变成观战」✓）：
+            #   同一个 conn_id 被 `_enter_room` 调了两次（两次之间**没有断线** ✓）。
+            #   第二次走到下面时：
+            #     · 规则 2「按 uid/token 回自己座位」匹配不上（uid 变了 / 没带 token）
+            #     · 规则 4「找空位」返回 -1 —— **因为座位正是它自己占着的**
+            #   -> `target < 0` -> 落到「新增观战连接」✗  座位就这样丢了。
+            #
+            # 所以：**已经坐着、且这次没说要观战** -> 原样返回自己的座位 ✓
+            # （若这次明确要观战，就尊重调用方，继续走正常流程 ✓）
+            old = self.conns.get(conn_id)
+            if old is not None and old.seat >= 0 and not spectator:
+                # 记一条日志：这个分支真的发生 = 「重复 join」确实在发生 ✓
+                # 以后数它的次数就知道根因还在不在。
+                log.info("房间 %s 连接 %s 重复 join（座位 %d 已存在），保持原座位（%s）",
+                         self.id, conn_id, old.seat, name)
+                return old
             # 入座前的「能不能全亮」——加了自己之后会变，所以先算。
             ok_before = all(s is None or s.kind != "human" for s in self.seats)
             if ok_before:
@@ -712,11 +988,14 @@ class Room:
         s.uid = uid
         s.name = (name or "玩家")[:16]
         s.kind = "human"
+        # 这三行都得清干净：AI 座位留下的模型名会跟着「人」一路进到
+        # 决策记录和画像里（`ai: maj-normal4v1.2` 挂在真人身上），
+        # 训练数据里就分不清哪个是人打的了。
         s.ai = None
-        s.online = True
-        s.token = _token()
         s.ai_degraded = False
         s.ai_degrade_reason = ""
+        s.online = True
+        s.token = _token()
         return seat
 
     def _can_take_ai_seat(self, seat: int) -> bool:
@@ -963,6 +1242,20 @@ class Room:
                 if self.phase in (PHASE_HAND_END, PHASE_FINISHED):
                     result = P.hand_result_view(self.game)
                     self.result_view = result
+            # ★ 日志要**按人过滤**：`draw`（摸牌）那几行只有本人能看。
+            #   自己 = 全给；别家 = 去掉不属于他的摸牌行；
+            #   观战者 = 只在「全亮」时给（纯 AI 房），否则同样看不到摸牌 ——
+            #   不然开个观战页就成了记牌器（用户抓到的严重问题）。
+            def _logs_for(seat: int, reveal: bool) -> list[str]:
+                out = []
+                for e in self.log_lines:
+                    if (e.get("kind") == "draw" and e.get("seat", -1) >= 0
+                            and e.get("seat", -1) != seat
+                            and not (seat < 0 and reveal)):
+                        continue
+                    out.append(e["text"])
+                return out
+
             log_lines = [e["text"] for e in self.log_lines]
             chat = list(self.chat)
             sok = self.spectator_ok
@@ -1003,7 +1296,7 @@ class Room:
                     last_event=last_event,
                     finished=finished,
                     result=result,
-                    log=log_lines,
+                    log=_logs_for(c.seat, c.reveal),
                     chat=chat,
                     spectator_count=spectator_count,
                     now=now,
@@ -1028,6 +1321,16 @@ class Room:
                 payload["error"] = err
             payload["room"]["next_acks"] = next_acks
             payload["room"]["dealt"] = dealt
+            # 局间在等谁确认：客户端据此显示「还等 XXX 确认」。
+            # 纯 AI 房等的是**观战的人**（座位那套此时是空的）。
+            if phase == PHASE_HAND_END:
+                waiting = self._pending_acks()
+                payload["room"]["pending_acks"] = waiting
+                payload["room"]["spectator_next"] = {
+                    "total": sum(1 for x in self.conns.values() if x.seat < 0),
+                    "acked": sum(1 for x in self.conns.values()
+                                 if x.seat < 0 and x.next_ack),
+                }
             _send(c, payload)
 
     def _seats_for_viewer(self, seats_info: list[dict], conn: Conn) -> list[dict]:
@@ -1084,6 +1387,17 @@ class Room:
             "return_score": self.rule.return_score,
             "created_at": round(self.created_at, 2),
             "record": bool(self.cfg.record),
+            # 团体战：四队名 / 当前轮次与角色 / 本轮四名上场者 / 四队（继承中的）总分
+            "team": (None if not self.team else {
+                "teams": list(self.team_names),
+                "round": self.team_round,
+                "role": (TEAM_ROLES[self.team_round]
+                         if self.team_round < len(TEAM_ROLES) else ""),
+                "lineup": list(self.team_lineup),
+                "scores": (list(self.game.scores) if self.game is not None
+                           and self.phase == PHASE_PLAYING else list(self.team_scores)),
+                "history": list(self.team_round_scores),
+            }),
             "rules": {
                 "aka": self.rule.aka,
                 "kita": self.rule.kita_dora,
