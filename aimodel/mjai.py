@@ -55,21 +55,46 @@ def tile_to_mjai(tile: int, red: bool = False) -> str:
 
 
 def tile_from_mjai(name: str) -> tuple[int, bool]:
-    """MJAI 牌名 -> (牌型下标, 是否赤)。"""
+    """MJAI 牌名 -> (牌型下标, 是否赤)。
+
+    赤五的**两种写法都认**（2026-10-21 加，之前只认第一种）：
+
+    * ``0m`` / ``0p`` / ``0s``   —— 本项目内部约定（那 40,000 局老数据用的是这个）
+    * ``5mr`` / ``5pr`` / ``5sr`` —— **标准 MJAI**（Mortal / riichienv /
+      以及新转出来的 5,717 局鳳凰数据用的是这个）
+
+    两种写法返回同一个结果 ``(base + 4, True)``。
+
+    ⚠️ 为什么之前会崩：新转换器 `tools/tenhou_xml_to_mjai.py` 按**标准**写 ``5mr``，
+    而这里只认 ``0m`` -> `ValueError: 认不出的牌名: '5mr'`，
+    整个抽取在**第一个含赤五的手牌**上就退出了 ✗
+    这不是转换器写错，是这里的读入端不够宽 ✓
+    """
     name = name.strip()
     if not name:
         raise ValueError("空牌名")
     if name in MJAI_HONOR:
         return MJAI_HONOR[name], False
+    # 标准 MJAI 的赤五后缀：5m + r
+    red_suffix = len(name) == 3 and name[-1] in "rR"
+    if red_suffix:
+        name = name[:-1]
     n, suit = name[:-1], name[-1].lower()
     if suit not in "mps":
         raise ValueError(f"认不出的牌名: {name!r}")
     base = "mps".index(suit) * 9
-    if n == "0":                      # 赤 5
+    if n == "0":                      # 赤 5（本项目写法）
         return base + 4, True
-    v = int(n)
+    try:
+        v = int(n)
+    except ValueError:
+        raise ValueError(f"认不出的牌名: {name!r}") from None
     if not 1 <= v <= 9:
         raise ValueError(f"认不出的牌名: {name!r}")
+    if red_suffix:
+        if v != 5:
+            raise ValueError(f"只有 5 号牌能带赤后缀: {name!r}")
+        return base + 4, True
     return base + v - 1, False
 
 
