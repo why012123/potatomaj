@@ -157,6 +157,34 @@ def extract_kyoku(kyoku, tracker, n: int, rule):
     game.rigged_wall = LC.kyoku_to_wall(kyoku, n, rule)
     game.on_event = None
 
+    # ---------------------------------------------------------------
+    # 把「这一局在**整场**里的位置」灌进去 ✗ 否则 match_state 全是默认值
+    # ---------------------------------------------------------------
+    # `extract_kyoku` 是**一局一局**重放的（每局新建一个 Game ✓ 从不调
+    # `Game.play()`），而 honba / kyoku / 供托 / 剩余局数 都是 `play()` 里
+    # 才推进的 ✓ 不灌的话 View 里这些字段恒为默认值（kyoku=1 honba=0
+    # kyotaku=0 hands_left=0），新加的 17 维 match_state 就等于**恒定的噪声** ✗
+    # 数据里这些都是现成的：`start_kyoku` 带 kyoku / honba / riichi_sticks /
+    # scores / bakaze ✓
+    def _as_points(v: int) -> int:
+        """天凤 mjlog 的点数单位是「百点」（250 = 25000）✓ 标准 MJAI 是实际点数 ✗"""
+        return int(v) * 100 if int(v) <= 1000 else int(v)
+
+    bakaze = start.get("bakaze", "E")
+    game.round_wind = S.EAST if bakaze == "E" else S.SOUTH
+    game.kyoku = int(start.get("kyoku", 1) or 1)
+    game.honba = int(start.get("honba", 0) or 0)
+    # 供托：我们自己的格式叫 riichi_sticks，标准 MJAI 叫 kyoutaku ✓ 两种都认
+    game.sticks = int(start.get("riichi_sticks", start.get("kyoutaku", 0)) or 0)
+    # 连庄：本场 > 0 基本等价于「这一局是连庄来的」✓（天凤里本场也可来自流局）
+    game.dealer_repeat = game.honba > 0
+    # 剩余局数（含本局）：东场 4 - kyoku + 1；南场 8 - kyoku + 1（南1 = 第5局）
+    _base = 0 if game.round_wind == S.EAST else 4
+    game.hands_left = max(0, _base + 4 - game.kyoku + 1)
+    if start.get("scores"):
+        game.scores = [_as_points(v) for v in start["scores"]]
+        game.start_scores = list(game.scores)
+
     def dispatch(a, agents=agents):
         for ag in agents:
             ag.on_action(a)
