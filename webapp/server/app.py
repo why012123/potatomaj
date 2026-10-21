@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from aiohttp import WSMsgType, web
+from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
 
 from aimodel import __version__ as AIMODEL_VERSION
 
@@ -214,6 +214,65 @@ class WSClient:
 
 
 # ---------------------------------------------------------------------------
+# 官方 ELO 反代（公网隧道只映射 8790；8964 的页面/接口不暴露）
+# ---------------------------------------------------------------------------
+
+#: 官方 ELO / 回放服务（``aimodel.ui.arena_server``）的本机地址。
+#: 环境变量 ``MAJ_ELO_UPSTREAM`` 只用于测试时指到假上游；线上不设。
+ELO_UPSTREAM = os.environ.get("MAJ_ELO_UPSTREAM", "http://127.0.0.1:8964")
+
+#: 原样转发的请求头（Host / Cookie 不转：上游是本机服务，不需要）。
+_FORWARD_HEADERS = ("Content-Type", "Accept", "User-Agent")
+
+
+async def _proxy_elo(request: web.Request) -> web.Response:
+    """把官方 ELO 的页面 / API 请求**原样**反代到 8964。
+
+    只加路由，不改已有的 7 个 webapp 接口 ✓
+    · ``path_qs`` 含 query string -> ``?season=`` / ``?days=all`` 都能过 ✓
+    · ``request.read()`` 后按原方法发出 -> POST（start/pause/favorite…）也能过 ✓
+    · 不引新依赖：aiohttp 客户端本来就是 webapp 的依赖 ✓
+    """
+    upstream = os.environ.get("MAJ_ELO_UPSTREAM", ELO_UPSTREAM).rstrip("/")
+    url = upstream + request.path_qs
+    body = await request.read()
+    headers = {name: request.headers[name]
+               for name in _FORWARD_HEADERS if request.headers.get(name)}
+    try:
+        timeout = ClientTimeout(total=60.0, sock_connect=10.0)
+        async with ClientSession(timeout=timeout) as session:
+            async with session.request(request.method, url, data=body or None,
+                                       headers=headers, allow_redirects=False) as r:
+                data = await r.read()
+                resp = web.Response(body=data, status=r.status)
+                for name in ("Content-Type", "Cache-Control"):
+                    if r.headers.get(name):
+                        resp.headers[name] = r.headers[name]
+                return resp
+    except asyncio.TimeoutError:
+        err = "上游 8964 超时"
+    except Exception as exc:                             # noqa: BLE001
+        err = f"上游 8964 不可达：{type(exc).__name__}: {exc}"
+    if request.path.startswith("/api/"):
+        return web.json_response({"ok": False, "error": err}, status=502)
+    return web.Response(text=f"官方 ELO 服务暂时不可用：{err}",
+                        status=502, content_type="text/plain; charset=utf-8")
+
+
+def register_elo_proxy(app: web.Application) -> None:
+    """注册官方 ELO 页面 / API 的反代路由（单独成函数，方便测试）。"""
+    # 页面：官方 / 手动池 / 回放 —— 都是 8964 的静态页
+    for path in ("/official", "/official.html", "/arena", "/arena.html",
+                 "/replay", "/replay.html"):
+        app.router.add_get(path, _proxy_elo)
+    # API：/api/arena、/api/arena/*、/api/elo/*；GET 和 POST 都转
+    app.router.add_route("*", "/api/arena", _proxy_elo)
+    app.router.add_route("*", "/api/arena/", _proxy_elo)
+    app.router.add_route("*", "/api/arena/{tail:.*}", _proxy_elo)
+    app.router.add_route("*", "/api/elo/{tail:.*}", _proxy_elo)
+
+
+# ---------------------------------------------------------------------------
 # 应用
 # ---------------------------------------------------------------------------
 
@@ -268,6 +327,9 @@ def create_app(cfg: Config) -> web.Application:
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/profiles", api_profiles)
     app.router.add_get("/api/record", api_record)
+    # 官方 ELO 页 / API：公网只映射 8790，所以在这里反代到 8964。
+    # **只加路由**：上面 7 个既有接口一个都没动 ✓
+    register_elo_proxy(app)
     app.router.add_get("/tiles/{name}", tile_handler)
     app.router.add_get("/", index_handler)
     app.router.add_get("/room/{rid}", index_handler)

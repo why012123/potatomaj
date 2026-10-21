@@ -64,7 +64,24 @@
 // 若那个端口没起，点进去会失败 —— 所以这里先探一下，探不到就把卡片灰掉 ✓
 const PORT_3P = 8965;
 
+function gray3p(reason) {
+  const card = document.getElementById("link3");
+  card.style.opacity = ".45";
+  card.style.pointerEvents = "none";
+  card.querySelector("p").innerHTML +=
+    `<br><span style="color:#d29922">（${reason}）</span>`;
+}
+
 async function probe3p() {
+  // ⚠️ 公网是 HTTPS，只有 8790 一条隧道（8964/8965 都没暴露）✗
+  //    再 fetch `http://host:8965` 会：① mixed content 被浏览器拦
+  //    ② 就算没拦也连不上。-> 公网直接标灰，不去发这个必失败的请求。
+  //    本机（http://127.0.0.1:8964）仍按原逻辑探 8965。
+  const local = ["127.0.0.1", "localhost", "::1"].includes(location.hostname);
+  if (location.protocol === "https:" && !local) {
+    gray3p("公网未暴露三麻端口 8965，三麻请在本机打开");
+    return;
+  }
   const card = document.getElementById("link3");
   try {
     const r = await fetch(`http://${location.hostname}:${PORT_3P}/api/arena`,
@@ -72,10 +89,7 @@ async function probe3p() {
     if (!r.ok) throw new Error("HTTP " + r.status);
     card.href = `http://${location.hostname}:${PORT_3P}/arena`;
   } catch (e) {
-    card.style.opacity = ".45";
-    card.style.pointerEvents = "none";
-    card.querySelector("p").innerHTML +=
-      `<br><span style="color:#d29922">（三麻服务未启动：端口 ${PORT_3P}）</span>`;
+    gray3p(`三麻服务未启动：端口 ${PORT_3P}`);
   }
 }
 
