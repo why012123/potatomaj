@@ -934,7 +934,7 @@ class Arena:
                 "放铳率": round(p.deal_in_rate, 4), "局数": p.hands,
                 "点数分": round(p.score_term, 1), "名次分": round(p.place_term, 1),
                 "触底": p.floor_hits,
-                "外部失败": p.external_failures,
+                "外部失败次数": p.external_failures,
                 "状态": "0分保底" if (p.at_floor and p.games) else "存活",
                 "曲线": p.history[-120:],
                 # 只加字段：老页面照常读，新页面/接口能看见外部参战者状态
@@ -967,7 +967,7 @@ class Arena:
             "平均顺位": round(p.avg_rank + 1, 2) if p.ranks else 0,
             "名次分": round(p.place_term, 1), "点数分": round(p.score_term, 1),
             "局数": p.hands, "触底": p.floor_hits,
-            "外部失败": p.external_failures,
+            "外部失败次数": p.external_failures,
             "状态": "0分保底" if (p.at_floor and p.games) else "存活",
             "曲线": p.history,
             "对局": list(reversed(p.matches)),     # 新的在前
