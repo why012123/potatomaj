@@ -247,6 +247,12 @@ def test_negative():
                               f'hai3="{HANDS1[3].replace(",89", ",120")}"')
     expect("同种牌 >4 张", "tile_over_4", build(init1=bad_init2))
 
+    # ③b 同一张**实体牌**（raw id）出现两次：136 张的总账被破坏。
+    #     牌种计数仍是 2（<=4），所以只有「实体牌唯一」这条能抓到 —— 更强的检查。
+    bad_init2b = INIT1.replace(f'hai3="{HANDS1[3]}"',
+                               f'hai3="{HANDS1[3].replace(",37", ",36")}"')  # 36 是 seat0 的 1p
+    expect("同一张实体牌出现两次", "tile_repeated", build(init1=bad_init2b))
+
     # ④ 和了点数对不上：赢家只拿到 1000，但 ten 说 1000 + 1 根棒 = 2000
     expect("赢家收的点数不对", "agari:winner_points",
            _mutate('sc="250,20,250,0,240,-10,250,0"',

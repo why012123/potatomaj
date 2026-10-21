@@ -334,15 +334,19 @@ def convert_kyoku(init_el: ET.Element, actions: list[ET.Element], issues: list[s
     net = [0, 0, 0, 0]
     n_reach = 0
     tally: Counter[int] = Counter()                          # 牌种 -> 出现过的次数
+    raws_seen: Counter[int] = Counter()                      # 具体牌 id -> 出现次数
 
     for h in tehais_raw:
         for x in h:
             tally[tile_type(x)] += 1
+            raws_seen[x] += 1
     tally[tile_type(indicator_raw)] += 1
+    raws_seen[indicator_raw] += 1
 
     # 一边打一边算「起手 52 张 + 指示牌」之后的可见牌，检查 <= 4
     def _seen(raw: int) -> None:
         tally[tile_type(raw)] += 1
+        raws_seen[raw] += 1
 
     #: 对账用的计数（hora/ryukyoku 的守恒式、事件类型直方图）
     stats: Counter = Counter()
@@ -547,6 +551,11 @@ def convert_kyoku(init_el: ET.Element, actions: list[ET.Element], issues: list[s
     over = [t for t, c in tally.items() if c > 4]
     if over:
         issues.append("tile_over_4:" + ",".join(f"t{t}={tally[t]}" for t in sorted(over)[:4]))
+    # ---- 局末检查：同一张**实体牌**不能出现两次（136 张的总账）------------
+    # 比「每种 <=4」更严：两张同一个 raw id 的牌不可能同时存在。
+    dup = [r for r, c in raws_seen.items() if c > 1]
+    if dup:
+        issues.append("tile_repeated:" + ",".join(str(r) for r in sorted(dup)[:4]))
     for ev in events:
         stats["ev_" + ev["type"]] += 1
 
