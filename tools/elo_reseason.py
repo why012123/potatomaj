@@ -218,6 +218,8 @@ def reseason_one(src: Path, season_dir: Path, all_dirs: list[Path]) -> dict:
             opp_n[p.key] = opp_n.get(p.key, 0) + 1
 
     done = arena.replay_ranks(records, fresh=False, before_settle=_hook)
+    # 每期独立：这一期自己的 Arena 里 done_total 就是本期局数（不是服务级累计）
+    arena.done_total = arena.n_matches
 
     table = arena.table()
     champ, champ_avg, champ_inst, champ_inst_score = E.champion_by_model(table)
@@ -358,6 +360,54 @@ def write_outputs(res: dict, out_root: Path) -> None:
 
 def public_view(res: dict) -> dict:
     return {k: v for k, v in res.items() if not k.startswith("_")}
+
+
+# ---------------------------------------------------------------------------
+# 硬校验（测试也直接用这个函数，不许另写一份判据 ✗）
+# ---------------------------------------------------------------------------
+
+
+def audit_season(res: dict, *, expected_matches: int | None = None) -> list[str]:
+    """把一期的结果按「每期独立」的硬指标检一遍，返回问题列表（空 = 通过）。
+
+    查的事：
+      ① 起始分是否**全部相同**（每期从同一个初始分起算 ✓ 跨期可比的地基）
+      ② ``games`` 合计是否 == 对局数 × 人数（口径有没有串）
+      ③ 是不是每一局都真的结算了（``replayed == matches``）
+      ④ ``n_matches``（本期序号）是否 == 该期对局数（不是累计 ✗）
+
+    ``expected_matches``：该期**计划**跑多少局（官方档位 4000）。给了就额外查
+    「本期局数有没有**超**」——
+
+    ⚠️ 这一条是「某期被多喂了上一期的对局」唯一能抓到的信号 ✗
+       ``games`` 合计和 ``n_matches`` 自己跟自己永远对得上（多一局就两边都多）✓
+       只有跟**计划**比才看得出「这期多打了」✗（用户要求的负向验证就是这条 ✓）
+    """
+    bad: list[str] = []
+    sid = res.get("sid", "?")
+    sr = res.get("start_rating") or {}
+    g = res.get("games") or {}
+    if not sr.get("all_same"):
+        bad.append(f"{sid}: 起始分不全是 {INITIAL_RATING:g}"
+                   f"（min={sr.get('min')} max={sr.get('max')}）")
+    if g.get("total") != g.get("per_seat_expected"):
+        bad.append(f"{sid}: games 合计 {g.get('total')} != "
+                   f"对局×人数 {g.get('per_seat_expected')}")
+    if res.get("replayed") != res.get("matches"):
+        bad.append(f"{sid}: 只结算了 {res.get('replayed')}/{res.get('matches')} 局")
+    if (res.get("new") or {}).get("n_matches") != res.get("matches"):
+        bad.append(f"{sid}: n_matches {(res.get('new') or {}).get('n_matches')} != "
+                   f"该期对局数 {res.get('matches')}")
+    if expected_matches is not None:
+        n = int(res.get("matches") or 0)
+        if n > expected_matches:
+            bad.append(f"{sid}: 该期对局 **{n} 局，超了计划 {expected_matches} 局**"
+                       f"（多喂了 {(n - expected_matches) * int(res.get('players') or 4)} 个座位"
+                       f" -> games 合计 {g.get('total')} 超了 "
+                       f"{expected_matches * int(res.get('players') or 4)}）")
+        elif n < expected_matches:
+            bad.append(f"{sid}: 该期只跑了 {n} 局 < 计划 {expected_matches} 局")
+    return bad
 
 
 # ---------------------------------------------------------------------------
@@ -548,17 +598,7 @@ def main(argv: list[str] | None = None) -> int:
     # 硬校验：任何一条不满足就**非 0 退出**（别让坏数据静默通过 ✗）
     bad: list[str] = []
     for r in results:
-        sr, g = r["start_rating"], r["games"]
-        if not sr["all_same"]:
-            bad.append(f"{r['sid']}: 起始分不全是 {INITIAL_RATING:g}")
-        if g["total"] != g["per_seat_expected"]:
-            bad.append(f"{r['sid']}: games 合计 {g['total']} != "
-                       f"对局×人数 {g['per_seat_expected']}")
-        if r["replayed"] != r["matches"]:
-            bad.append(f"{r['sid']}: 只结算了 {r['replayed']}/{r['matches']} 局")
-        if r["new"]["n_matches"] != r["matches"]:
-            bad.append(f"{r['sid']}: n_matches {r['new']['n_matches']} != "
-                       f"对局数 {r['matches']}")
+        bad.extend(audit_season(r, expected_matches=r["matches"]))
 
     if args.dry_run:
         print("（dry-run：没落盘）")
