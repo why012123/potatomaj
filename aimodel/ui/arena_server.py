@@ -76,12 +76,17 @@ class Session:
         self.record = True
 
     def resume_latest(self) -> None:
-        """重启后把**最近一期**的 ``arena.json`` 读回来。
+        """重启后把**最近一期**的 ``arena.json`` 读回来（**只读那一期自己的状态**）。
 
-        为什么需要：:class:`Session` 的构造函数总是从 0 分开始；而官方天梯的
-        ELO 是跨期累积的（每期收尾都会把 ``arena.json`` 落盘）。不读回来的话，
-        服务一重启 ``/api/arena`` 就变成 ``done_total=0``，页面看起来像「数据没了」；
-        更糟的是下一期会从 500 分重新开始，和已落盘的最终表对不上。
+        为什么需要：服务重启后 :class:`Session` 的构造函数总是从初始分开始；
+        而「最近一期」可能**还没跑完**（周期存盘每 200 局一次）。不读回来的话，
+        服务一重启，那一期的最终 ELO 表就只剩重启后那段 —— 同一期重启三次
+        冠军变了三次，那是假的（2026-10-20 实测）。
+
+        ⚠️ 2026-10-21 起口径变了：官方天梯**每期独立** ✗ 天梯不再跨期累积 ✗
+           所以这里读回来的只是「**那一期自己**」的分数状态，
+           它**不会**被带进下一期 —— 下一期开局 ``_enter_season()`` 会把
+           rating 重置回初始分 ✓（``test_season_independent.py`` 有正向 + 负向验证 ✓）
 
         只在最新一期的参战者名单（key 集合）与当前阵容一致时续接；
         对不上就忽略（宁可从头开始，也不要把别的池子的分数混进来）。
@@ -140,43 +145,89 @@ class Session:
                     else:
                         seed = E.seed_from_sid(sid)
                     self.arena.seed = seed
+                    # 该期**已经落盘了几局**（0 = 新一期）
                     # ⚠️ **续跑要把场次序号接上** ✗ 否则 seed_of(index) 会重复发出
                     #    同一批种子 -> 补跑出来的前几局和已有的**一模一样** ✗（重复数据）
+                    have = 0
                     if prev is not None:
                         try:
                             have = sum(1 for _ in E.iter_matches(prev))
                         except OSError:
                             have = 0
-                        if have:
-                            self.arena.n_matches = have
-                            log(f"↩️ 续跑 {sid}：已有 {have} 局，场次序号从 {have} 接着数")
                     self.season = E.open_season(
                         sid, players=self.arena.players, copies=self.copies,
                         seed_base=seed, target=matches)
-                    # ⚠️ **把该期的分数读回来** ✗ —— 否则每次重启 arena 的分数都归零 ✓
-                    #    -> 期未跑完就重启 => 最终 ELO 表只反映**最后一次跑**的那段 ✗
-                    #       （2026-10-20 实测：同一期重启三次，冠军变了三次 ✓ 那是假的 ✓）
-                    st_path = self.season.dir / "arena.json"
-                    if st_path.exists():
-                        try:
-                            loaded = Arena.load(st_path)
-                            if loaded is not None and loaded.players == self.arena.players \
-                                    and len(loaded.participants) == len(self.arena.participants):
-                                self.arena = loaded
-                                self.arena.seed = seed
-                                log(f"↩️ 读回 {sid} 的分数状态："
-                                    f"{self.arena.n_matches} 场、"
-                                    f"{len(self.arena.participants)} 个参战者")
-                            else:
-                                log("⚠️ 存档的 arena 与当前阵容不符，忽略它（从零开始）")
-                        except Exception as exc:  # noqa: BLE001
-                            log(f"⚠️ 读回分数失败（从零开始）：{type(exc).__name__}: {exc}")
+                    # ★★★ 「每期独立」的分界线就在这一行 ★★★
+                    self._enter_season(sid, have, seed)
                 except Exception as exc:  # noqa: BLE001 - 存档失败不能拖垮跑局
                     log(f"⚠️ 开期失败（不影响跑局）：{type(exc).__name__}: {exc}")
                     self.season = None
             self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+
+    def _enter_season(self, sid: str, have: int, seed: int) -> None:
+        """进入某一期：**新一期从初始分重开**，续跑才读回该期自己的分数。
+
+        ⚠️ 这是「每期独立」的核心 ✗ 一秒都不能省 ✗
+           以前这里把上一期的 ``Arena`` 直接带进新一期 —— rating 一路
+           946 -> 1209 -> 1462 -> 1680，``games`` 一路涨到 48000 ✗
+           于是页面上的「该期最终 ELO / 冠军均分」**根本不是该期的成绩** ✗
+           （用户 2026-10-21 实测指出；天梯存在的唯一意义是**横向公平比较** ✓）
+
+        ⚠️ 只重置**本期**的东西：rating / ``Participant.games`` / 曲线 / 名次 …
+           ``arena.done_total``（服务级累计进度，配额看它）**绝不动** ✓
+           —— 两个计数器混在一起就是上一轮的口径错 ✗
+
+        ``have``: 该期 ``matches.jsonl`` 里已经有多少局（0 = 新一期）
+        """
+        from aimodel import elo_store as E
+        from aimodel.arena import INITIAL_RATING
+
+        if have <= 0:
+            self.arena.new_season()            # 同时把 n_matches（本期序号）归零
+            log(f"🆕 新一期 {sid}：{len(self.arena.participants)} 个参战者从 "
+                f"{INITIAL_RATING:.0f} 分起算（上期成绩已清空；"
+                f"done_total 累计 {self.arena.done_total} 场照旧只增不减 ✓）")
+            return
+
+        # ---- 续跑：**只能**读该期自己的状态，绝不能把上一期的 rating 带进来 ----
+        loaded = None
+        st_path = self.season.dir / "arena.json"   # type: ignore[union-attr]
+        if st_path.exists():
+            try:
+                loaded = Arena.load(st_path)
+            except Exception as exc:  # noqa: BLE001
+                log(f"⚠️ 读回分数失败（改用 matches.jsonl 重算）："
+                    f"{type(exc).__name__}: {exc}")
+                loaded = None
+            if loaded is not None and (
+                    loaded.players != self.arena.players
+                    or len(loaded.participants) != len(self.arena.participants)):
+                log("⚠️ 存档的 arena 与当前阵容不符，忽略它（改用 matches.jsonl 重算）")
+                loaded = None
+        if loaded is not None and loaded.n_matches == have:
+            # 快照正好追平已落盘局数 -> 直接用（省一次全期重算）
+            self.arena = loaded
+            self.arena.seed = seed
+            log(f"↩️ 续跑 {sid}：读回该期分数状态 {self.arena.n_matches} 场、"
+                f"{len(self.arena.participants)} 个参战者")
+            return
+
+        # 没有快照、或快照落后（周期存盘最多差 200 局）-> 用该期的 matches.jsonl
+        # **按名次精确重算**回来 ✓ 不重打牌 ✓ 和实时跑局同一条 _settle() ✓
+        #   ⚠️ replay_ranks(fresh=True) 会先 new_season() —— 上一期的分数进不来 ✓
+        try:
+            n = self.arena.replay_ranks(E.iter_matches(self.season))
+        except Exception as exc:  # noqa: BLE001
+            log(f"⚠️ 用 matches.jsonl 重算失败，这一期改为从初始分重开："
+                f"{type(exc).__name__}: {exc}")
+            self.arena.new_season()
+            return
+        self.arena.seed = seed
+        self.arena.n_matches = have            # 以盘上实际局数为准（快照可能更旧）
+        log(f"↩️ 续跑 {sid}：没有可用分数快照，用 matches.jsonl 重算了 {n} 局"
+            f"（该期已落盘 {have} 局）")
 
     def pause(self) -> None:
         with self.lock:
@@ -259,6 +310,11 @@ class Session:
             from aimodel import elo_store as E
 
             season.finished_at = time.time()
+            # ⚠️ ``season.done`` 是**这一期**跑了多少局 ✗ 不是服务级累计 ✗
+            #    以前这里写的是 ``arena.n_matches``，而它是跨期累积的
+            #    -> 一期 4000 局，meta.json 写 8000 / 12000，scores 的 summary
+            #       也写 8000 / 12000 ✗（用户 2026-10-21 实测：口径错 ✗）
+            #    -> 现在 ``n_matches`` 每期归零；服务级累计挪到 ``arena.done_total`` ✓
             season.done = arena.n_matches
             table = arena.table()
             if table:
@@ -270,8 +326,10 @@ class Session:
                     E.champion_by_model(table)
                 season.champion_key = season.champion
             E.save_season(season)
-            E.save_scores(season.sid, table, {"players": arena.players,
-                                              "matches": arena.n_matches})
+            E.save_scores(season.sid, table,
+                          {"players": arena.players,
+                           "matches": arena.n_matches,        # 本期局数 ✓
+                           "done_total": arena.done_total})   # 服务级累计（参考 ✓）
             try:
                 arena.save(season.dir / "arena.json")   # 分数状态跟着期一起存 ✓
             except Exception as exc:  # noqa: BLE001
@@ -291,7 +349,10 @@ class Session:
                 "strict": a.strict,
                 "running": self.running,
                 "target": self.target,
-                "done_total": a.n_matches,
+                #: **服务级累计**场次（跨期只增不减；配额/调度看它 ✓）
+                #: ⚠️ 别再把它当「本期局数」✗ —— 那是 ``done_season`` ✓
+                #:    （以前两件事共用一个计数，于是「一期 4000 局」在页面上写成 48000 ✗）
+                "done_total": a.done_total,
                 "done_run": self.done,
                 #: **新增**（只加不改）：直接可读的计数（老字段全部保持原样）
                 "external_failed": a.external_failed,
@@ -311,6 +372,9 @@ class Session:
                 "summary_weighted": self._summary_weighted(a),
                 "log": a.log[-14:],
                 "copies": self.copies,
+                #: **本期**已跑多少局（页面的「本轮进度」「本期进度」看它 ✓）
+                #: ⚠️ 与上面的 ``done_total``（服务级累计）**不是一个东西** ✗
+                "done_season": a.n_matches,
                 #: **新增**（只加不改）：外部参战者（Mortal 等）的配置与计数 ✓
                 "external": {
                     "enabled": bool(a.externals),
