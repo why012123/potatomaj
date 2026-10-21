@@ -13,15 +13,18 @@
   header { padding:13px 18px; border-bottom:1px solid var(--line);
            display:flex; gap:18px; align-items:baseline; flex-wrap:wrap; }
   h1 { font-size:17px; margin:0; }
+  h3 { font-size:13px; margin:16px 0 6px; color:var(--dim); font-weight:600; }
   .dim { color:var(--dim); } a { color:#58a6ff; text-decoration:none; }
   a:hover { text-decoration:underline; }
-  main { padding:16px 18px; max-width:1180px; }
+  main { padding:16px 18px; max-width:1180px; margin:0 auto; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
           padding:12px 14px; margin-bottom:14px; }
   h2 { font-size:14px; margin:0 0 10px; color:var(--dim); font-weight:600; }
   table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; font-size:13px; }
   th,td { text-align:left; padding:5px 8px; border-bottom:1px solid var(--line); }
-  th { color:var(--dim); font-weight:600; font-size:12px; }
+  th { color:var(--dim); font-weight:600; font-size:12px; position:sticky; top:0;
+       background:var(--card); z-index:1; }
+  .scroll { max-height:430px; overflow:auto; }
   .slots { display:flex; gap:10px; flex-wrap:wrap; }
   .slot { flex:1; min-width:110px; border:1px solid var(--line); border-radius:8px;
           padding:9px 11px; background:#0d1117; }
@@ -32,16 +35,34 @@
   .bar { height:7px; background:#21262d; border-radius:4px; overflow:hidden; margin-top:7px; }
   .bar > i { display:block; height:100%; background:var(--hi); width:0; transition:width .3s; }
   .row { display:flex; gap:16px; flex-wrap:wrap; align-items:baseline; }
+  .spacer { flex:1; }
   button { background:#21262d; color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:4px 11px; cursor:pointer; font-size:12px; }
   button:hover { background:#30363d; }
+  button.on { background:var(--hi); border-color:var(--hi); color:#fff; }
   button:disabled { opacity:.4; cursor:default; }
+  select { background:#21262d; color:var(--fg); border:1px solid var(--line);
+           border-radius:6px; padding:4px 8px; font-size:12px; }
   .star { color:var(--warn); }
   .tag { font-size:11px; padding:1px 6px; border-radius:9px; background:#21262d;
          color:var(--dim); margin-left:6px; }
-  .tag.p { background:#f8514922; color:var(--bad); }
+  .tag.live { background:#3fb95022; color:var(--acc); }
+  .tag.scores { background:#1f6feb22; color:#58a6ff; }
+  .tag.none { background:#f8514922; color:var(--bad); }
   #detail { display:none; }
   .mv { cursor:pointer; } .mv:hover { background:#1f6feb22; }
+  .empty { padding:14px 6px; color:var(--dim); font-size:13px; line-height:1.8; }
+  .chart { width:100%; height:auto; background:#0d1117; border:1px solid var(--line);
+           border-radius:8px; overflow:hidden; }
+  .chart svg { display:block; width:100%; height:auto; }
+  .legend { display:flex; flex-wrap:wrap; gap:6px 16px; margin-top:9px; font-size:12px; }
+  .legend .lg { display:inline-flex; gap:6px; align-items:baseline; }
+  .legend i { width:9px; height:9px; border-radius:50%; display:inline-block; }
+  .trend-note { margin-top:8px; color:var(--dim); font-size:12px; line-height:1.8; }
+  .warnbox { border:1px solid #f85149; border-radius:8px; padding:9px 11px;
+             margin-bottom:10px; background:#f8514911; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -54,7 +75,7 @@
 </header>
 
 <main>
-  <!-- 当期 -->
+  <!-- 当期进度 -->
   <div class="card">
     <h2>当期</h2>
     <div id="cur" class="dim">读取中…</div>
@@ -65,13 +86,29 @@
     </div>
   </div>
 
-  <!-- 当期实时榜（手动池那张表的同款 ✓ 5 秒一刷） -->
+  <!-- 实时：模型榜在上（按场数加权），实例榜在下 -->
   <div class="card">
-    <h2>当期实时榜 <span class="dim" style="font-weight:400;font-size:12px">
-      —— 和手动池同一套渲染 ✓ 每 5 秒刷新</span></h2>
-    <div style="max-height:420px;overflow:auto">
-      <table id="live"><thead><tr>
-        <th>#</th><th>参战者</th><th>段位分</th><th>场数</th>
+    <h2>当期实时模型榜
+      <span class="dim" style="font-weight:400;font-size:12px">
+        —— 同一模型的多个实例按场数加权（不是简单平均）· 每 5 秒刷新</span>
+    </h2>
+    <div id="liveModelMeta" class="dim" style="font-size:12px;margin-bottom:6px">读取中…</div>
+    <div class="scroll">
+      <table id="liveModel"><thead><tr>
+        <th>#</th><th>模型</th><th>实例数</th><th>场数</th><th>ELO</th>
+        <th>一位率</th><th>和了率</th><th>放铳率</th><th>版本</th><th>风格</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>当期实时实例榜
+      <span class="dim" style="font-weight:400;font-size:12px">
+        —— 完整实例排名（不是只显示前 40）· 每 5 秒刷新</span>
+    </h2>
+    <div class="scroll">
+      <table id="liveInst"><thead><tr>
+        <th>#</th><th>参战者</th><th>模型</th><th>ELO</th><th>场数</th>
         <th>一位率</th><th>和了率</th><th>放铳率</th><th>状态</th>
       </tr></thead><tbody></tbody></table>
     </div>
@@ -83,6 +120,20 @@
     </div>
   </div>
 
+  <!-- 跨期趋势 -->
+  <div class="card">
+    <div class="row" style="margin-bottom:4px">
+      <h2 style="margin:0">模型 ELO 趋势</h2>
+      <span class="spacer"></span>
+      <button data-range="3" class="on">最近 3 天</button>
+      <button data-range="all">全部</button>
+    </div>
+    <div id="trendMeta" class="dim" style="font-size:12px;margin:6px 0">读取中…</div>
+    <div id="trend" class="chart"><div class="empty">读取中…</div></div>
+    <div id="legend" class="legend"></div>
+    <div id="trendNote" class="trend-note"></div>
+  </div>
+
   <!-- 今天五个档位 -->
   <div class="card">
     <h2>今天的档位（每天 08 / 11 / 14 / 17 / 20 点各一期，每期 4000 局）</h2>
@@ -91,14 +142,23 @@
 
   <!-- 历史各期 -->
   <div class="card">
-    <h2>历史各期</h2>
-    <div class="dim" style="margin-bottom:8px;font-size:12px">
-      3 天前、且**没有收藏**的期会自动精简成「只留冠军名字」（回放数据删掉以省空间）。
-      最终 ELO 表长期保留。
+    <div class="row" style="margin-bottom:6px">
+      <h2 style="margin:0">历史各期</h2>
+      <span class="spacer"></span>
+      <label class="dim" style="font-size:12px">选择期
+        <select id="histSel"></select>
+      </label>
     </div>
-    <table id="hist"><thead><tr>
-      <th>期号</th><th>冠军（按模型均分）</th><th>场次</th><th>回放</th><th>收藏</th><th></th>
-    </tr></thead><tbody></tbody></table>
+    <div class="dim" style="margin-bottom:8px;font-size:12px">
+      任意已存在的期都能点开，看到该期完整排名（模型榜 + 实例榜）。
+      3 天前、且没有收藏的期只会精简「逐局回放」，最终 ELO 表长期保留，所以历史榜仍然完整。
+    </div>
+    <div class="scroll">
+      <table id="hist"><thead><tr>
+        <th>期号</th><th>冠军（按场数加权）</th><th>场次</th>
+        <th>模型/实例</th><th>回放</th><th>收藏</th><th></th>
+      </tr></thead><tbody></tbody></table>
+    </div>
   </div>
 
   <!-- 某期详情 -->
@@ -110,7 +170,22 @@
         <button id="dClose">关闭</button>
       </div>
     </div>
-    <div id="dBody" style="margin-top:10px"></div>
+    <div id="dMeta" class="dim" style="margin-top:6px;font-size:12px"></div>
+    <h3>模型榜（按场数加权，模型名 / 实例数 / 场数 / ELO / 一位率 / 和了率 / 放铳率 / 版本 / 风格）</h3>
+    <div class="scroll">
+      <table id="dModel"><thead><tr>
+        <th>#</th><th>模型</th><th>实例数</th><th>场数</th><th>ELO</th>
+        <th>一位率</th><th>和了率</th><th>放铳率</th><th>版本</th><th>风格</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <h3>实例榜（完整）</h3>
+    <div class="scroll">
+      <table id="dInst"><thead><tr>
+        <th>#</th><th>参战者</th><th>模型</th><th>ELO</th><th>场数</th>
+        <th>一位率</th><th>和了率</th><th>放铳率</th><th>状态</th>
+      </tr></thead><tbody></tbody></table>
+    </div>
+    <div id="dMatches" style="margin-top:12px"></div>
   </div>
 
   <div class="card">
@@ -120,195 +195,492 @@
 </main>
 
 <script>
-const $ = id => document.getElementById(id);
-let LAST = null;
+"use strict";
 
+const $ = id => document.getElementById(id);
+const RANGE_BTN = () => document.querySelectorAll("[data-range]");
+const COLORS = ["#58a6ff","#3fb950","#d29922","#f85149","#bc8cff","#39c5cf",
+                "#ff7b72","#7ee787","#e3b341","#ffa657","#a5d6ff","#ff9bce",
+                "#56d364","#f0883e","#79c0ff","#d2a8ff","#2ea043","#db6d28"];
+
+let LAST = null;        // /api/elo/schedule
+let HIST = null;        // /api/elo/history (列表 + 趋势)
+let CUR_SID = "";       // 当前期（实时榜看这个）
+let SELECTED = "";      // 历史详情里选中的期
+let RANGE = "3";        // "3" = 最近 3 天；"all" = 全部
+let FIRST_HIST = true;  // 首次加载自动打开一期，便于一眼看到历史榜
+let MATCH_ROWS = 0;
+let MATCH_TOTAL = 0;
+
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function pct(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? (n * 100).toFixed(1) + "%" : "—";
+}
+function eloText(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(1) : "—";
+}
+function fmtSid(sid) {
+  // 标准官方期号：10-21 11:00；手动期号带一次性后缀：10-20 20:00·169
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2})(?:-[^-]+-([A-Za-z0-9]+))?$/.exec(String(sid || ""));
+  if (m) return `${m[2]}-${m[3]} ${m[4]}:00${m[5] ? "·" + m[5] : ""}`;
+  return String(sid || "—");
+}
 function fmtState(s) {
   return { done: "已完成", due: "待跑（补跑窗口内）", upcoming: "未到时间",
            missed: "已错过（不补）" }[s] || s;
 }
+function srcLabel(src) {
+  return { live: "实时快照", scores: "最终 ELO 表", none: "暂无 ELO 表" }[src] || src || "—";
+}
+function srcTag(src) {
+  return `<span class="tag ${src || "none"}">${escapeHtml(srcLabel(src))}</span>`;
+}
+function setEmpty(id, text, colspan) {
+  const tb = $(id).querySelector("tbody");
+  tb.innerHTML = `<tr><td colspan="${colspan || 10}" class="empty">${escapeHtml(text)}</td></tr>`;
+}
+function setError(id, e, colspan) {
+  const tb = $(id).querySelector("tbody");
+  tb.innerHTML = `<tr><td colspan="${colspan || 10}" class="empty" style="color:#f85149">
+    加载失败：${escapeHtml(e && e.message ? e.message : e)}（页面其余部分继续可用）</td></tr>`;
+}
 
-async function loadSchedule() {
-  const d = await (await fetch("/api/elo/schedule")).json();
-  LAST = d;
-  const box = $("slots");
-  box.innerHTML = (d.slots || []).map(r => `
-    <div class="slot">
-      <div class="h">${String(r.slot).padStart(2, "0")}:00</div>
-      <div class="s s-${r.state}">${fmtState(r.state)}</div>
-      <div class="dim" style="font-size:11px">${r.season_id}</div>
-    </div>`).join("");
-  $("next").textContent = `下次 ${d.next}`;
+async function api(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  let d = null;
+  try { d = await r.json(); } catch (_) { /* 下面统一报错 */ }
+  if (!r.ok || !d || d.ok === false) {
+    const msg = (d && d.error) ? d.error : `HTTP ${r.status}`;
+    throw new Error(msg);
+  }
   return d;
 }
 
-async function loadCurrent() {
-  const d = await (await fetch("/api/arena")).json();
-  const bar = $("curbar").firstElementChild;
-  if (d.running) {
-    const pct = d.target ? Math.min(100, (d.done_run / d.target) * 100) : 0;
-    bar.style.width = pct.toFixed(1) + "%";
-    $("cur").innerHTML = `<b class="s-due">正在跑</b> · ${d.players} 麻 · `
-      + `已完成 <b>${d.done_run}</b> / ${d.target} 局`
-      + ` · 已用 ${d.elapsed}s`
-      + (d.error ? ` · <span class="bad">${d.error}</span>` : "");
-  } else {
-    bar.style.width = "0%";
-    $("cur").innerHTML = `<span class="dim">空闲</span>`
-      + (d.error ? ` · <span style="color:#f85149">${d.error}</span>` : "")
-      + (LAST && LAST.current_season ? ` · 上一期 <b>${LAST.current_season}</b>` : "");
+/* ---------------- 当期进度 ---------------- */
+async function loadArena() {
+  try {
+    const d = await api("/api/arena");
+    const bar = $("curbar").firstElementChild;
+    if (d.running) {
+      const p = d.target ? Math.min(100, (d.done_run / d.target) * 100) : 0;
+      bar.style.width = p.toFixed(1) + "%";
+      $("cur").innerHTML = `<b class="s-due">正在跑</b> · ${d.players} 麻 · `
+        + `已完成 <b>${d.done_run}</b> / ${d.target} 局 · 已用 ${d.elapsed}s`
+        + (d.error ? ` · <span class="s-missed">${escapeHtml(d.error)}</span>` : "");
+    } else {
+      bar.style.width = "0%";
+      $("cur").innerHTML = `<span class="dim">空闲</span>`
+        + (d.error ? ` · <span class="s-missed">${escapeHtml(d.error)}</span>` : "")
+        + (LAST && LAST.current_season ? ` · 上一期 <b>${escapeHtml(LAST.current_season)}</b>` : "");
+    }
+    $("curMeta").textContent = `${d.alive}/${d.total} 个参战者存活 · 种子 ${d.seed}`
+      + ` · 每模型 ${d.copies} 个实例 · 累计 ${d.done_total} 场`;
+    renderLiveLog(d.log || []);
+  } catch (e) {
+    $("cur").innerHTML = `<span class="s-missed">进度加载失败：${escapeHtml(e.message)}</span>`;
   }
-  $("curMeta").textContent = `${d.alive}/${d.total} 个参战者存活 · 种子 ${d.seed}`;
-  renderLive(d);
+}
+function renderLiveLog(log) {
+  $("liveLog").innerHTML = (log && log.length)
+    ? log.map(x => `<div>${escapeHtml(x)}</div>`).join("")
+    : '<span class="dim">（最近对局会显示在这里）</span>';
 }
 
-/**
- * 当期实时榜 —— 渲染 `/api/arena` 的 table + log。
- * ⚠️ `Arena.table()` 的字段是**中文**（名/模型/分数/场数/一位率/…）✗
- *    不是 rating/games 那套 ✗（这里踩过一次：按英文键取会全是 undefined）
- */
-function renderLive(d) {
-  const rows = d.table || [];
-  const tb = $("live").querySelector("tbody");
-  if (!rows.length) {
-    tb.innerHTML = `<tr><td colspan="8" class="dim">还没有数据（开跑后就会出现）</td></tr>`;
-  } else {
-    const pct = v => (v === undefined || v === null || isNaN(v))
-      ? "—" : (v * 100).toFixed(1) + "%";
-    tb.innerHTML = rows.map((r, i) => {
-      const atFloor = (r["状态"] || "") !== "存活";
-      return `<tr>
-        <td>${i + 1}</td>
-        <td>${r["名"] || r["模型"] || ""}</td>
-        <td>${r["分数"] ?? "—"}</td>
-        <td>${r["场数"] ?? 0}</td>
-        <td>${pct(r["一位率"])}</td>
-        <td>${pct(r["和了率"])}</td>
-        <td>${pct(r["放铳率"])}</td>
-        <td>${atFloor ? `<span class="s-missed">${r["状态"]}</span>`
-                       : `<span class="dim">存活</span>`}</td>
-      </tr>`;
+/* ---------------- 档位 ---------------- */
+async function loadSchedule() {
+  try {
+    const d = await api("/api/elo/schedule");
+    LAST = d;
+    if (d.current_season) CUR_SID = d.current_season;
+    const box = $("slots");
+    if (!(d.slots || []).length) {
+      box.innerHTML = `<div class="empty">今天的档位还没算出来（服务刚启动时可能短暂为空，稍后自动刷新）。</div>`;
+    } else {
+      box.innerHTML = d.slots.map(r => `
+        <div class="slot">
+          <div class="h">${String(r.slot).padStart(2, "0")}:00</div>
+          <div class="s s-${escapeHtml(r.state)}">${escapeHtml(fmtState(r.state))}</div>
+          <div class="dim" style="font-size:11px">${escapeHtml(r.season_id)}</div>
+        </div>`).join("");
+    }
+    $("next").textContent = d.next ? `下次 ${d.next}` : "—";
+  } catch (e) {
+    $("slots").innerHTML = `<div class="empty" style="color:#f85149">档位加载失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+/* ---------------- 实时榜（模型 + 实例） ---------------- */
+function renderModelTable(id, models, emptyText) {
+  if (!models || !models.length) { setEmpty(id, emptyText || "还没有模型数据。", 10); return; }
+  const tb = $(id).querySelector("tbody");
+  tb.innerHTML = models.map((r, i) => {
+    const inst = `${r["实例数"] ?? 0}` +
+      ((r["已赛实例"] != null && r["已赛实例"] !== r["实例数"]) ? `（已赛 ${r["已赛实例"]}）` : "");
+    return `<tr>
+      <td>${i + 1}</td>
+      <td><b>${escapeHtml(r["模型"])}</b></td>
+      <td>${inst}</td>
+      <td>${r["场数"] ?? 0}</td>
+      <td><b>${eloText(r["ELO"] ?? r["分数"])}</b></td>
+      <td>${pct(r["一位率"])}</td>
+      <td>${pct(r["和了率"])}</td>
+      <td>${pct(r["放铳率"])}</td>
+      <td>${escapeHtml(r["版本"] || "—")}</td>
+      <td>${escapeHtml(r["风格"] || "—")}</td>
+    </tr>`;
+  }).join("");
+}
+function renderInstTable(id, rows, emptyText) {
+  if (!rows || !rows.length) { setEmpty(id, emptyText || "还没有实例数据。", 9); return; }
+  const tb = $(id).querySelector("tbody");
+  tb.innerHTML = rows.map((r, i) => {
+    const atFloor = (r["状态"] || "存活") !== "存活";
+    return `<tr>
+      <td>${i + 1}</td>
+      <td>${escapeHtml(r["名"] || r["模型"] || "")}</td>
+      <td>${escapeHtml(r["模型"] || "")}</td>
+      <td>${eloText(r["分数"])}</td>
+      <td>${r["场数"] ?? 0}</td>
+      <td>${pct(r["一位率"])}</td>
+      <td>${pct(r["和了率"])}</td>
+      <td>${pct(r["放铳率"])}</td>
+      <td>${atFloor ? `<span class="s-missed">${escapeHtml(r["状态"])}</span>`
+                     : `<span class="dim">存活</span>`}</td>
+    </tr>`;
+  }).join("");
+}
+async function loadLive() {
+  if (!CUR_SID) {
+    $("liveModelMeta").textContent = "当前没有期（等 08/11/14/17/20 档位开跑后自动出现）。";
+    setEmpty("liveModel", "当前还没有任何一期，模型榜等开跑后出现。", 10);
+    setEmpty("liveInst", "当前还没有任何一期，实例榜等开跑后出现。", 9);
+    return;
+  }
+  try {
+    const d = await api(`/api/elo/history?season=${encodeURIComponent(CUR_SID)}&days=${RANGE}`);
+    const m = d.models || [], t = d.table || [];
+    $("liveModelMeta").innerHTML = `期 <b>${escapeHtml(CUR_SID)}</b> ${srcTag(d.source)}`
+      + ` · 模型 <b>${m.length}</b> 个 · 实例 <b>${t.length}</b> 个`
+      + ` · 按场数加权 · 每 5 秒刷新`
+      + (d.message ? ` · <span class="dim">${escapeHtml(d.message)}</span>` : "");
+    renderModelTable("liveModel", m, "该期还没有模型数据（可能还在跑）；不会白屏。");
+    renderInstTable("liveInst", t, "该期还没有实例数据（可能还在跑）；不会白屏。");
+  } catch (e) {
+    $("liveModelMeta").innerHTML = `<span class="s-missed">实时榜加载失败：${escapeHtml(e.message)}</span>`;
+    setError("liveModel", e, 10);
+    setError("liveInst", e, 9);
+  }
+}
+
+/* ---------------- 历史列表 ---------------- */
+function championCell(s) {
+  if (!s.champion) return '<span class="dim">—</span>';
+  let out = `<b>${escapeHtml(s.champion)}</b>`;
+  if (s.champion_avg) out += ` <span class="dim">加权 ${eloText(s.champion_avg)}</span>`;
+  const instModel = String(s.champion_inst || "").replace(/#\d+$/, "");
+  if (s.champion_inst && instModel !== s.champion) {
+    out += `<br><span class="dim" style="font-size:11px">单实例最高：`
+         + `${escapeHtml(s.champion_inst)}（${eloText(s.champion_inst_score)}）</span>`;
+  }
+  return out;
+}
+function renderSeasonList(d) {
+  const seasons = d.seasons || [];
+  const tb = $("hist").querySelector("tbody");
+  const sel = $("histSel");
+  if (!seasons.length) {
+    sel.innerHTML = `<option value="">还没有任何一期</option>`;
+    sel.disabled = true;
+    tb.innerHTML = `<tr><td colspan="7" class="empty">还没有任何一期。等官方档位开跑后，这里会自动出现；页面不会白屏。</td></tr>`;
+    return;
+  }
+  sel.disabled = false;
+  const want = seasons.some(s => s.sid === SELECTED) ? SELECTED : (d.current || seasons[0].sid);
+  sel.innerHTML = seasons.map(s =>
+    `<option value="${escapeHtml(s.sid)}">${escapeHtml(fmtSid(s.sid))}`
+    + ` · ${s.done || 0} 局${s.pruned ? " · 已精简" : ""}</option>`).join("");
+  sel.value = want;
+  tb.innerHTML = seasons.map(s => `<tr>
+      <td>${escapeHtml(s.sid)}${s.note ? '<br><span class="s-missed" style="font-size:11px">已作废</span>' : ''}</td>
+      <td>${championCell(s)}</td>
+      <td>${s.pruned ? '<span class="dim">已精简</span>' : (s.done || 0)}</td>
+      <td>${s.model_count || 0} / ${s.instance_count || 0}</td>
+      <td>${s.has_replay ? '<span class="s-done">有</span>' : '<span class="dim">无</span>'}</td>
+      <td>${s.favorite ? '<span class="star">★</span>' : ""}</td>
+      <td><button class="mv" data-sid="${escapeHtml(s.sid)}">查看</button></td>
+    </tr>`).join("");
+  tb.querySelectorAll("button.mv").forEach(b => {
+    b.onclick = () => { SELECTED = b.dataset.sid; $("histSel").value = SELECTED; showSeason(SELECTED); };
+  });
+  if (!SELECTED) SELECTED = want;
+}
+
+/* ---------------- 趋势图 ---------------- */
+function renderTrend(d) {
+  const trend = d.trend || {};
+  const sids = trend.sids || [];
+  const series = (trend.series || []).filter(s => (s.n || 0) > 0);
+  const box = $("trend"), legend = $("legend"), note = $("trendNote"), meta = $("trendMeta");
+  const win = d.range === "all" ? "全部期" : `最近 ${d.days} 天`;
+  meta.textContent = `窗口：${win} · ${sids.length} 期 · ${series.length} 个模型`;
+  legend.innerHTML = "";
+  note.textContent = "";
+
+  if (!sids.length) {
+    box.innerHTML = `<div class="empty">还没有任何一期，趋势图暂时没有数据；等档位开跑后自动出现（不会白屏）。</div>`;
+    return;
+  }
+  if (!series.length) {
+    box.innerHTML = `<div class="empty">这些期还没有模型榜数据（可能还在跑或回放已精简）；等收尾后自动出现（不会白屏）。</div>`;
+    return;
+  }
+  const with2 = series.filter(s => (s.n || 0) >= 2);
+  if (sids.length < 2 || !with2.length) {
+    box.innerHTML = `<div class="empty">数据不够画折线：当前只有 ${sids.length} 期`
+      + `${sids.length < 2 ? "（至少需要 2 期）" : ""}，`
+      + `且没有模型在 2 期里都出现过。缺期不连线，所以这里只列已有数值，不会白屏。`
+      + `等 14:00 / 17:00 / 20:00 档位收尾后会自动变多。</div>`;
+    legend.innerHTML = series.map((s, i) => {
+      const c = COLORS[i % COLORS.length];
+      const last = s.last;
+      return `<span class="lg"><i style="background:${c}"></i>${escapeHtml(s["模型"])}`
+        + ` <span class="dim">${escapeHtml(s["版本"] || "")} ${escapeHtml(s["风格"] || "")}</span>`
+        + ` <b>${last ? eloText(last.ELO) : "—"}</b></span>`;
     }).join("");
+    const missing = trend.missing || [];
+    if (missing.length) note.textContent = `缺期（没有 ELO 表，折线断开）：${missing.map(fmtSid).join("、")}`;
+    return;
   }
-  const lg = d.log || [];
-  $("liveLog").innerHTML = lg.length
-    ? lg.map(x => `<div>${escapeHtml(x)}</div>`).join("")
-    : '<span style="color:#8b949e">（最近对局会显示在这里）</span>';
+
+  // 收集所有数值，定 Y 轴范围
+  const vals = [];
+  series.forEach(s => (s.points || []).forEach(p => {
+    if (p && Number.isFinite(Number(p.ELO))) vals.push(Number(p.ELO));
+  }));
+  if (!vals.length) {
+    box.innerHTML = `<div class="empty">有期，但所有趋势点都是空的；不会白屏。</div>`;
+    return;
+  }
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const pad = Math.max(20, (hi - lo) * 0.08);
+  lo -= pad; hi += pad;
+  if (hi === lo) { hi += 50; lo -= 50; }
+
+  const W = 960, H = 340, L = 58, R = 18, T = 18, B = 42;
+  const n = sids.length;
+  const xAt = i => L + (W - L - R) * (n <= 1 ? 0.5 : i / (n - 1));
+  const yAt = v => T + (H - T - B) * (hi - v) / (hi - lo);
+  const col = i => COLORS[i % COLORS.length];
+
+  let svg = `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">`;
+  // 横向网格 + Y 轴刻度
+  for (let g = 0; g <= 4; g++) {
+    const v = lo + (hi - lo) * g / 4;
+    const y = yAt(v);
+    svg += `<line x1="${L}" y1="${y.toFixed(1)}" x2="${W - R}" y2="${y.toFixed(1)}"`
+      + ` stroke="#30363d" stroke-width="1" stroke-dasharray="${g === 0 ? "0" : "3 4"}"/>`;
+    svg += `<text x="${L - 8}" y="${(y + 4).toFixed(1)}" fill="#8b949e" font-size="11"`
+      + ` text-anchor="end">${v.toFixed(0)}</text>`;
+  }
+  // X 轴刻度
+  sids.forEach((sid, i) => {
+    const x = xAt(i);
+    svg += `<line x1="${x.toFixed(1)}" y1="${T}" x2="${x.toFixed(1)}" y2="${H - B}"`
+      + ` stroke="#30363d" stroke-width="1" stroke-dasharray="2 6"/>`;
+    svg += `<text x="${x.toFixed(1)}" y="${H - B + 18}" fill="#8b949e" font-size="11"`
+      + ` text-anchor="middle">${escapeHtml(fmtSid(sid))}</text>`;
+  });
+  // 每个模型：缺期（null）处断开，绝不跨期连线
+  series.forEach((s, si) => {
+    const c = col(si);
+    let seg = [];
+    const flush = () => {
+      if (seg.length > 1) {
+        svg += `<polyline fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round"`
+          + ` stroke-linecap="round" points="${seg.map(p => p.join(",")).join(" ")}"/>`;
+      }
+      seg = [];
+    };
+    (s.points || []).forEach((p, i) => {
+      if (!p || !Number.isFinite(Number(p.ELO))) { flush(); return; }
+      const x = xAt(i), y = yAt(Number(p.ELO));
+      seg.push([x.toFixed(1), y.toFixed(1)]);
+      svg += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.2" fill="${c}">`
+        + `<title>${escapeHtml(s["模型"])} · ${escapeHtml(fmtSid(sids[i]))} · `
+        + `${eloText(p.ELO)}（${p["场数"] || 0} 场）</title></circle>`;
+    });
+    flush();
+  });
+  svg += `</svg>`;
+  box.innerHTML = svg;
+
+  legend.innerHTML = series.map((s, i) => {
+    const last = s.last;
+    return `<span class="lg"><i style="background:${col(i)}"></i>${escapeHtml(s["模型"])}`
+      + ` <span class="dim">${escapeHtml(s["版本"] || "")} ${escapeHtml(s["风格"] || "")}</span>`
+      + ` <b>${last ? eloText(last.ELO) : "—"}</b>`
+      + `${(s.n || 0) < 2 ? ' <span class="dim">（仅 1 期）</span>' : ""}</span>`;
+  }).join("");
+
+  const bits = [];
+  const missing = trend.missing || [];
+  if (missing.length) bits.push(`缺期（没有 ELO 表，折线断开）：${missing.map(fmtSid).join("、")}`);
+  const allSeasons = (d.seasons || []).length;
+  if (d.range !== "all" && allSeasons > sids.length) {
+    bits.push(`最近 ${d.days} 天内只有 ${sids.length} 期；更早的期在「全部」里。`);
+  }
+  bits.push("某个模型在某一期没有数据时，折线也会在该期断开，不会跨期连线。");
+  note.textContent = bits.join(" · ");
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, c => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+/* ---------------- 历史详情 ---------------- */
+function setFavButton(fav) {
+  $("dFav").textContent = fav ? "★ 取消收藏" : "☆ 收藏";
+  $("dFav").style.color = fav ? "#d29922" : "";
+}
+function renderMatches(d, reset) {
+  if (reset) { MATCH_ROWS = 0; MATCH_TOTAL = d.total || 0; }
+  const box = $("dMatches");
+  if (reset) box.innerHTML = "";
+  if (!(d.matches || []).length && reset) {
+    box.innerHTML = `<div class="dim" style="font-size:12px">该期没有可回放的对局（可能已精简，或还在跑）。最终 ELO 表不受影响。</div>`;
+    return;
+  }
+  let list = box.querySelector("#dMatchList");
+  if (!list) {
+    box.innerHTML = `<div class="dim" style="font-size:12px;margin-bottom:4px" id="dMatchHead"></div>`
+      + `<div id="dMatchList" style="max-height:220px;overflow:auto"></div>`
+      + `<div id="dMoreWrap" style="margin-top:8px"></div>`;
+    list = box.querySelector("#dMatchList");
+  }
+  const html = (d.matches || []).map(m => {
+    const g = (m.group || []).map(x => String(x).replace(/#\d+$/, "")).join(" / ");
+    return `<div class="mv" onclick="location.href='/replay?season=${encodeURIComponent(d.season.sid)}&index=${m.index}'"
+      style="padding:3px 6px;border-radius:4px;font-size:12px">
+      <span class="dim">#${m.index + 1}</span> 种子 ${m.seed} · ${escapeHtml(g)}
+      · 名次 ${(m.ranks || []).map(x => x + 1).join(" ")}</div>`;
+  }).join("");
+  list.insertAdjacentHTML("beforeend", html);
+  MATCH_ROWS += (d.matches || []).length;
+  const from = (d.offset || 0) + 1;
+  const to = (d.offset || 0) + (d.matches || []).length;
+  box.querySelector("#dMatchHead").textContent =
+    `对局 ${from}–${to} / 共 ${MATCH_TOTAL || d.total || "?"} 局（点开看回放）`;
+  const more = (MATCH_TOTAL || d.total || 0) - (d.offset || 0) - (d.matches || []).length;
+  const wrap = box.querySelector("#dMoreWrap");
+  wrap.innerHTML = more > 0 ? `<button id="dMore">加载更多（还有 ${more} 局）</button>` : "";
+  const btn = wrap.querySelector("#dMore");
+  if (btn) btn.onclick = () => loadMoreMatches(d.season.sid, (d.offset || 0) + (d.matches || []).length);
+}
+async function loadMoreMatches(sid, offset) {
+  try {
+    const d = await api(`/api/elo/season?id=${encodeURIComponent(sid)}&offset=${offset}&limit=30`);
+    renderMatches(d, false);
+  } catch (e) {
+    $("dMatches").insertAdjacentHTML("beforeend",
+      `<div class="empty" style="color:#f85149">加载更多失败：${escapeHtml(e.message)}</div>`);
+  }
+}
+async function showSeason(sid, silent) {
+  SELECTED = sid;
+  $("detail").style.display = "block";
+  $("dTitle").textContent = sid;
+  $("dMeta").innerHTML = '<span class="dim">读取中…</span>';
+  setEmpty("dModel", "读取中…", 10);
+  setEmpty("dInst", "读取中…", 9);
+  $("dMatches").innerHTML = "";
+  try {
+    const d = await api(`/api/elo/history?season=${encodeURIComponent(sid)}&days=${RANGE}`);
+    const s = d.season || {};
+    const bits = [
+      `期号 <b>${escapeHtml(sid)}</b>`,
+      `${s.players || 4} 麻`,
+      `场次 <b>${s.done || 0}</b>`,
+      srcTag(d.source),
+      s.favorite ? '<span class="star">★ 已收藏</span>' : "未收藏",
+      s.pruned ? '<span class="s-missed">回放已精简（最终 ELO 表仍完整）</span>' : "",
+    ].filter(Boolean);
+    $("dMeta").innerHTML = bits.join(" · ")
+      + `<div style="margin-top:5px">${escapeHtml(d.message || "")}</div>`;
+    setFavButton(!!s.favorite);
+    renderModelTable("dModel", d.models,
+      "该期还没有模型榜数据（可能还在跑，或最终 ELO 表还没落盘）；不会白屏。");
+    renderInstTable("dInst", d.table,
+      "该期还没有实例榜数据（可能还在跑，或最终 ELO 表还没落盘）；不会白屏。");
+
+    // 旧接口继续用来看逐局回放 / 收藏状态；它和榜单是两份字段，互补但不改口径。
+    try {
+      const old = await api(`/api/elo/season?id=${encodeURIComponent(sid)}&offset=0&limit=30`);
+      setFavButton(!!(old.season || {}).favorite);
+      renderMatches(old, true);
+    } catch (e) {
+      $("dMatches").innerHTML = `<div class="dim" style="font-size:12px">`
+        + `逐局回放加载失败：${escapeHtml(e.message)}（排行榜仍然可用）</div>`;
+    }
+  } catch (e) {
+    $("dMeta").innerHTML = `<span class="s-missed">该期加载失败：${escapeHtml(e.message)}</span>`;
+    setEmpty("dModel", "加载失败，页面其余部分继续可用。", 10);
+    setEmpty("dInst", "加载失败，页面其余部分继续可用。", 9);
+  }
 }
 
-async function loadHist() {
-  const d = await (await fetch("/api/elo/seasons")).json();
-  const st = d.stats || {};
+/* ---------------- 存储 ---------------- */
+function renderStats(st) {
+  if (!st) { $("stat").textContent = "存储统计不可用。"; return; }
   $("stat").innerHTML = `回放数据 <b>${st.replay_human}</b>（${st.matches} 局，`
     + `每局 ${st.per_match_bytes} B）· ELO 表 <b>${st.scores_human}</b> · `
     + `合计 <b>${st.human}</b> / ${st.quota_human}（已用 ${(st.used_pct || 0).toFixed(4)}%）`
     + `<br>按当前每局大小，配额还能装 <b>${(st.matches_capacity || 0).toLocaleString()}</b> 局`;
-
-  const tb = $("hist").querySelector("tbody");
-  if (!(d.seasons || []).length) {
-    tb.innerHTML = `<tr><td colspan="6" class="dim">还没有任何一期</td></tr>`;
-    return;
-  }
-  tb.innerHTML = d.seasons.map(s => `<tr>
-      <td>${s.sid}${s.note ? '<br><span class="s-missed" style="font-size:11px">已作废</span>' : ''}</td>
-      <td>${champCell(s)}</td>
-      <td>${s.pruned ? '<span class="dim">已精简</span>' : (s.done || 0)}</td>
-      <td>${s.has_replay ? '<span class="s-done">有</span>' : '<span class="dim">无</span>'}</td>
-      <td>${s.favorite ? '<span class="star">★</span>' : ""}</td>
-      <td><button class="mv" data-sid="${s.sid}">查看</button></td>
-    </tr>`).join("");
-  tb.querySelectorAll("button.mv").forEach(b => b.onclick = () => showSeason(b.dataset.sid));
 }
 
-/**
- * 冠军单元格：**以「模型均分」为准** ✓ 单实例最高只作附注 ✗
- * 为什么：每个模型派 copies 份参赛者（默认 3），单实例第一名噪声很大
- *         （三份同权重的模型，谁运气好谁高）。用户要求两者都显示。
- */
-function champCell(s) {
-  if (!s.champion) return '<span class="dim">—</span>';
-  let out = `<b>${s.champion}</b>`;
-  if (s.champion_avg) out += ` <span class="dim">均分 ${s.champion_avg}</span>`;
-  const instModel = (s.champion_inst || "").replace(/#\d+$/, "");
-  if (s.champion_inst && instModel !== s.champion) {
-    out += `<br><span class="dim" style="font-size:11px">单实例最高：`
-         + `${s.champion_inst}（${s.champion_inst_score}）</span>`;
-  }
-  return out;
-}
-
-async function showSeason(sid, offset = 0) {  CUR_SID = sid;
-  $("detail").style.display = "block";
-  $("dTitle").textContent = sid;
-  $("dBody").innerHTML = '<span class="dim">读取中…</span>';
-  const d = await (await fetch(`/api/elo/season?id=${encodeURIComponent(sid)}&offset=${offset}`)).json();
-  if (!d.ok) { $("dBody").innerHTML = `<span style="color:#f85149">${d.error}</span>`; return; }
-  const s = d.season, sc = d.scores || {};
-  setFavButton(!!s.favorite);
-  const rows = (sc.table || []).slice(0, 40);
-  // ⚠️ note 非空 = 该期已作废（例如 2026-10-21 之前算番 bug 的期次）
-  //    标了却不显示，等于没标 —— 所以详情页把它放在最前面。
-  let html = (s.note
-      ? `<div style="border:1px solid #f85149;border-radius:8px;padding:9px 11px;`
-        + `margin-bottom:10px;background:#f8514911">`
-        + `<b class="s-missed">本期作废</b>`
-        + `<div class="dim" style="font-size:12px;margin-top:4px;line-height:1.7">`
-        + escapeHtml(s.note) + `</div></div>`
-      : "")
-    + `<div class="row dim" style="margin-bottom:8px">
-      场次 ${s.done} · ${s.players} 麻 · 收藏 ${s.favorite ? "是" : "否"}` +
-      `${s.pruned ? " · <b>已精简（回放数据已删）</b>" : ""}</div>`;
-  if (rows.length) {
-    html += `<table><thead><tr><th>#</th><th>参战者</th><th>段位分</th>
-      <th>场数</th><th>一位率</th><th>和了率</th></tr></thead><tbody>`;
-    rows.forEach((r, i) => {
-      html += `<tr><td>${i + 1}</td><td>${r["名"] || r["模型"] || ""}</td>
-        <td>${r["分数"]}</td><td>${r["场数"]}</td>
-        <td>${(r["一位率"] * 100).toFixed(1)}%</td>
-        <td>${(r["和了率"] * 100).toFixed(1)}%</td></tr>`;
-    });
-    html += "</tbody></table>";
-  } else {
-    html += '<div class="dim">没有该期的 ELO 表（可能还没收尾）</div>';
-  }
-  if ((d.matches || []).length) {
-    const from = (d.offset || 0) + 1;
-    const to = (d.offset || 0) + (d.matches || []).length;
-    html += `<div class="dim" style="margin-top:12px">对局 ${from}–${to} / 共 `
-          + `${d.total !== undefined ? d.total : "?"} 局（点开看回放）：</div>`
-          + `<div style="max-height:200px;overflow:auto">`;
-    d.matches.forEach(m => {
-      const g = (m.group || []).map(x => x.replace(/#\d+$/, "")).join(" / ");
-      html += `<div class="mv" onclick="location.href='/replay?season=${sid}&index=${m.index}'"
-        style="padding:3px 6px;border-radius:4px;font-size:12px">
-        <span class="dim">#${m.index + 1}</span> 种子 ${m.seed} · ${g}
-        · 名次 ${(m.ranks || []).map(x => x + 1).join(" ")}</div>`;
-    });
-    html += "</div>";
-    const more = (d.total || 0) - (d.offset || 0) - (d.matches || []).length;
-    if (more > 0) {
-      html += `<div style="margin-top:8px"><button id="dMore">加载更多（还有 `
-            + `${more} 局）</button></div>`;
+/* ---------------- 总刷新 ---------------- */
+async function loadHistory() {
+  try {
+    const d = await api(`/api/elo/history?days=${RANGE}`);
+    HIST = d;
+    if (d.current) CUR_SID = d.current;
+    renderSeasonList(d);
+    renderTrend(d);
+    renderStats(d.stats);
+    if (!SELECTED && (d.current || (d.seasons || [])[0])) {
+      SELECTED = d.current || d.seasons[0].sid;
     }
-  }
-  $("dBody").innerHTML = html;
-  const btnMore = $("dMore");
-  if (btnMore) {
-    btnMore.onclick = () => showSeason(sid, (d.offset || 0) + (d.matches || []).length);
+    if (FIRST_HIST && SELECTED) {
+      FIRST_HIST = false;
+      await showSeason(SELECTED, true);
+    } else if (SELECTED && $("detail").style.display === "block") {
+      await showSeason(SELECTED, true);
+    }
+  } catch (e) {
+    $("trendMeta").textContent = `历史/趋势加载失败：${e.message}`;
+    $("trend").innerHTML = `<div class="empty" style="color:#f85149">历史接口加载失败：${escapeHtml(e.message)}；页面其余部分继续可用。</div>`;
+    $("hist").querySelector("tbody").innerHTML =
+      `<tr><td colspan="7" class="empty" style="color:#f85149">历史加载失败：${escapeHtml(e.message)}</td></tr>`;
+    $("stat").textContent = "存储统计不可用。";
   }
 }
 
+$("btnRefresh").onclick = () => { loadSchedule(); loadArena(); loadHistory(); loadLive(); };
 $("dClose").onclick = () => { $("detail").style.display = "none"; };
-$("btnRefresh").onclick = () => refresh();
+$("histSel").onchange = () => {
+  SELECTED = $("histSel").value;
+  if (SELECTED) showSeason(SELECTED);
+};
+RANGE_BTN().forEach(b => {
+  b.onclick = () => {
+    RANGE = b.dataset.range || "3";
+    RANGE_BTN().forEach(x => x.classList.toggle("on", x === b));
+    loadHistory();
+    loadLive();
+  };
+});
 
-// 收藏：只有管理员能改（服务端要 MAJ_ELO_ADMIN_KEY 环境变量 ✓ 没设就 403 并说明 ✓）
-// 口令只用在**这一次请求**里，不落 localStorage ✓（这是本机管理动作，不是用户登录 ✓）
-let CUR_SID = "";
+// 收藏：只有管理员能改（服务端要 MAJ_ELO_ADMIN_KEY 环境变量；没设就 403 并说明）
 $("dFav").onclick = async () => {
   const key = prompt("管理员口令（服务端环境变量 MAJ_ELO_ADMIN_KEY 的值）：");
   if (!key) return;
@@ -316,27 +688,28 @@ $("dFav").onclick = async () => {
   try {
     const r = await fetch("/api/elo/favorite", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sid: CUR_SID, key, favorite: wantFav }),
+      body: JSON.stringify({ sid: SELECTED, key, favorite: wantFav }),
     });
     const d = await r.json();
     if (!d.ok) { alert("失败：" + (d.error || ("HTTP " + r.status))); return; }
     setFavButton(d.favorite);
-    await loadHist();
+    await loadHistory();
   } catch (e) { alert("请求失败：" + e); }
 };
-function setFavButton(fav) {
-  $("dFav").textContent = fav ? "★ 取消收藏" : "☆ 收藏";
-  $("dFav").style.color = fav ? "#d29922" : "";
-}
 
-async function refresh() {
+/* 启动 */
+(async function boot() {
+  const hash = decodeURIComponent(String(location.hash || "").replace(/^#/, ""));
+  if (hash) SELECTED = hash;
   await loadSchedule();
-  await loadCurrent();
-  await loadHist();
-}
-refresh();
-setInterval(loadCurrent, 5000);   // 进度 5 秒一刷 ✓
-setInterval(refresh, 60000);      // 期次/历史 1 分钟一刷 ✓
+  await loadArena();
+  await loadHistory();
+  await loadLive();
+  setInterval(loadLive, 5000);       // 实时榜单 5 秒一刷
+  setInterval(loadArena, 5000);      // 进度 5 秒一刷
+  setInterval(loadSchedule, 60000);  // 档位 1 分钟一刷
+  setInterval(loadHistory, 60000);   // 历史/趋势 1 分钟一刷
+})();
 </script>
 </body>
 </html>

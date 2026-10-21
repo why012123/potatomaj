@@ -251,6 +251,9 @@ class Session:
                 "elapsed": round(time.time() - self.t0, 1),
                 "table": rows,
                 "summary": self._summary(a),
+                #: **新增**（只加不改）：按场数加权的模型榜 ✓
+                #: 老字段 ``summary`` 保持原样（简单均分）——老页面照常能跑 ✓
+                "summary_weighted": self._summary_weighted(a),
                 "log": a.log[-14:],
                 "copies": self.copies,
             }
@@ -284,6 +287,13 @@ class Session:
             })
         out.sort(key=lambda r: -r["均分"])
         return out
+
+    @staticmethod
+    def _summary_weighted(a: Arena) -> list[dict]:
+        """按**场数加权**的模型榜（实时页用）——与历史页共用 elo_store 的同一函数。"""
+        from aimodel import elo_store as E
+
+        return E.model_ranking(a.table())
 
     def settings(self, payload: dict) -> None:
         with self.lock:
@@ -382,6 +392,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(d)
             return
         # ---- ELO 期次 / 回放（见 aimodel/elo_store.py）----------------------
+        if u.path == "/api/elo/history":
+            self._history(u)
+            return
         if u.path == "/api/elo/seasons":
             from aimodel import elo_store as E
 
@@ -552,6 +565,138 @@ class Handler(BaseHTTPRequestHandler):
         s.favorite = bool(payload.get("favorite", True))
         E.save_season(s)
         self._json({"ok": True, "sid": sid, "favorite": s.favorite})
+
+    def _history(self, u) -> None:
+        """聚合 / 趋势接口 —— **历史与实时共用同一份聚合函数**（elo_store.model_ranking）。
+
+        ``GET /api/elo/history``                -> 期列表 + 趋势（默认最近 3 天）
+        ``GET /api/elo/history?days=all``        -> 全部期的趋势
+        ``GET /api/elo/history?season=<期号>``   -> 该期**完整**模型榜 + 实例榜
+
+        为什么历史不另算一套：历史榜单读 ``scores/<期号>.json`` 的 ``table``，
+        实时榜单读当前 ``arena.table()`` —— 两者是**同一种行格式**，
+        聚合都走 :func:`aimodel.elo_store.model_ranking`，所以同一期数字必然一致。
+        当前期若正在跑，则历史也直接用实时快照（source=live），避免读到旧表。
+        """
+        from aimodel import elo_store as E
+
+        q = parse_qs(u.query)
+        sid = ((q.get("season") or q.get("id") or [""])[0] or "").strip()
+        days_raw = ((q.get("days") or ["3"])[0] or "3").strip().lower()
+        if days_raw in ("all", "0", ""):
+            days = 0
+        else:
+            try:
+                days = max(0, int(float(days_raw)))
+            except ValueError:
+                days = 3
+
+        # 实时快照只取一次（锁内），历史/实时看到的是同一份当前数据。
+        with self.session.lock:
+            ss = self.session.season
+            live_sid = ss.sid if ss is not None else ""
+            live_table = self.session.arena.table() if live_sid else []
+            live_done = self.session.arena.n_matches if live_sid else 0
+            running = self.session.running
+
+        def _score(r: dict) -> float:
+            try:
+                return float(r.get("分数") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _games(r: dict) -> float:
+            try:
+                return float(r.get("场数") or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        rows: list[dict] = []
+        for s in E.list_seasons():
+            scores = E.load_scores(s.sid)
+            if s.sid == live_sid and live_table:
+                table, source = live_table, "live"
+            elif scores and scores.get("table"):
+                table, source = list(scores["table"]), "scores"
+            else:
+                table, source = [], "none"
+            models = E.model_ranking(table)
+            if source == "live":
+                done = live_done
+            else:
+                done = int(((scores or {}).get("summary") or {}).get("matches")
+                           or s.done or 0)
+            row = s.as_dict()
+            row["done"] = done
+            row["source"] = source
+            row["has_scores"] = bool(table)
+            row["model_count"] = len(models)
+            row["instance_count"] = len(table)
+            row["ts"] = round(E.season_start_ts(s), 3)
+            row["models"] = models
+            row["table"] = table
+            # 新页面的冠军口径 = **按场数加权的模型榜第一**（与榜单同一函数），
+            # 不再用老的简单均分；老接口 /api/elo/seasons 的字段保持原样不动。
+            if models:
+                row["champion"] = models[0]["模型"]
+                row["champion_avg"] = models[0]["分数"]
+                rated = [r for r in table if _games(r) > 0]
+                if rated:
+                    best = max(rated, key=_score)
+                    row["champion_inst"] = str(best.get("名") or row["champion"])
+                    row["champion_inst_score"] = round(_score(best), 1)
+            rows.append(row)
+
+        now = time.time()
+        if days:
+            cutoff = now - days * 86400
+            ranged = [r for r in rows if not r["ts"] or r["ts"] >= cutoff]
+        else:
+            ranged = list(rows)
+        trend = E.build_trend([(r["sid"], r["models"]) for r in ranged])
+        public_rows = [{k: v for k, v in r.items() if k not in ("models", "table")}
+                       for r in rows]
+        current = live_sid or (rows[0]["sid"] if rows else "")
+        payload: dict = {
+            "ok": True,
+            "now": round(now, 3),
+            "range": "all" if not days else f"{days}d",
+            "days": days,
+            "current": current,
+            "running": running,
+            "seasons": public_rows,
+            "trend": trend,
+            # 存储统计只给「列表 + 趋势」这一次请求做（5 秒一次的实时刷新不重复扫盘）
+            "stats": (None if sid else E.stats()),
+        }
+        if not rows:
+            payload.update({
+                "season": None, "models": [], "table": [],
+                "message": "还没有任何一期；等官方档位开跑后这里会自动出现。",
+            })
+            self._json(payload)
+            return
+        if not sid:
+            payload.update({"season": None, "models": [], "table": []})
+            if not current:
+                payload["message"] = "还没有当前期。"
+            self._json(payload)
+            return
+        row = next((r for r in rows if r["sid"] == sid), None)
+        if row is None:
+            self._json({"ok": False, "error": f"没有这一期: {sid}"}, 404)
+            return
+        detail = {k: v for k, v in row.items() if k not in ("models", "table")}
+        payload.update({"season": detail, "models": row["models"],
+                        "table": row["table"], "source": row["source"]})
+        if not row["table"]:
+            payload["message"] = ("该期还没有可用的最终 ELO 表（可能还在跑，"
+                                  "或回放已被精简）；期信息仍然显示，不会白屏。")
+        elif row["source"] == "live":
+            payload["message"] = "该期正在跑，下面是实时快照；收尾后会落盘为最终 ELO 表。"
+        else:
+            payload["message"] = "该期已收尾，使用 scores/<期号>.json 的最终 ELO 表。"
+        self._json(payload)
 
 
 def _startup_audit() -> None:

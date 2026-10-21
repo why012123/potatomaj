@@ -150,6 +150,155 @@ def champion_by_model(table: list[dict]) -> tuple[str, float, str, float]:
     return top, round(avg, 1), inst_name, round(0.0 if inst_score == float("-inf") else inst_score, 1)
 
 
+def _num(v: Any, default: float = 0.0) -> float:
+    """把 JSON 里的数字/数字字符串转成 float（坏值不抛异常）。"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def model_ranking(table: list[dict]) -> list[dict]:
+    """把实例表聚合成**模型榜** —— ELO 按**场数加权**，不是简单平均。
+
+    为什么必须加权：同一个模型派 ``copies`` 个实例（默认 3），各自记分。
+    简单平均会让「只打了几场、运气好分高」的实例和「打了几百场」的实例
+    同权 —— 少打的实例把模型均分带偏（用户 2026-10-21 明确要求按局数加权）。
+
+    口径（与页面上写的完全一致，历史/实时共用这一个函数）：
+      · ``ELO = Σ(实例分数 × 实例场数) / Σ实例场数``
+      · ``一位率 = Σ一位 / Σ场数``
+      · ``和了率 = Σ(和了率 × 局数) / Σ局数``（``局数`` 是手数分母）
+      · ``放铳率 = Σ(放铳率 × 局数) / Σ局数``
+      · ``实例数`` 含没上过场的实例；``已赛实例`` 只算场数 > 0 的
+      · 一个模型一场都没打 -> 不进榜（与 ``Arena`` 的 ``summary`` 一致）
+
+    入参就是 ``Arena.table()`` 的行（**中文键**：名/模型/分数/场数/局数/…），
+    历史 JSON 和实时快照是同一套字段，所以两处数字必然一致。
+    """
+    groups: dict[str, list[dict]] = {}
+    for row in table or []:
+        if not isinstance(row, dict):
+            continue
+        model = str(row.get("模型") or model_of(str(row.get("名") or "")) or "").strip()
+        if not model:
+            continue
+        groups.setdefault(model, []).append(row)
+
+    out: list[dict] = []
+    for model, rows in groups.items():
+        rated = [r for r in rows if _num(r.get("场数")) > 0]
+        if not rated:
+            continue
+        counts = [(r, max(0.0, _num(r.get("场数")))) for r in rated]
+        games = sum(c for _, c in counts)
+        hands = sum(max(0.0, _num(r.get("局数"))) for r, _ in counts)
+        # 按场数加权：ELO 的样本量是「打过多少场」，不是「打过多少手」。
+        elo = sum(_num(r.get("分数")) * c for r, c in counts) / games if games else 0.0
+        best = max(_num(r.get("分数")) for r in rated)
+        worst = min(_num(r.get("分数")) for r in rated)
+        wins = sum(max(0.0, _num(r.get("一位"))) for r, _ in counts)
+        first_rate = wins / games if games else 0.0
+        # 和了/放铳的分母是手数：先还原成次数再相加，避免「先四舍五入成比率再加权」。
+        agari = sum(_num(r.get("和了率")) * max(0.0, _num(r.get("局数")))
+                    for r, _ in counts)
+        deal_in = sum(_num(r.get("放铳率")) * max(0.0, _num(r.get("局数")))
+                      for r, _ in counts)
+        agari_rate = agari / hands if hands else 0.0
+        deal_rate = deal_in / hands if hands else 0.0
+
+        def _uniq(key: str) -> str:
+            vals: list[str] = []
+            for r in rows:
+                v = str(r.get(key) or "").strip()
+                if v and v not in vals:
+                    vals.append(v)
+            return " / ".join(vals)
+
+        out.append({
+            "模型": model,
+            "实例数": len(rows),
+            "已赛实例": len(rated),
+            "场数": int(games),
+            "局数": int(hands),
+            "分数": round(elo, 1),
+            "ELO": round(elo, 1),
+            "均分": round(sum(_num(r.get("分数")) for r in rated) / len(rated), 1),
+            "最好": round(best, 1),
+            "最差": round(worst, 1),
+            "极差": round(best - worst, 1),
+            "一位率": round(first_rate, 4),
+            "和了率": round(agari_rate, 4),
+            "放铳率": round(deal_rate, 4),
+            "版本": _uniq("版本"),
+            "风格": _uniq("风格"),
+            "保底": sum(1 for r in rows
+                        if _num(r.get("触底")) > 0
+                        or (str(r.get("状态") or "") not in ("", "存活")
+                            and _num(r.get("场数")) > 0)),
+            "加权": "场数",
+        })
+    out.sort(key=lambda r: (-r["分数"], r["模型"]))
+    return out
+
+
+def season_start_ts(s: Season) -> float:
+    """一期的开始时间；没有时间戳就从期号 ``YYYY-MM-DDTHH`` 推。"""
+    if s.started_at:
+        return float(s.started_at)
+    if s.finished_at:
+        return float(s.finished_at)
+    try:
+        return time.mktime(time.strptime(s.sid[:13], "%Y-%m-%dT%H"))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_trend(season_tables: list[tuple[str, list[dict]]]) -> dict:
+    """跨期趋势：``[(期号, 模型榜)]`` -> 每个模型一条带缺口的折线。
+
+    **缺期返回 ``None`` 点**（不是补 0、也不是沿用上一期 ✗）。前端遇到
+    ``None`` 就断开折线 —— 这是用户明确要求的「缺期要断开，不许连线」。
+    一期有存档但没 ELO 表（还在跑 / 被精简）时，该期所有模型都是 ``None``。
+    """
+    items = sorted(((str(sid), rows or []) for sid, rows in season_tables),
+                   key=lambda x: x[0])
+    sids = [sid for sid, _ in items]
+    by_model: dict[str, dict] = {}
+    for sid, rows in items:
+        for r in rows:
+            model = str(r.get("模型") or "").strip()
+            if not model:
+                continue
+            slot = by_model.setdefault(model, {
+                "模型": model,
+                "版本": str(r.get("版本") or ""),
+                "风格": str(r.get("风格") or ""),
+                "points": {},
+            })
+            slot["points"][sid] = {
+                "sid": sid,
+                "ELO": r.get("ELO", r.get("分数")),
+                "场数": r.get("场数", 0),
+                "一位率": r.get("一位率", 0.0),
+            }
+    series: list[dict] = []
+    for d in by_model.values():
+        points = [d["points"].get(sid) for sid in sids]
+        last = next((p for p in reversed(points) if p), None)
+        series.append({
+            "模型": d["模型"],
+            "版本": d["版本"],
+            "风格": d["风格"],
+            "points": points,
+            "last": last,
+            "n": sum(1 for p in points if p),
+        })
+    series.sort(key=lambda r: (-(r["last"]["ELO"] if r["last"] else -1e9), r["模型"]))
+    missing = [sid for sid, rows in items if not rows]
+    return {"sids": sids, "series": series, "missing": missing}
+
+
 def season_id(when: float | None = None, slot_hour: int | None = None) -> str:
     """期号：``YYYY-MM-DDTHH``。``slot_hour`` 给了就用它（官方固定档位）。"""
     t = time.localtime(when if when is not None else time.time())
