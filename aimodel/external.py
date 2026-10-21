@@ -1111,6 +1111,20 @@ class ExternalMJaiAgent(Agent):
                 )
                 self._discard_response = None
                 self._discard_response_key = None
+            elif t in ("daiminkan", "ankan", "kakan") \
+                    and ev.get("actor") != self.player_id:
+                # ⚠️ **抢杠**（ロン on kakan）没有 `dahai` 事件 ✗
+                #    真实踩过：`kakan 1p` 后引擎问 ron，`_discard_key` 是 None，
+                #    `_choose_call` 直接抛协议错 -> Mortal 整局降级 ✗
+                #    （seed=1588596275 第 4 局必现；200 局小样里没撞到纯属运气）
+                #    把被杠的那张也当成一个「可荣和的出牌点」记 key，
+                #    后面的 ron 决策就能正常读/缓存 Mortal 的 hora。
+                self._discard_seq += 1
+                self._discard_key = (
+                    t, ev.get("actor"), ev.get("pai"), self._discard_seq,
+                )
+                self._discard_response = None
+                self._discard_response_key = None
 
     def _translate(self, a: Mapping[str, Any]) -> list[dict]:
         k = a.get("kind")

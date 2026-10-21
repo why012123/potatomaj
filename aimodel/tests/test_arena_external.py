@@ -34,7 +34,9 @@ sys.path.insert(0, str(ROOT))
 
 from aimodel import arena as A  # noqa: E402
 from aimodel import elo_store as E  # noqa: E402
+from aimodel import external  # noqa: E402
 from aimodel.arena import Arena, Participant  # noqa: E402
+from aimodel.engine import Decision  # noqa: E402
 
 FAKE = Path(__file__).resolve().parent / "_fake_mjai_bot.py"
 
@@ -223,6 +225,40 @@ def test_match_marker_optional_and_replay_refusal() -> None:
 
 
 # ---------------------------------------------------------------------------
+def test_chankan_ron_has_key() -> None:
+    """抢杠（ロン on kakan）没有 dahai 事件，也必须能映射 hora -> ron。
+
+    真实踩过：`kakan 1p` 后引擎问 ron，`_discard_key` 还是 None，
+    `_choose_call` 直接抛协议错 -> Mortal 整局降级。固定 seed 1588596275
+    第 4 局必现（本测试不依赖真 Mortal，只验证事件流 key + 映射）。
+    """
+    td, _ = _config("normal")
+    ag = None
+    try:
+        ag = external.ExternalMJaiAgent(
+            "manue", seed=1, player_id=3, players=4, timeout=5,
+            command=[sys.executable, str(FAKE)],
+            env={"FAKE_MJAI_MODE": "normal", "FAKE_MJAI_BATCH": "1"},
+            batch_events=True,
+        )
+        # 别家加杠：没有 dahai，但引擎会问其他家 ron（抢杠）
+        ag._after_feed([{"type": "kakan", "actor": 0, "pai": "1p",
+                         "consumed": ["1p", "1p", "1p"]}])
+        check("抢杠事件会生成一个「可荣和出牌点」key",
+              ag._discard_key is not None, repr(ag._discard_key))
+        # 模拟适配层已经读到 Mortal 的 hora
+        ag._discard_response = {"type": "hora", "actor": 3, "target": 0}
+        ag._discard_response_key = ag._discard_key
+        idx = ag._choose_call(Decision("ron", ["yes", "no"], 9), None)
+        check("抢杠的 hora 能映射成 ron=yes（不抛协议错）",
+              idx == 0, str(idx))
+    finally:
+        if ag is not None:
+            ag.close()
+        shutil.rmtree(td, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 def test_pick_fairness_400() -> None:
     """18 模型 × 3 实例，模拟 400 局：各模型场数必须在均值 ±20% 内。"""
     parts: list[Participant] = []
@@ -353,6 +389,7 @@ def main() -> int:
         ("负向 2：外部超时 -> 兜底且整期继续", test_timeout_falls_back_and_period_continues),
         ("非法动作 -> 兜底", test_illegal_action_falls_back),
         ("存档标记 / replay 明确拒绝", test_match_marker_optional_and_replay_refusal),
+        ("抢杠 ron 的 key（真实踩过的 1/5 故障）", test_chankan_ron_has_key),
         ("抽人公平 400 局", test_pick_fairness_400),
         ("负向 3：孤立高分仍被抽到", test_isolated_high_still_picked),
         ("官方调度带外部 AI", test_official_scheduler_includes_external),
