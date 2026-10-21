@@ -42,6 +42,7 @@ import argparse
 import math
 from pathlib import Path
 
+from . import external
 from . import sanma as S
 from .agents import HeuristicAgent, MLAgent, RandomAgent
 from .engine import Game, build_wall
@@ -53,7 +54,13 @@ WEIGHTS = Path(__file__).resolve().parent / "weights"
 Z95 = 1.959963984540054
 
 
-def make_third(spec: str, seed: int):
+def make_third(spec: str, seed: int, *, seat: int = 0, players: int = 3):
+    # 外部 AI（Mortal / mjai-manue / …）：协议桥见 aimodel/external.py
+    key = external.normalize_key(spec)
+    if key is not None:
+        return external.ExternalMJaiAgent(
+            key, seed=seed, player_id=seat, players=players,
+        )
     if spec == "random":
         return RandomAgent(seed)
     if spec == "teacher":
@@ -121,14 +128,19 @@ def _run_one(agents, seed: int, rule: S.Rule, wall, same_wall: bool):
     g = Game(agents, seed=seed, rule=rule)
     if same_wall and wall is not None:
         g.rigged_wall = list(wall)
-    return g.play()
+    external.attach(g)          # 把 Game.on_action 转给外部 AI（没有外部 AI 时是 no-op）
+    try:
+        return g.play()
+    finally:
+        external.close_external(agents)
 
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="两个模型对打（相同牌山配对）")
     ap.add_argument("--a", default=str(WEIGHTS / "policy.npz"), help="A 的权重")
     ap.add_argument("--b", default=str(WEIGHTS / "policy_bc3.npz"), help="B 的权重")
-    ap.add_argument("--third", default="teacher", help="第三家：teacher / random")
+    ap.add_argument("--third", default="teacher",
+                    help=f"第三家：teacher / random / style:<名字> / 外部 AI：{external.spec_help()}")
     ap.add_argument("--matches", type=int, default=2500,
                     help="牌局组数（每组默认打两副座位，所以实际对局是它的两倍）")
     ap.add_argument("--seed", type=int, default=777001,
@@ -156,6 +168,16 @@ def main(argv: list[str] | None = None) -> None:
     print(f"同牌山注入：{'关（老行为）' if args.no_same_wall else '开'}   "
           f"基础种子 = {args.seed}\n")
 
+    # 外部 AI 先做安装检查：没装就清晰报错，不要等跑到一半才崩
+    ext_key = external.normalize_key(args.third)
+    if ext_key is not None:
+        if n_players != 4:
+            raise SystemExit(
+                f"外部 AI {ext_key!r} 只支持四麻；当前权重推断出 {n_players} 人。"
+                f"见 {external.DOC_HINT}"
+            )
+        external.require(ext_key)
+
     rp_a = rp_b = 0.0
     rk_a = rk_b = 0.0
     win_a = win_b = 0
@@ -182,7 +204,8 @@ def main(argv: list[str] | None = None) -> None:
                 elif tag == "B":
                     agents.append(MLAgent(net_b, seed=gseed * 3 + s, greedy=not args.sample))
                 else:
-                    agents.append(make_third(args.third, gseed * 3 + s))
+                    agents.append(make_third(args.third, gseed * 3 + s,
+                                             seat=s, players=n_players))
             r = _run_one(agents, gseed, rule, wall, same_wall=not args.no_same_wall)
             ia = seats.index("A")
             ib = seats.index("B")

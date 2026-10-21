@@ -26,14 +26,18 @@ aimodel/ui/java/.tilecache/
 #
 # ⚠️ .gitignore 不支持行尾注释 —— 模式必须单独占一行，否则整行会被当成
 #    一个模式而永远匹配不上（这里踩过一次，删掉的文件又被 git add 加了回来）。
-electron/
+# ── 2026-10-21：仓库改为 **private** ✓ 于是把外挂源码纳入版本管理 ✓
+#    为什么以前整目录忽略：`electron/` 有 250 MB ✗ —— 实测**全是 node_modules** ✓
+#    源码只有 33 个文件、不到 1 MB ✓ 忽略整个目录是拿错了工具 ✗
+#    -> 改成只忽略依赖/产物 ✓ 源码进库 ✓
+electron/node_modules/
+electron/dist/
+electron/out/
+electron/*.log
+refs/
 .refs/
 archive/
-tools/protocol.js
-tools/decode.js
 tools/cache/
-potatomaj/bridge.py
-run-electron.sh
 土豆麻将.command
 土豆麻将浏览器.command
 

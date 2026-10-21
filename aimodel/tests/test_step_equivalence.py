@@ -176,10 +176,20 @@ def max_abs_diff_vs_golden(net: Net) -> float:
     """返回「当前权重 vs 金值权重」的**最大绝对差** ✓ 连续量 ✓ 可跨机器 ✓
 
     ⚠️ 若金值文件不存在 -> 抛 FileNotFoundError ✓（不静默通过 ✗）
+
+    ⚠️ ``Wc`` / ``bc``（chisel 头）**不在金值范围内** ✗ —— 金值录制于
+    加 chisel 之前 ✓ 本测试要保的是**原有 9 个头 + 躯干**的数值不变 ✓
+    chisel 是**独立二级头**：本测试的合成 batch 没有 ``chipat``、
+    ``chisel_coef=0``（默认）-> 它的权重必须原样保持 0 ✓
+    所以这里显式跳过，而不是「金值里缺参数 -> 结构变了」误报红 ✗
+    （chisel 自己的梯度由 ``test_chisel.py`` 的数值梯度/学习测试保证 ✓）
     """
+    _chisel = {"Wc", "bc"}
     with np.load(GOLDEN_NPZ) as g:
         worst = 0.0
         for name, p in net.params():
+            if name in _chisel:
+                continue
             if name not in g.files:
                 raise KeyError(f"金值里缺参数 {name!r} —— 结构变了 ✗ 需重录 ✓")
             ref = g[name]

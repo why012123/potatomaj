@@ -146,6 +146,7 @@ def train_bc(
     label_smoothing: float = 0.05,
     ref_holdout: dict | None = None,
     ref_name: str = "参照",
+    chisel_coef: float = 0.0,
 ) -> tuple[list[dict], Net, dict]:
     """行为克隆。返回 ``(hist, best_net, best_info)``。
 
@@ -156,11 +157,34 @@ def train_bc(
 
     现在每轮记一次留出率，**只在变好时留一份网络快照**，跑完把最好的那份
     返回给调用方去存。``patience`` 轮没有改善就提前停（0 = 不早停）。
+
+    ``chisel_coef``（新增）：「吃成什么样」的独立头。
+    >0 时把 ``data["chipat"]`` 传进 ``Net.step``，只监督
+    ``kind=="chi" & chipat>=0`` 的行 ✓ 每轮在**留出集**上报 chisel 准确率 ✓
+    0（默认）时完全不动 chisel 头 —— 老调用方 / 老数据集行为不变 ✓
     """
     rng = np.random.default_rng(seed)
     n = len(data["X"])
     adv = np.ones(n, dtype=np.float32)
     hist: list[dict] = []
+    # chisel：只在数据里**真有** chipat 列时才训练 ✓
+    # 老数据集（collect_bc / 旧 npz）没有这一列 -> 自动退化成 0 ✓ 不报错 ✓
+    has_chipat = ("chipat" in data) and (len(data["chipat"]) == n)
+    if chisel_coef > 0.0 and not has_chipat:
+        print("    ⚠️ 数据里没有 chipat 列 -> chisel 头**不参与**本次训练 ✓")
+        chisel_coef = 0.0
+    chi_lab = 0
+    if has_chipat:
+        _cp = np.asarray(data["chipat"])
+        chi_lab = int(np.sum((data["kind"] == "chi") & (_cp >= 0)))
+    # 验证集上的 chisel 指标（在训练**之前**先量一次，作为基线）
+    base_chisel = chisel_metrics(net, holdout) if (has_chipat and holdout) else None
+    if base_chisel is not None:
+        print(
+            f"    chisel 留出基线：acc={base_chisel['acc']:.1%}"
+            f"（n={base_chisel['n']:,}，多数类 {base_chisel['majority']:.1%}）"
+            f"  可监督吃法行 {chi_lab:,}"
+        )
     # ⚠️⚠️ `best_hold` **不能初始化为 -1** ✗ 那是个死值 ✓
     #
     # 后果（远端实测发现的，很严重）：`improved = hold > best_hold` 在**第一轮永远为真** ✗
@@ -196,32 +220,46 @@ def train_bc(
         idx = rng.permutation(n)
         tot = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
         nb = 0
+        # chisel 的批均值**只对真有标签的批取平均** ✓
+        # 与主损失分开累，否则「这一批没吃法样本」会被当成 loss=0 拉低均值 ✗
+        chisel_loss_sum = 0.0
+        chisel_batches = 0
         for s in range(0, n, batch_size):
             sel = idx[s : s + batch_size]
             if len(sel) < 8:
                 continue
+            batch = {
+                "X": data["X"][sel],
+                "mask": data["mask"][sel],
+                "actfeat": data["actfeat"][sel],
+                "action": data["action"][sel],
+                "logp": data["logp"][sel],
+                "kind": data["kind"][sel],
+                "adv": adv[sel],
+                "ret": data["ret"][sel],
+                "mode": "bc",
+            }
+            if has_chipat:
+                batch["chipat"] = np.asarray(data["chipat"][sel])
             st = net.step(
-                {
-                    "X": data["X"][sel],
-                    "mask": data["mask"][sel],
-                    "actfeat": data["actfeat"][sel],
-                    "action": data["action"][sel],
-                    "logp": data["logp"][sel],
-                    "kind": data["kind"][sel],
-                    "adv": adv[sel],
-                    "ret": data["ret"][sel],
-                    "mode": "bc",
-                },
+                batch,
                 clip=0.0,
                 ent_coef=0.001,
                 vf_coef=0.5,
                 label_smoothing=label_smoothing,
+                chisel_coef=chisel_coef,
             )
             for k in tot:
                 tot[k] += st[k]
+            if st.get("chisel_n", 0):
+                chisel_loss_sum += float(st["chisel_loss"])
+                chisel_batches += 1
             nb += 1
         acc = agreement(net, data)
         hold = agreement(net, holdout) if holdout else acc
+        # chisel：**在留出集上**报准确率 ✓（用同一个 holdout ✓ 同源 ✓）
+        chisel_hold = chisel_metrics(net, holdout) if (has_chipat and holdout) else None
+        chisel_train = chisel_metrics(net, data, limit=4000) if has_chipat else None
         # 累计计数在**打分之后、存最优之前**加 —— 这样存下来的最优权重
         # 带的是「它实际训过多少轮」✓
         net.epochs_done += 1
@@ -248,6 +286,15 @@ def train_bc(
             "与教师一致率": acc,
             "留出集一致率": hold,
             "最优留出轮次": best_epoch,
+            # chisel（「吃成什么样」）：
+            #   acc = 留出集上 chipat>=0 的行的 argmax 准确率 ✓
+            #   majority = **多数类基线** ✓ 标签 95% 是 slot 0 时，
+            #             光看 acc 会误以为很好 ✗ 必须和它一起看 ✓
+            "chisel_acc": (chisel_hold or {}).get("acc"),
+            "chisel_n": (chisel_hold or {}).get("n", 0),
+            "chisel_majority": (chisel_hold or {}).get("majority"),
+            "chisel_train_acc": (chisel_train or {}).get("acc"),
+            "chisel_loss": chisel_loss_sum / max(1, chisel_batches),
         }
         hist.append(row)
         if verbose:
@@ -256,6 +303,13 @@ def train_bc(
                 f"（留出 {hold:.1%}）  value_loss={row['value_loss']:.4f}"
                 + ("  ★最优" if improved else f"  （已 {stale} 轮没进步）")
             )
+            if chisel_hold is not None:
+                print(
+                    f"      chisel 留出 acc={chisel_hold['acc']:.1%}"
+                    f"（n={chisel_hold['n']:,}，多数类 {chisel_hold['majority']:.1%}）"
+                    f"  训练 acc={row['chisel_train_acc']:.1%}"
+                    f"  loss={row['chisel_loss']:.4f}"
+                )
         if patience > 0 and stale >= patience:
             if verbose:
                 print(f"    ⏹ 留出集连续 {patience} 轮没进步，提前停在 epoch {ep + 1}")
@@ -266,6 +320,11 @@ def train_bc(
         "best_epoch": best_epoch,
         "best_holdout": best_hold,
         "last_epoch": len(hist),
+        # chisel：进来时 / 最后一轮 的留出准确率 ✓（base 不参与选优 ✗）
+        "chisel_base": base_chisel,
+        "chisel_last": hist[-1] if hist else None,
+        "chisel_labeled": chi_lab,
+        "chisel_coef": chisel_coef,
     }
     if verbose:
         if kept_original:
@@ -300,6 +359,43 @@ def agreement(net: Net, data: dict, limit: int = 4000) -> float:
     logits = np.where(m > 0, logits, -1e9)
     pred = logits.argmax(axis=1)
     return float(np.mean(pred == data["action"][idx]))
+
+
+def chisel_metrics(net: Net, data: dict, limit: int = 0) -> dict | None:
+    """「吃成什么样」的留出指标：只在 ``kind=="chi" & chipat>=0`` 的行上算 ✓
+
+    返回 ``{"acc", "n", "majority"}``；没有可监督的行（老数据集）返回 ``None`` ✓
+
+    ⚠️ **acc 的基准不是 1/3** ✗：真实人类数据里 95% 的吃法都是 slot 0
+    （见 docs/chisel-数据侧-2026-10-21.md：176/5/3），所以「永远选 0」
+    就已经有 ~95% 准确率 ✓ 必须同时报 ``majority``（多数类基线）✓
+    否则会得出「chisel 学得真好」的错误结论 ✗
+
+    ⚠️ 这里**不按合法吃法数屏蔽** ✗：数据里没有「这个局面有几种吃法」这一列 ✓
+    所以这是**3 路全量 argmax** 的准确率 ✓ 推理时会屏蔽非法 slot ✓
+    （两者口径不同，报告里要分开说；这也是「为什么还要看 majority」的原因 ✓）
+    """
+    if "chipat" not in data or "kind" not in data:
+        return None
+    cp = np.asarray(data["chipat"])
+    kinds = np.asarray(data["kind"])
+    sel = np.nonzero((kinds == "chi") & (cp >= 0) & (cp < 3))[0]
+    if len(sel) == 0:
+        return None
+    if limit and len(sel) > limit:
+        # 均匀取而不是取前 limit 条 ✓ 尾部切片在「按局排序」的数据里会有偏 ✗
+        step = max(1, len(sel) // limit)
+        sel = sel[::step][:limit]
+    h2 = net.trunk(np.asarray(data["X"][sel], dtype=np.float32))
+    pred = net.chisel_logits(h2).argmax(axis=1)
+    labels = cp[sel].astype(np.int64)
+    counts = np.bincount(labels, minlength=3)
+    return {
+        "acc": float(np.mean(pred == labels)),
+        "n": int(len(sel)),
+        "majority": float(counts.max() / max(1, len(sel))),
+        "dist": counts.tolist(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +494,7 @@ def train_rl(
     ent_coef_adapt: bool = False,
     kl_coef: float = 0.0,
     ref: Net | None = None,
+    chisel_coef: float = 0.0,
 ) -> list[dict]:
     rng = np.random.default_rng(seed)
     data = dict(data)
@@ -416,6 +513,10 @@ def train_rl(
                "clip_frac": 0.0, "kl": 0.0}
         ent_by_kind: dict[str, float] = {}
         ent_n: dict[str, int] = {}
+        chisel_n_tot = 0
+        chisel_hit_tot = 0.0
+        chisel_loss_tot = 0.0
+        chisel_batches = 0
         nb = 0
         for s in range(0, n, batch_size):
             sel = idx[s : s + batch_size]
@@ -432,21 +533,33 @@ def train_rl(
                     "adv": data["adv"][sel],
                     "ret": data["ret"][sel],
                     "mode": "pg",
+                    # chisel：自对弈轨迹里只有「实际吃出的那一对已知」的行
+                    # 才带 chipat>=0 ✓ 其余全是 -1 ✓ Net.step 会自己筛 ✓
+                    **({"chipat": data["chipat"][sel]} if "chipat" in data else {}),
                 },
                 clip=clip,
                 ent_coef=ent_coef,
                 vf_coef=vf_coef,
                 ent_target=ENT_TARGETS,
                 ent_coef_adapt=ent_coef_adapt,
+                chisel_coef=chisel_coef,
             )
             for k in tot:
                 tot[k] += st[k]
             for k, hv in st.get("entropy_by_kind", {}).items():
                 ent_by_kind[k] = ent_by_kind.get(k, 0.0) + hv
                 ent_n[k] = ent_n.get(k, 0) + 1
+            if st.get("chisel_n", 0):
+                chisel_n_tot += int(st["chisel_n"])
+                chisel_hit_tot += float(st["chisel_acc"]) * int(st["chisel_n"])
+                chisel_loss_tot += float(st["chisel_loss"])
+                chisel_batches += 1
             nb += 1
         row = {k: v / max(1, nb) for k, v in tot.items()}
         row["epoch"] = ep + 1
+        row["chisel_n"] = chisel_n_tot
+        row["chisel_acc"] = chisel_hit_tot / max(1, chisel_n_tot)
+        row["chisel_loss"] = chisel_loss_tot / max(1, chisel_batches)
         row["entropy_by_kind"] = {
             k: ent_by_kind[k] / max(1, ent_n[k]) for k in ent_by_kind
         }
@@ -850,6 +963,7 @@ def cmd_bc(args) -> Net:
         net, data, epochs=args.epochs, batch_size=args.batch, seed=args.seed,
         holdout=holdout, patience=args.patience,
         ref_holdout=ref_holdout, ref_name=ref_name,
+        chisel_coef=args.chisel_coef,
     )
     # 存**留出最优**那一轮，不是最后一轮。老代码无条件 net.save()，
     # 存下来的是过拟合最重的那份（实测训练 87.6%->93.4% 时留出 75.9%->74.9%）。
@@ -878,6 +992,11 @@ def cmd_bc(args) -> Net:
         "best_epoch": bc_info["best_epoch"],
         "best_holdout": bc_info["best_holdout"],
         "last_epoch": bc_info["last_epoch"],
+        # 「吃成什么样」：chisel 的留出准确率 / 多数类基线 / 可监督行数 ✓
+        "chisel_coef": bc_info.get("chisel_coef"),
+        "chisel_labeled": bc_info.get("chisel_labeled"),
+        "chisel_base": bc_info.get("chisel_base"),
+        "chisel_last": bc_info.get("chisel_last"),
     }})
     return saved_net
 
@@ -967,6 +1086,7 @@ def cmd_rl(args) -> Net:
             ent_coef=max(0.002, 0.01 * (1 - it / (args.iters + 1))),
             kl_coef=kl_coef_now,
             ref=ref_net,
+            chisel_coef=args.chisel_coef,
         )
         ev = quick_eval(
             net, n_matches=args.eval_matches, seed=args.seed + 777, spec=spec
@@ -1120,6 +1240,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--rl-lr", type=float, default=3e-4, help="自对弈 PPO 的学习率")
     ap.add_argument("--hidden", type=str, default="256,256", help="隐层宽度")
     ap.add_argument("--l2", type=float, default=1e-4, help="L2 正则（抑制过拟合）")
+    ap.add_argument(
+        "--chisel-coef", type=float, default=0.1, dest="chisel_coef",
+        help="「吃成什么样」（chisel）辅助损失的系数（默认 0.1）。"
+             "只监督 kind=='chi' 且 chipat>=0 的行，**不往躯干回传**；"
+             "0 = 关掉 -> 就是「不带 chisel」的消融基线 ✓。"
+             "数据里没有 chipat 列时自动跳过 ✓",
+    )
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--teacher-ratio", type=float, default=0.25, help="自对弈里教师的占比")
     ap.add_argument("--pool-ratio", type=float, default=0.0,

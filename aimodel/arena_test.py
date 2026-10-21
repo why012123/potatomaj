@@ -51,6 +51,7 @@ from pathlib import Path
 # 允许 `python aimodel/arena_test.py` 直接跑
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from aimodel import external  # noqa: E402
 from aimodel import sanma as S  # noqa: E402
 from aimodel.agents import HeuristicAgent, MLAgent, RandomAgent  # noqa: E402
 from aimodel.engine import Game, build_wall  # noqa: E402
@@ -80,43 +81,134 @@ def _load(path: str) -> Net:
     return Net.load(path)
 
 
+def _net_path(spec: str) -> Path | None:
+    """把 A/B 的写法解析成权重路径；不是神经网络就返回 None。
+
+    支持三种写法：
+      * ``aimodel/weights/xxx.npz``（路径）
+      * ``maj-pro4v1.1_mac_rl``（注册表里的模型名）
+      * ``strong`` / ``teacher`` / ``random`` / ``style:speed``（规则 agent）
+    """
+    if not spec:
+        return None
+    p = Path(spec)
+    if p.suffix == ".npz":
+        return p if p.exists() else None
+    try:
+        from aimodel import variants
+
+        sp = variants.get(spec)
+        return sp.path if sp.path.exists() else None
+    except Exception:                       # noqa: BLE001 - 不是注册模型
+        return None
+
+
+def _load_spec_net(spec: str) -> Net | None:
+    p = _net_path(spec)
+    return _load_quiet(str(p)) if p is not None else None
+
+
+def _style_names() -> set[str]:
+    from .styles import STYLES
+
+    return set(STYLES)
+
+
+def _make_agent(spec: str, seed: int, players: int, *,
+                sample: bool = False, net: Net | None = None,
+                player_id: int = 0):
+    """按 spec 造一个 agent —— 神经网络 / 教师 / 随机 / strong / 风格 / 外部 AI。"""
+    s = (spec or "teacher").strip()
+    low = s.lower()
+    ext_key = external.normalize_key(s)
+    if ext_key is not None:
+        return external.ExternalMJaiAgent(
+            ext_key, seed=seed, player_id=player_id, players=players,
+        )
+    if low in ("teacher", "heuristic"):
+        return HeuristicAgent(seed)
+    if low in ("random", "r"):
+        return RandomAgent(seed)
+    # ``strong`` / ``strong:attack`` / ``strong3`` / ``strong4``
+    if low.startswith("strong") or low in ("attack", "defense", "value"):
+        from .strong import make as make_strong
+
+        if low in ("strong3", "strong4"):
+            low = "strong"
+        return make_strong(low, seed)
+    # 风格陪练（styles.py）
+    if low.startswith("style:") or low in _style_names():
+        from .styles import make as make_style
+
+        return make_style(s, seed)
+    if net is None:
+        net = _load_spec_net(s)
+    if net is None:
+        raise SystemExit(
+            f"未知的 agent spec: {spec!r}（可用：teacher / random / strong / "
+            f"strong:<变体> / style:<风格> / <权重路径> / <注册模型名>）"
+        )
+    return MLAgent(net, seed=seed, greedy=not sample)
+
+
 def _init_worker(a: str, b: str, third: str | None) -> None:
     global _NET_A, _NET_B, _NET_C
-    _NET_A, _NET_B = _load(a), _load(b)
-    _NET_C = _load(third) if third and third.endswith(".npz") else None
+    _NET_A = None if external.is_external_spec(a) else _load_spec_net(a)
+    _NET_B = None if external.is_external_spec(b) else _load_spec_net(b)
+    _NET_C = (None if third and external.is_external_spec(third)
+              else (_load_spec_net(third) if third else None))
 
 
-def _third_agent(kind: str, seed: int):
-    if kind == "random":
-        return RandomAgent(seed)
-    if kind == "third" and _NET_C is not None:
-        return MLAgent(_NET_C, seed=seed, greedy=True)
-    return HeuristicAgent(seed, style="normal")
+def _third_agent(kind: str, seed: int, players: int, net: Net | None = None,
+                 *, seat: int = 0, third_seat: int = 0):
+    ext_key = external.normalize_key(kind)
+    if ext_key is not None:
+        # 外部 AI 只占一个座位，其它座位继续用教师：A/B 两边面对同一批对手
+        if seat == third_seat:
+            return external.ExternalMJaiAgent(
+                ext_key, seed=seed, player_id=seat, players=players,
+            )
+        return HeuristicAgent(seed, style="normal")
+    if kind == "third" and net is not None:
+        return MLAgent(net, seed=seed, greedy=True)
+    return _make_agent(kind, seed, players, sample=True, net=net,
+                       player_id=seat)
 
 
-def _run_one_side(wall, net, seat: int, third: str, opp_seed: int,
-                  players: int, sample: bool):
+def _run_one_side(wall, spec: str, net: Net | None, seat: int, third: str,
+                  third_net: Net | None, opp_seed: int,
+                  players: int, sample: bool, third_seat: int = 0):
     """一副牌山、一个座位、一套固定对手，打一局。"""
     agents = []
     for s in range(players):
         if s == seat:
-            agents.append(MLAgent(net, seed=opp_seed, greedy=not sample))
+            agents.append(_make_agent(spec, opp_seed, players,
+                                      sample=sample, net=net, player_id=s))
         else:
-            agents.append(_third_agent(third, opp_seed + 1000 + s))
+            agents.append(_third_agent(third, opp_seed + 1000 + s, players,
+                                       net=third_net, seat=s,
+                                       third_seat=third_seat))
     game = Game(agents, seed=0, rule=S.rule_for(players))
     game.rigged_wall = wall
-    return game.play()
+    external.attach(game)
+    try:
+        return game.play()
+    finally:
+        external.close_external(agents)
 
 
 def _group(args_tuple):
     """一个「组」= 同一副牌山 + 同一个座位，A、B 各打一遍。"""
-    m, wall_seed, seat, third, players, sample, a_path, b_path = args_tuple
-    net_a = _load(a_path) if _NET_A is None else _NET_A
-    net_b = _load(b_path) if _NET_B is None else _NET_B
+    m, wall_seed, seat, third, players, sample, a_spec, b_spec = args_tuple
+    net_a = _NET_A if _NET_A is not None else _load_spec_net(a_spec)
+    net_b = _NET_B if _NET_B is not None else _load_spec_net(b_spec)
     wall = build_wall(random.Random(wall_seed), S.rule_for(players))
     opp = wall_seed * 31 + 7          # 对手种子固定 ⇒ 两边对手完全一致
-    ra = _run_one_side(wall, net_a, seat, third, opp, players, sample)
-    rb = _run_one_side(wall, net_b, seat, third, opp, players, sample)
+    third_seat = 0 if seat != 0 else 1
+    ra = _run_one_side(wall, a_spec, net_a, seat, third, _NET_C, opp, players,
+                       sample, third_seat)
+    rb = _run_one_side(wall, b_spec, net_b, seat, third, _NET_C, opp, players,
+                       sample, third_seat)
     return {
         "diff_rp": ra.rank_points[seat] - rb.rank_points[seat],
         "diff_rank": ra.ranks[seat] - rb.ranks[seat],
@@ -182,9 +274,16 @@ def mde(sigma: float, n: int, alpha=0.05, power=0.80) -> float:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="模型强度评测（duplicate + SPRT + 功效分析）")
-    ap.add_argument("--a", default=str(WEIGHTS / "maj-normalv1.1.npz"))
-    ap.add_argument("--b", default=str(WEIGHTS / "maj-normalv1.1_bcbase.npz"))
-    ap.add_argument("--third", default="teacher", help="teacher / random / <权重路径>")
+    ap.add_argument("--a", default=str(WEIGHTS / "maj-normalv1.1.npz"),
+                    help=f"A：权重路径 / 注册模型名 / teacher / random / strong[:变体] / "
+                         f"style:<风格> / 外部 AI（{external.spec_help()}）")
+    ap.add_argument("--b", default=str(WEIGHTS / "maj-normalv1.1_bcbase.npz"),
+                    help="B：同 --a")
+    ap.add_argument("--third", default="teacher",
+                    help=f"其余座位的对手：teacher / random / strong / <权重路径> / "
+                         f"外部 AI（{external.spec_help()}）")
+    ap.add_argument("--players", type=int, default=0, choices=[0, 3, 4],
+                    help="人数；0 = 自动（有神经网络按权重维度推断，否则四麻）")
     ap.add_argument("--target-delta", type=float, default=2.0,
                     help="要检出的段位分差（默认 2）")
     ap.add_argument("--games", type=int, default=None,
@@ -201,8 +300,37 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--sigma", type=float, default=None, help="已知 σ（不给就用先验）")
     args = ap.parse_args(argv)
 
-    net_a, net_b = _load_quiet(args.a), _load_quiet(args.b)
-    players = 4 if net_a.dim > 500 else 3
+    # A/B 现在既可以是权重，也可以是纯规则 agent（strong / teacher / ...），
+    # 还可以是外部 mjai AI（mortal / manue / ...）。
+    ext_a = external.is_external_spec(args.a)
+    ext_b = external.is_external_spec(args.b)
+    ext_third = external.normalize_key(args.third)
+    net_a = None if ext_a else _load_spec_net(args.a)
+    net_b = None if ext_b else _load_spec_net(args.b)
+    dims = []
+    for net in (net_a, net_b):
+        if net is not None:
+            dims.append(4 if net.dim > 500 else 3)
+    if args.players:
+        players = args.players
+    elif dims:
+        players = dims[0]
+        if len(set(dims)) > 1:
+            raise SystemExit(
+                f"A/B 的权重人数不一致（{dims}）—— 不能同桌，请用 --players 明确指定"
+            )
+    else:
+        players = 4                 # 纯规则对照 / 外部 AI 默认四麻
+    if (ext_a or ext_b or ext_third is not None) and players != 4:
+        raise SystemExit(
+            f"外部 AI 只支持四麻（mjai 的 start_kyoku 是 4 人格式）；"
+            f"当前 {players} 人。见 {external.DOC_HINT}"
+        )
+    for key, is_ext in ((args.a, ext_a), (args.b, ext_b)):
+        if is_ext:
+            external.require(key)
+    if ext_third is not None:
+        external.require(ext_third)
     sigma = args.sigma or PRIOR_SIGMA[players]
     need = plan(args.target_delta, sigma, args.alpha, args.power)
     games = args.games or min(need, args.max_games)
@@ -210,10 +338,12 @@ def main(argv: list[str] | None = None) -> None:
     print("═" * 74)
     print("  模型强度评测")
     print("═" * 74)
-    print(f"  A = {Path(args.a).name}")
-    print(f"  B = {Path(args.b).name}")
+    print(f"  A = {args.a if ext_a else Path(args.a).name}"
+          f"    B = {args.b if ext_b else Path(args.b).name}")
     print(f"  人数 {players}   第三家 {args.third}   设计 duplicate（同牌山 + 同座位重放）")
-    print(f"  先验 σ = {sigma:.1f}（实测区间 54~61，三麻）")
+    if ext_a or ext_b or ext_third is not None:
+        print(f"  外部 AI：mjai stdio 子进程（{external.spec_help()}）")
+    print(f"  先验 σ = {sigma:.1f}（实测区间 54~61，三麻；四麻按比例更小）")
     print(f"  目标效应 δ = {args.target_delta:+.2f} 段位分"
           f"（α={args.alpha} 单侧，功效 {args.power:.0%}）")
     print(f"  → 固定样本量方案需要 **{need} 组**；本次计划跑 {games} 组")

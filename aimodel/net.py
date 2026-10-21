@@ -26,6 +26,14 @@ from .encode import ACTION_DIM, DIM, HEAD_SIZE, layout_for
 #: 打牌用的动作塔宽度（每张候选牌先变成一个分数，再加到打牌头的 logit 上）
 ACTION_HIDDEN = 32
 
+#: 「吃成什么样」头的宽度：合法吃法（另外两张）最多 3 种 ✓
+#:
+#: ⚠️ 它**不是** ``Decision.kind``，所以**绝不进** ``HEAD_SIZE`` ✗
+#: ``HEAD_SIZE`` 是「引擎会发出的决策种类」的集合 ✓ 而 ``chisel`` 只在
+#: 「chi 头已经决定要吃」之后才用到 ✓ 混进去会污染 action_mask /
+#: action_index / 抽取逻辑（见 ``CHISEL_SIZE`` 的用法）。
+CHISEL_SIZE = 3
+
 #: 参与训练的决策种类（顺序固定，存档里会记下来）
 KINDS: tuple[str, ...] = (
     "discard", "tsumo", "ron", "riichi", "call", "chi", "kita", "kan", "kyuushu",
@@ -81,6 +89,14 @@ class Net:
         self.missing_heads: tuple[str, ...] = ()
         #: 逐头熵系数（P1-1）。默认值在第一次 step(ent_coef_adapt=True) 时播种。
         self._ent_coef: dict[str, float] = {}
+        #: 「吃成什么样」头（chisel）是否**真的被训练过** ✓
+        #:
+        #: 和 ``untrained_heads`` 分开记：chisel 不是决策种类，不能塞进
+        #: ``untrained_heads``（那会被当成「缺了一个 kind」）✗
+        #: 老权重没有 Wc/bc -> 这里 False -> MLAgent 走引擎启发式兜底 ✓
+        self.chisel_trained: bool = False
+        #: chisel 头累计拿到过多少次**有效**梯度（有 chipat>=0 的样本）✓
+        self.chisel_updates: int = 0
         #: KL 锚定的参考策略（P1-2）：**不参与求导**的冻结副本。
         #: 全仓库原来 `grep -i "kl|anchor|reference"` 在 train/net 里零命中。
         self.ref_probs: dict[str, np.ndarray] = {}
@@ -112,6 +128,17 @@ class Net:
         self.Wa2 = (rng.normal(0.0, np.sqrt(2.0 / ACTION_HIDDEN), (ACTION_HIDDEN, 1)) * 0.1
                     ).astype(np.float32)
         self.ba2 = np.zeros(1, dtype=np.float32)
+        # 「吃成什么样」的**独立**头 ✓
+        #
+        # ⚠️ 为什么**零初始化**而不是随机：
+        #   ① 老模型加载后必须「等于没加这个头」✓ 随机权重会让 argmax
+        #      乱跳 ✗ 零权重下 3 路全等 -> argmax=0（第一组合法吃法）确定性 ✓
+        #   ② 没训过 chisel 的权重（例如旧 BC 数据）也应该有一个**可预测**
+        #      的默认行为 ✓ 而 `chisel_trained=False` 会让 MLAgent 干脆不用它 ✓
+        #   ③ 零初始化的 softmax 是均匀分布 -> 第一 -log(1/3) 的损失 ✓
+        #      梯度的起点是对称的，不存在「被随机初始化带偏」✓
+        self.Wc = np.zeros((last, CHISEL_SIZE), dtype=np.float32)
+        self.bc = np.zeros(CHISEL_SIZE, dtype=np.float32)
 
         self._adam: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         #: `_apply` 里按形状复用的两个临时缓冲（避免每步每参数分配临时数组）✓
@@ -136,6 +163,11 @@ class Net:
         yield "ba1", self.ba1
         yield "Wa2", self.Wa2
         yield "ba2", self.ba2
+        #: 「吃成什么样」的**独立**头 ✓
+        #: 它不进 KINDS / HEAD_SIZE（不是 Decision.kind），但**是网络参数** ✓
+        #: 所以存档 / Adam / copy / 参数量统计都必须带上它们 ✓
+        yield "Wc", self.Wc
+        yield "bc", self.bc
 
     def copy(self) -> "Net":
         other = Net(self.dim, self.hidden, seed=0, lr=self.lr, l2=self.l2)
@@ -152,7 +184,26 @@ class Net:
         other.epochs_done = self.epochs_done
         other.untrained_heads = set(self.untrained_heads)
         other.missing_heads = tuple(self.missing_heads)
+        #: chisel 头的标量状态 ✓ Wc/bc 已经由上面的 params() 拷过了 ✓
+        #: `test_net.py` 的「copy() 不许漏标量」会自动抓到这里 ✓
+        other.chisel_trained = self.chisel_trained
+        other.chisel_updates = self.chisel_updates
         return other
+
+    # -- chisel 头（「吃成什么样」）--------------------------------------
+    def chisel_logits(self, features: np.ndarray) -> np.ndarray:
+        """chisel 头的 3 路 logits：``(N, last) -> (N, CHISEL_SIZE)``。
+
+        slot ``k`` = 「用 ``sorted(合法吃法)[k]`` 这两张吃」✓
+        合法吃法最多 3 种 ✓ 顺序必须与数据侧 ``tenhou_bc._legal_chi_pairs``
+        一致（都是 ``(a,b)`` 升序）✗ 否则训练/推理的 slot 语义就错位了 ✗
+
+        ⚠️ 训练数据里**没有**「这个局面有几种合法吃法」这一列 ✓
+           （``chipat`` 只记了人选的是第几种 ✓）
+           -> 训练就是 3 路 softmax ✓ 推理时由调用方把**不合法**的 slot
+           屏蔽掉再 argmax ✗（见 ``MLAgent._chisel_pick``）✓
+        """
+        return features @ self.Wc + self.bc
 
     def n_params(self) -> int:
         return sum(p.size for _, p in self.params())
@@ -253,6 +304,7 @@ class Net:
         ent_adapt_rate: float = 0.25,
         label_smoothing: float = 0.0,
         kl_coef: float | None = None,
+        chisel_coef: float = 0.0,
     ) -> dict:
         """一次 minibatch 更新。``batch`` 由 :mod:`aimodel.train` 组装。
 
@@ -268,6 +320,11 @@ class Net:
         熵低于目标就**调大** coef（逼它多探索），高于目标就调小。
         二分类头（立直/和了）目标熵天然低，所以**必须分头设目标** ——
         用一个全局系数会把这些头推坏。
+
+        ``chisel_coef``（新增）：监督「吃成什么样」的独立头。
+        =0（默认）时**整段跳过** ✓ 于是老调用方 / 金值测试的数值逐位不变 ✓
+        >0 时只对 ``kind=="chi" & chipat>=0`` 的行算 3 路交叉熵 ✓
+        其他行**不参与**（不是负样本）✗
         """
         X = batch["X"]
         mask = batch["mask"]
@@ -400,6 +457,43 @@ class Net:
         grads["bv"] = dv.sum(axis=0)
         g_feat += dv @ self.Wv.T
 
+        # -- chisel 头：「吃成什么样」 -----------------------------------
+        # 只监督 **kind=="chi" 且 chipat>=0** 的行 ✓
+        # 其余行（不是吃 / 人没吃）**完全不参与** ✗ 不能当负样本 ✗
+        #
+        # ⚠️ 这里**不往躯干回传**（g_feat 不动）✓ 这是一个有意的选择：
+        #   ① chisel 是「已经决定要吃」之后的二级决策 ✓ 不该去改主策略的表示 ✗
+        #   ② 用户明确要求「先用小系数，别破坏已经训好的东西」✓
+        #      不回传 = 无论系数多大都不可能动到主策略 / 价值头 ✓
+        #   ③ 金值测试（test_step_equivalence）在 chisel_coef=0 下逐位不变 ✓
+        #   线性头接在 256 维特征上已经够用 ✓（特征里已有手牌/副露/向听）
+        chipat = batch.get("chipat")
+        chisel_loss = 0.0
+        chisel_acc = 0.0
+        chisel_n = 0
+        if chisel_coef > 0.0 and chipat is not None:
+            cp = np.asarray(chipat)
+            sel = np.nonzero(
+                (kinds == "chi") & (cp >= 0) & (cp < CHISEL_SIZE)
+            )[0]
+            if len(sel):
+                hsel = feat[sel]
+                zc = hsel @ self.Wc + self.bc
+                pc = softmax_rows(zc)
+                t = cp[sel].astype(np.int64)
+                pt = pc[np.arange(len(sel)), t]
+                # d(-log p_t)/dz = p - onehot
+                dzc = pc.copy()
+                dzc[np.arange(len(sel)), t] -= 1.0
+                dzc *= float(chisel_coef) / len(sel)
+                grads["Wc"] = hsel.T @ dzc + self.l2 * self.Wc
+                grads["bc"] = dzc.sum(axis=0)
+                chisel_loss = float(-np.mean(np.log(np.maximum(pt, 1e-12))))
+                chisel_acc = float(np.mean(zc.argmax(axis=1) == t))
+                chisel_n = int(len(sel))
+                self.chisel_updates += 1
+                self.chisel_trained = True
+
         # 躯干反向
         g = g_feat
         for i in reversed(range(len(self.W))):
@@ -429,6 +523,11 @@ class Net:
             #       要么在这里返回 None 并让调用方处理 ✓
             "kl": (kl_sum / kl_n) if kl_n else 0.0,
             "clip_frac": clip_frac / nk,
+            # chisel 头（「吃成什么样」）：chisel_n == 0 表示这一批**没有**
+            # 可监督的吃法样本 ✓（不是「损失为 0」）✓
+            "chisel_loss": chisel_loss,
+            "chisel_acc": chisel_acc,
+            "chisel_n": chisel_n,
         }
 
     # -- Adam ---------------------------------------------------------------
@@ -523,6 +622,12 @@ class Net:
                     # 就变了（P0-4）。
                     "l2": self.l2,
                     "action_dim": int(self.Wa1.shape[0]),
+                    # 「吃成什么样」的独立头 ✓
+                    # ⚠️ 只写「有没有 / 训过没有」，Wc/bc 本身作为普通参数存 ✓
+                    #    老权重没有这两个键 -> load() 里零初始化 + 标成未训练 ✓
+                    "chisel": CHISEL_SIZE,
+                    "chisel_trained": bool(self.chisel_trained),
+                    "chisel_updates": int(self.chisel_updates),
                 }
             ).encode(),
             dtype=np.uint8,
@@ -548,6 +653,12 @@ class Net:
         而且**训练侧其实不需要默认 True**：它加载的是自己刚存的检查点，
         存的时候就带着当前的 `KINDS` ✓ 永远不会有缺头 ✓
         真想要「配套性断言」的调用方，显式传 `strict=True` 即可 ✓
+
+        **chisel（「吃成什么样」）是例外**：它**不是** `Decision.kind` ✓
+        老权重没有 ``Wc`` / ``bc`` 时**零初始化 + ``chisel_trained=False``** ✓
+        不报错、不警告、也不进 ``missing`` ✗ —— 因为 MLAgent 见到
+        ``chisel_trained=False`` 会走引擎启发式 ✓ 老模型行为完全不变 ✓
+        ``strict=True`` 也不因缺 chisel 而抛错（它不是决策头 ✓）。
         """
 
         data = np.load(path, allow_pickle=False)
@@ -624,10 +735,34 @@ class Net:
         net.steps = 0
         missing = []
         for name, p in net.params():
+            # chisel 是**可选二级头** ✓ 老权重没有它**不是**「结构变了」✗
+            # 把它塞进下面的 missing 警告会让 44 个存量权重每次加载都喊
+            # 「请重新训练」✗ —— 那就是加头把整网搞瘫的另一种形式 ✓
+            if name in ("Wc", "bc") and name not in data:
+                continue
             if name in data:
                 p[...] = data[name]
             else:
                 missing.append(name)
+        # -- chisel 头：零初始化 / 恢复训练状态 -------------------------
+        # 存量权重里**没有** Wc/bc -> 保持 __init__ 的零 ✓
+        # 零权重 + 3 路 softmax -> argmax 恒为 0（第一组合法吃法）✓
+        # 但 `chisel_trained=False` 会让 MLAgent **不启用**它 ✓
+        # -> 老模型完全走引擎启发式，行为与加头前一致 ✓
+        has_chisel = ("Wc" in data) and ("bc" in data)
+        if has_chisel:
+            net.chisel_updates = int(meta.get("chisel_updates", 0))
+            trained = meta.get("chisel_trained", None)
+            if trained is None:
+                # 自己存的新权重一定带这个键；这里只是兜底：
+                # 有非零权重 / 有更新计数才算训过 ✓
+                trained = net.chisel_updates > 0 or bool(np.any(net.Wc))
+            net.chisel_trained = bool(trained)
+        else:
+            net.Wc[...] = 0.0
+            net.bc[...] = 0.0
+            net.chisel_updates = 0
+            net.chisel_trained = False
         # 补上的新头必须**显式清零** —— 留着随机初始化的话，万一哪天被走到，
         # 输出就是噪声（这正是当初写那句报错要防的事）。
         # ⚠️ 这里用 `added_all`（**含不可达的头**）✗
@@ -671,4 +806,4 @@ def softmax_masked(z: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return (e / s).astype(np.float32)
 
 
-__all__ = ["Net", "KINDS", "HEAD_SIZE", "softmax_masked", "softmax_rows"]
+__all__ = ["Net", "KINDS", "HEAD_SIZE", "CHISEL_SIZE", "softmax_masked", "softmax_rows"]

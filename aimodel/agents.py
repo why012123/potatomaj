@@ -485,6 +485,38 @@ class Tracker:
         }
 
 
+def legal_chi_pairs(hand: Sequence[int], tile: int) -> list[tuple[int, int]]:
+    """吃 ``tile`` 时，手里**真有**的「另外两张」组合，按 ``(a,b)`` 升序 ✓
+
+    ⚠️ 这个顺序就是数据侧 ``chipat`` 的编码基准 ✗
+    （``tenhou_bc._legal_chi_pairs``，见 docs/chisel-数据侧-2026-10-21.md）
+    推理端**必须**用同一顺序，否则 slot k 训练/推理语义错位 ✗
+    两张实现用 ``test_chisel.py`` 逐 tile × 随机手牌对拍 ✓
+
+    为什么这里不直接 import ``tenhou_bc._legal_chi_pairs``：
+    ``tenhou_bc`` -> ``logcheck`` -> ``agents`` 会形成**循环 import** ✗
+    而且它 import 一次要 ~1s（拉进 mjai / logcheck / rewards）✓
+    运行时每个 chi 决策都付不起这个钱 ✗
+    所以照抄这份**唯一**的实现，并用测试钉住两边一致 ✓
+
+    与 ``engine._chi_pairs`` 的等价性：引擎按 ``start`` 从小到大遍历
+    （``n-2, n-1, n``），每个 ``start`` 产出的 ``(a,b)`` 内部也是升序 ✓
+    所以它天然就是 ``(a,b)`` 升序 ✓ 不需要（也不能）改引擎 ✓
+    """
+    if tile < 0 or tile >= 27:          # 字牌 / 非法牌 -> 不能吃
+        return []
+    suit0 = (tile // 9) * 9
+    out: list[tuple[int, int]] = []
+    for lo in (tile - 2, tile - 1, tile):
+        hi = lo + 2
+        if lo < suit0 or hi >= suit0 + 9:   # 越界 / 跨花色
+            continue
+        others = [x for x in (lo, lo + 1, hi) if x != tile]
+        if all(hand[x] > 0 for x in others):
+            out.append((others[0], others[1]))
+    return sorted(out)
+
+
 class MLAgent(Agent):
     """用神经网络的策略头决策；策略头没有的种类退化成随机。"""
 
@@ -500,6 +532,7 @@ class MLAgent(Agent):
         temperature: float = 1.0,
         *,
         style: str | TeacherStyle = "normal",
+        use_chisel: bool = True,
     ) -> None:
         self.net = net
         self.rng = np.random.default_rng(seed)
@@ -512,6 +545,30 @@ class MLAgent(Agent):
         self.fallback = fallback or HeuristicAgent(seed, style=style)
         self.temperature = temperature
         self.counts: dict[str, int] = {}
+        #: 「吃成什么样」开关（消融用）✓
+        #: False -> 与加 chisel 之前**完全一致**：chi 头说吃就吃，
+        #:         具体用哪两张交给引擎的向听启发式 ✓
+        #: True  -> 只有当拿到「逐吃法」选项（``chi:<a>:<b>`` / ``decision.pairs``）
+        #:         时才由 chisel 选 ✓ 拿不到（stock engine 只有二值）时
+        #:         **仍然走原路径** ✗ 不 veto、不改变吃不吃 ✓
+        #:         —— veto 会同时改「吃不吃」，破坏单变量消融（见交接说明）✗
+        self.use_chisel = bool(use_chisel)
+        #: 上一手 chisel 的选择（诊断 / UI 用）：
+        #: ``{"pair": (a,b), "slot": k, "legal": [...], "logits": [...]}``
+        self.last_chisel: dict | None = None
+
+    def _chisel_active(self) -> bool:
+        """chisel 头**可不可用**：开关开着 + 权重真的训过 + 有接口 ✓
+
+        老权重的 ``chisel_trained=False``（net.py 里 load 时标好）✓
+        没训过 chisel 的权重（例如纯教师 BC）也不会启用 ✓
+        这两种情况都退回「引擎按向听挑吃法」= 加头之前的行为 ✓
+        """
+        return bool(
+            self.use_chisel
+            and getattr(self.net, "chisel_trained", False)
+            and hasattr(self.net, "chisel_logits")
+        )
 
     def _head_to_option(self, decision: Decision, head: int) -> int | None:
         """策略头下标 -> ``decision.options`` 下标；对不上返回 ``None``。
@@ -535,6 +592,61 @@ class MLAgent(Agent):
             None,
         )
 
+    # -- chisel（吃成什么样）------------------------------------------------
+    def _chisel_pick(self, x: np.ndarray, decision: Decision, view: View):
+        """chisel 在**合法吃法**里挑一对；返回 ``(slot, pair, legal)`` 或 None。
+
+        合法吃法由 :func:`legal_chi_pairs` 给出（与数据侧
+        ``tenhou_bc._legal_chi_pairs`` 逐项相同，都是 ``(a,b)`` 升序）✓
+        chisel 的 3 个 slot **只在合法数量内**比较 ✓ 非法 slot 直接不参与
+        argmax（训练时没有「有几种合法吃法」这一列，推理时**有**）✓
+        """
+        tile = getattr(decision, "tile", None)
+        if tile is None:
+            return None
+        legal = legal_chi_pairs(view.hand, int(tile))
+        if not legal:
+            return None
+        h2 = self.net.trunk(x[None, :])
+        z = np.asarray(self.net.chisel_logits(h2), dtype=np.float64)[0, : len(legal)]
+        slot = int(np.argmax(z))
+        return slot, legal[slot], legal
+
+    def _pair_option_index(self, decision: Decision, pair: tuple[int, int]) -> int | None:
+        """在 ``decision.options`` 里找「正是这一对」的选项下标。
+
+        支持两种引擎写法（都已实测）：
+          · ``["pass", "chi:15:16", "chi:20:22"]`` —— 从选项串里解析 (a,b) ✓
+          · ``Decision.pairs = [(15,16), (20,22)]`` 且 options 与之对齐 ✓
+            （字段可能还没合并进来 -> 用 ``getattr`` 兼容 ✓）
+        都没有（stock engine 的 ``["pass","chi"]``）-> ``None`` ✓
+        """
+        opts = list(decision.options)
+        # ① 选项串 chi:<a>:<b> —— 最可靠，直接按值匹配
+        for i, o in enumerate(opts):
+            s = str(o)
+            if s.split(":", 1)[0] != "chi":
+                continue
+            parts = s.split(":")
+            if len(parts) < 3:
+                continue
+            try:
+                ab = (int(parts[1]), int(parts[2]))
+            except ValueError:
+                continue
+            if ab == pair:
+                return i
+        # ② Decision.pairs（顺序与 options[1:] 对齐）
+        pairs = getattr(decision, "pairs", None)
+        if pairs:
+            pl = [tuple(int(v) for v in p) for p in pairs]
+            if pair in pl:
+                j = pl.index(pair)
+                # 无字符串信息时只能假定 options = [pass] + pairs
+                if len(opts) == len(pl) + 1:
+                    return 1 + j
+        return None
+
     def decide(self, decision: Decision, view: View) -> int:
         kind = decision.kind
         if kind not in HEAD_SIZE or kind not in getattr(self.net, "kinds", []):
@@ -549,7 +661,36 @@ class MLAgent(Agent):
             head, logp, _ = self.net.act(
                 x, kind, mask[:size], self.rng, greedy=self.greedy, actfeat=actfeat
             )
-        choice = self._head_to_option(decision, head)
+        # 「吃成什么样」：只在 **chi 头已经决定吃** 之后才轮到它 ✓
+        # chipat 只在「引擎真的会吃我们选的那一对」时才记 ✓
+        # 拿不到逐吃法选项时保持 -1 ✗ 不能把「心想的 pair」当成实际标签 ✗
+        chipat = -1
+        choice = None
+        if kind == "chi" and head == 1 and self._chisel_active():
+            got = self._chisel_pick(x, decision, view)
+            if got is not None:
+                slot, pair, legal = got
+                opt = self._pair_option_index(decision, pair)
+                self.last_chisel = {
+                    "pair": pair, "slot": slot, "legal": list(legal),
+                    # honored=False = stock engine 只有二值选项，
+                    # 这一手**实际**还是引擎按向听挑的 ✓（诊断时别误读）
+                    "honored": opt is not None,
+                }
+                if opt is not None:
+                    # 引擎给了逐吃法选项 -> chisel 的 pair 就是真正吃出去的那一对 ✓
+                    choice = opt
+                    chipat = slot
+                    self.counts["chi_chisel"] = self.counts.get("chi_chisel", 0) + 1
+                else:
+                    # stock engine 只有 ["pass","chi"] -> **无法指定 pair** ✗
+                    # 走原路径：chi 头说吃就吃，引擎按向听挑 ✓
+                    # 这里**不 veto** ✓（veto 会同时改「吃不吃」，不是单变量消融）
+                    self.counts["chi_pair_engine"] = (
+                        self.counts.get("chi_pair_engine", 0) + 1
+                    )
+        if choice is None:
+            choice = self._head_to_option(decision, head)
         if choice is None:
             # 网络选中的动作在本次合法选项里不存在（选项写法/动作空间不一致）。
             # 不记进 Tracker（那一手的头下标没法对应到选项），交给兜底教师。
@@ -560,6 +701,7 @@ class MLAgent(Agent):
             self.tracker.record(
                 kind, x, mask[:size], head, logp, view.player,
                 action_label(decision, choice), actfeat,
+                chipat=chipat,
             )
         return choice
 

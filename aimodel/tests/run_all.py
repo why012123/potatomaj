@@ -30,6 +30,7 @@ DOCS = {
     "test_4p.py":           "四麻：136 张 / 吃 / 北家自风 / 三色同顺 / 点数",
     "test_teacher_4p.py":   "四麻教师不能对第 4 家失明（P0-1 回归）",
     "test_chi_4p.py":       "四麻的「吃」必须真的被学到（P0-2 回归）",
+    "test_chisel.py":       "chisel（吃成什么样）：老权重兜底 / 零初始化 / 梯度 / 端到端",
     "test_bc_holdout.py":   "BC 存「留出最优」而非「最后一轮」（P0-5 回归）",
     "test_weight_guard.py": "裸跑不许覆盖已训好的权重（P0-6 回归）",
     "test_eval_resolution.py": "同牌山注入 / 置信区间 / 还要多少场（P1-4 回归）",
@@ -43,6 +44,7 @@ DOCS = {
     "test_logs.py":         "牌谱管线：MJAI 读写 / 重放对拍 / 数据抽取",
     "test_danger_model.py": "危险度模型接入：布局一致性 / 人数维度守卫 / 退回手写路径",
     "test_repo_hygiene.py": "仓库卫生：天鳳牌谱的保护规则必须一直生效",
+    "test_external.py":    "外部 mjai AI 协议桥：正常/超时/崩溃/非法动作/确定性",
 }
 
 #: 明确不跑的（目前没有）。放这里而不是「不写进列表」✗ —— 那样会变成静默跳过 ✓
