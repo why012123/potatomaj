@@ -67,6 +67,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
@@ -87,6 +88,9 @@ from .agents import Agent, HeuristicAgent
 from .engine import Decision, View
 
 log = logging.getLogger("potatomaj.external")
+
+#: 还活着的 agent —— 进程退出 / Ctrl-C 时由 atexit 统一 kill
+_LIVE: "set[ExternalMJaiAgent]" = set()
 
 ROOT = Path(__file__).resolve().parents[1]
 #: 外部 AI 默认放这里（`.gitignore` 里的 `_data/`，不会进 git）
@@ -410,7 +414,18 @@ def resolve_settings(
     ek = _env_key(sp.key)
     env_cmd = os.environ.get(ek + "_CMD", "").strip()
     if env_cmd:
-        cmd = shlex.split(env_cmd)
+        # 路径里有空格时 shlex 会切错；允许直接写 JSON 数组：
+        #   POTATOMAJ_EXTERNAL_MANUE_CMD='["/a b/python", "/a b/bot.py"]'
+        if env_cmd.startswith("["):
+            try:
+                parsed = json.loads(env_cmd)
+                cmd = [str(x) for x in parsed]
+            except Exception as exc:  # noqa: BLE001
+                raise ExternalAINotInstalled(
+                    f"{ek}_CMD 不是合法的 JSON 数组：{exc}"
+                ) from exc
+        else:
+            cmd = shlex.split(env_cmd)
     env_dir = os.environ.get(ek + "_DIR", "").strip()
     if env_dir:
         workdir = Path(env_dir).expanduser()
@@ -620,7 +635,7 @@ class ExternalMJaiAgent(Agent):
         seed: int = 0,
         player_id: int = 0,
         players: int = 4,
-        timeout: float = 20.0,
+        timeout: float = 2.0,
         start_timeout: float = 60.0,
         fallback: Agent | None = None,
         strict: bool = True,
@@ -714,6 +729,9 @@ class ExternalMJaiAgent(Agent):
         # 统计
         self.decisions = 0
         self.errors = 0
+        self.fallback_steps = 0
+        self._decide_total = 0.0
+        self._decide_max = 0.0
         self.degraded = False
         self.degrade_reason = ""
         self.crash_count = 0
@@ -780,6 +798,7 @@ class ExternalMJaiAgent(Agent):
         threading.Thread(target=self._read_stderr, args=(gen,),
                          name=f"ext-{self.spec.key}-err", daemon=True).start()
         self._started = True
+        _LIVE.add(self)
         start = {"type": "start_game", "id": self.player_id,
                  "names": [f"P{i}" for i in range(self.players)]}
         if self.batch_events:
@@ -838,6 +857,7 @@ class ExternalMJaiAgent(Agent):
             if self._closed:
                 return
             self._closed = True
+            _LIVE.discard(self)
             proc = self._proc
             if proc is not None and proc.poll() is None:
                 try:
@@ -879,6 +899,7 @@ class ExternalMJaiAgent(Agent):
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise ExternalAICrashed(f"{self.name} 的 stdin 不可用")
+        event = {k: v for k, v in event.items() if not k.startswith("_")}
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         try:
             proc.stdin.write(line + "\n")
@@ -892,7 +913,9 @@ class ExternalMJaiAgent(Agent):
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise ExternalAICrashed(f"{self.name} 的 stdin 不可用")
-        line = json.dumps(events, ensure_ascii=False, separators=(",", ":"))
+        clean = [{k: v for k, v in ev.items() if not k.startswith("_")}
+                 for ev in events]
+        line = json.dumps(clean, ensure_ascii=False, separators=(",", ":"))
         try:
             proc.stdin.write(line + "\n")
             proc.stdin.flush()
@@ -941,8 +964,6 @@ class ExternalMJaiAgent(Agent):
                     f"stderr 末尾：{self._stderr_tail()}"
                 )
             if kind == "bad":
-                if allow_none:
-                    return None
                 raise ExternalAIProtocolError(
                     f"{self.name} 输出的不是 JSON 对象：{payload!r}"
                 )
@@ -1073,7 +1094,12 @@ class ExternalMJaiAgent(Agent):
                 pai = _tile_name(int(a.get("tile", 0)), False)
             else:
                 pai = "?"
-            return [{"type": "tsumo", "actor": p, "pai": pai}]
+            ev = {"type": "tsumo", "actor": p, "pai": pai}
+            if a.get("rinshan"):
+                # 标记给 _sync_dora 用：新宝牌必须插在岭上摸牌**之前**，
+                # 否则 manue 的「等 dora 再进入可打牌状态」会卡住。
+                ev["_rinshan"] = True
+            return [ev]
 
         if k == "discard":
             p = int(a.get("player", 0))
@@ -1175,6 +1201,15 @@ class ExternalMJaiAgent(Agent):
 
         return []
 
+    @staticmethod
+    def _insert_before_rinshan(events: list[dict], dora: list[dict]) -> None:
+        """把 dora 事件插到最后一个岭上 tsumo 之前；没有就追加。"""
+        for i in range(len(events) - 1, -1, -1):
+            if events[i].get("type") == "tsumo" and events[i].get("_rinshan"):
+                events[i:i] = dora
+                return
+        events.extend(dora)
+
     def _sync_dora(self, view: View) -> None:
         """杠后宝牌指示牌会变多；引擎没有单独的 dora 事件，用 View 补。"""
         inds = list(getattr(view, "dora_indicators", []) or [])
@@ -1183,11 +1218,20 @@ class ExternalMJaiAgent(Agent):
         new = inds[self._dora_sent:]
         self._dora_sent = len(inds)
         events = [{"type": "dora", "dora_marker": _tile_name(int(d))} for d in new]
-        self._hand_events.extend(events)
-        self._outbox.extend(events)
+        self._insert_before_rinshan(self._hand_events, events)
+        self._insert_before_rinshan(self._outbox, events)
 
     # -- 决策 ---------------------------------------------------------------
     def decide(self, decision: Decision, view: View) -> int:
+        t0 = time.perf_counter()
+        try:
+            return self._decide(decision, view)
+        finally:
+            dt = time.perf_counter() - t0
+            self._decide_total += dt
+            self._decide_max = max(self._decide_max, dt)
+
+    def _decide(self, decision: Decision, view: View) -> int:
         self.decisions += 1
         if self.degraded:
             assert self.fallback is not None
@@ -1240,6 +1284,18 @@ class ExternalMJaiAgent(Agent):
         if action is None:
             return
         if own:
+            # 自己的回合不可能是 none；这是上一条事件迟到的脏数据。
+            # 继续读几行，拿到真正的动作（最多等 3×0.5s）。
+            for _ in range(3):
+                if action.get("type") != "none":
+                    break
+                try:
+                    nxt = self._read_action(0.5, allow_none=True,
+                                            count_timeout=False)
+                except ExternalAITimeout:
+                    break
+                if nxt is not None:
+                    action = nxt
             self._pending_action = action
         else:
             self._discard_response = action
@@ -1378,6 +1434,7 @@ class ExternalMJaiAgent(Agent):
         if self.fallback is None:
             raise exc
         self.degraded = True
+        self._dead = True
         log.warning("%s 降级为内置教师（原因：%s）", self.name, reason)
 
     def _fail(self, exc: ExternalAIError, decision: Decision, view: View) -> int:
@@ -1562,6 +1619,9 @@ class ExternalMJaiAgent(Agent):
             "bad_actions": self._bad_action_count,
             "degraded": self.degraded,
             "degrade_reason": self.degrade_reason,
+            "fallback_steps": self.fallback_steps,
+            "avg_decide_ms": round(1000 * self._decide_total / max(1, self.decisions), 2),
+            "max_decide_ms": round(1000 * self._decide_max, 2),
             "available": self.available,
             "available_reason": self.available_reason,
         }
@@ -1639,11 +1699,19 @@ def attach(game: Any, agents: Iterable[Any] | None = None) -> list[ExternalMJaiA
 
 
 def close_external(agents: Iterable[Any]) -> None:
-    """关掉一批 agent 里的外部进程（其它 agent 忽略）。"""
+    """关掉一批 agent 里的外部进程（其它 agent 忽略）。
+
+    也认 ``webapp.server.agents.AISeat`` 这种包装：它把外部 agent 放在
+    ``.agent`` / ``._external`` 里。
+    """
     for a in agents:
-        if isinstance(a, ExternalMJaiAgent):
+        inner = getattr(a, "agent", a)
+        ext = getattr(a, "_external", None)
+        if ext is None and isinstance(inner, ExternalMJaiAgent):
+            ext = inner
+        if ext is not None:
             try:
-                a.close()
+                ext.close()
             except Exception:  # noqa: BLE001
                 log.exception("关闭外部 AI 失败")
 
@@ -1677,6 +1745,18 @@ def external_models(players: int = 4) -> list[dict]:
             "note": sp.note if ok else why,
         })
     return rows
+
+
+def close_all() -> None:
+    """进程退出 / Ctrl-C 时把所有外部子进程 kill 干净。"""
+    for ag in list(_LIVE):
+        try:
+            ag.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+atexit.register(close_all)
 
 
 __all__ = [

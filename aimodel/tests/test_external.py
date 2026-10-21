@@ -15,10 +15,14 @@
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import subprocess
+import threading
 import sys
 import tempfile
+import time
 import unittest.mock as mock
 from pathlib import Path
 
@@ -231,6 +235,157 @@ def test_tile_names():
     print("  ✅ 赤 5 的 mjai 写法（5mr）往返正确")
 
 
+def test_bad_json_raises_and_degrades():
+    agent = _agent("badjson", max_restarts=0)
+    try:
+        try:
+            _play(agent)
+        except external.ExternalAIProtocolError as exc:
+            assert "JSON" in str(exc) or "json" in str(exc), str(exc)
+            print("  ✅ 外部 AI 吐非法 JSON -> 明确协议错误")
+            return
+        else:
+            raise AssertionError("非法 JSON 居然没报错")
+    finally:
+        agent.close()
+    # fallback 版：桌子不能崩
+    teacher = HeuristicAgent(seed=123)
+    agent = _agent("badjson", max_restarts=0, fallback=teacher)
+    try:
+        r = _play(agent)
+        assert len(r.hands) >= 1 and agent.degraded
+        print("  ✅ 非法 JSON + fallback -> 降级继续打完")
+    finally:
+        agent.close()
+
+
+def test_close_kills_process():
+    agent = _agent("normal")
+    r = _play(agent, seed=2026)
+    assert len(r.hands) >= 1
+    proc = agent._proc
+    assert proc is not None
+    agent.close()
+    assert proc.poll() is not None, "close() 后子进程还活着"
+    print("  ✅ close() / close_external() 会 kill 子进程")
+
+
+def test_platform_aiset_external():
+    """平台接法：AISeat(_build) + Room._on_action 的 feed 转发。"""
+    from webapp.server import agents as AG
+
+    names = {m["name"] for m in AG.available_models()}
+    assert "external:manue" in names, "平台模型列表里没有 external:manue"
+    cmd, env = _command("normal")
+    with mock.patch.dict(os.environ, {
+        "POTATOMAJ_EXTERNAL_MANUE_CMD":
+            json.dumps([sys.executable, str(FAKE)]),
+        "FAKE_MJAI_MODE": "normal",
+    }, clear=False):
+        seat = AG.AISeat(0, "external:manue", workers=1, seed=7,
+                         players=4, delay=0.0)
+        try:
+            assert isinstance(seat.agent, external.ExternalMJaiAgent), type(seat.agent)
+            game = Game([seat] + [HeuristicAgent(seed=10 + i) for i in range(3)],
+                        seed=31, rule=S.rule_for(4), rounds=1)
+            # 平台里是 Room._on_action 把事件转给 inner agent
+            game.on_action = lambda ev: seat.agent.feed(ev)
+            r = game.play()
+            assert len(r.hands) >= 1
+            assert seat.agent.decisions > 0
+            assert not seat.degraded, seat.summary()
+            print(f"  ✅ 平台 AISeat 用 external:manue 打完 {len(r.hands)} 局，"
+                  f"{seat.agent.decisions} 次决策")
+        finally:
+            external.close_external([seat])
+
+
+def test_tcp_server_with_fake_client():
+    """最小 mjai TCP server：hello -> join -> start_game -> 事件 -> 动作。"""
+    from aimodel import mjai_tcp
+
+    agent = mjai_tcp.ExternalTCPAgent(
+        "akochan", seed=5, player_id=0, players=4, port=0,
+        timeout=10.0, fallback=HeuristicAgent(seed=77),
+        allow_missing=True,
+    )
+    srv = agent._server()
+    srv.listen()
+    port = srv.port
+    errors: list[str] = []
+
+    def client() -> None:
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+            f = sock.makefile("rw", encoding="utf-8", newline="\n")
+            hello = json.loads(f.readline())
+            assert hello.get("type") == "hello", hello
+            f.write(json.dumps({"type": "join", "name": "fake",
+                                "room": "default"}) + "\n")
+            f.flush()
+            pid = 0
+            last_draw = None
+            hand: dict[str, int] = {}
+            for line in f:
+                ev = json.loads(line)
+                typ = ev.get("type")
+                if typ == "start_game":
+                    pid = int(ev.get("id", 0))
+                    f.write('{"type":"none"}\n'); f.flush()
+                elif typ == "start_kyoku":
+                    hand = {}
+                    for t in (ev.get("tehais") or [[], [], [], []])[pid]:
+                        if t != "?":
+                            hand[t] = hand.get(t, 0) + 1
+                    f.write('{"type":"none"}\n'); f.flush()
+                elif typ == "tsumo" and ev.get("actor") == pid:
+                    last_draw = ev.get("pai")
+                    f.write(json.dumps({"type": "dahai", "actor": pid,
+                                        "pai": last_draw,
+                                        "tsumogiri": True}) + "\n")
+                    f.flush()
+                elif typ == "dahai":
+                    if ev.get("actor") != pid:
+                        f.write('{"type":"none"}\n'); f.flush()
+                elif typ == "end_game":
+                    break
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    t = threading.Thread(target=client, daemon=True)
+    t.start()
+    try:
+        r = _play(agent, seed=4242)
+        assert len(r.hands) >= 1
+        assert agent.decisions > 0
+        assert not errors, errors
+        print(f"  ✅ mjai TCP server 跑完 {len(r.hands)} 局、"
+              f"{agent.decisions} 次决策（fake akochan client）")
+    finally:
+        agent.close()
+
+
+def test_akochan_missing_fast():
+    """没装 akochan：必须在 2 秒内抛，不能 listen/accept 拖死 CI。"""
+    from aimodel import mjai_tcp
+
+    with mock.patch.dict(os.environ, {
+        "POTATOMAJ_EXTERNAL_AKOCHAN_BIN": "/nonexistent/akochan",
+        "POTATOMAJ_AKOCHAN_BIN": "",
+    }, clear=False):
+        t = time.monotonic()
+        try:
+            mjai_tcp.ExternalTCPAgent("akochan")
+        except external.ExternalAINotInstalled as exc:
+            dt = time.monotonic() - t
+            assert dt < 2.0, f"没装也要快失败，实际 {dt:.2f}s"
+            assert external.DOC_HINT in str(exc)
+            print(f"  ✅ 没装 akochan -> {dt*1000:.1f}ms 内抛错（不监听端口）")
+            return
+        else:
+            raise AssertionError("没装 akochan 居然构造成功了")
+
+
 def test_cli_help():
     for mod in ("aimodel.ab", "aimodel.arena_test"):
         r = subprocess.run([sys.executable, "-m", mod, "--help"],
@@ -257,6 +412,11 @@ def main() -> int:
         test_crash_without_fallback_raises,
         test_determinism,
         test_batch_mode,
+        test_bad_json_raises_and_degrades,
+        test_close_kills_process,
+        test_platform_aiset_external,
+        test_tcp_server_with_fake_client,
+        test_akochan_missing_fast,
         test_cli_help,
     ]
     for fn in tests:

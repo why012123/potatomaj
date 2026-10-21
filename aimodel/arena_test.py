@@ -124,6 +124,7 @@ def _make_agent(spec: str, seed: int, players: int, *,
     if ext_key is not None:
         return external.ExternalMJaiAgent(
             ext_key, seed=seed, player_id=player_id, players=players,
+            timeout=20.0, max_restarts=2,
         )
     if low in ("teacher", "heuristic"):
         return HeuristicAgent(seed)
@@ -167,10 +168,14 @@ def _third_agent(kind: str, seed: int, players: int, net: Net | None = None,
         if seat == third_seat:
             return external.ExternalMJaiAgent(
                 ext_key, seed=seed, player_id=seat, players=players,
+                timeout=20.0, max_restarts=2,
             )
         return HeuristicAgent(seed, style="normal")
-    if kind == "third" and net is not None:
-        return MLAgent(net, seed=seed, greedy=True)
+    if kind == "third":
+        if net is not None:
+            return MLAgent(net, seed=seed, greedy=True)
+        # 老行为：没给第三家权重时退回教师，而不是把 "third" 当未知 spec 报错。
+        return HeuristicAgent(seed, style="normal")
     return _make_agent(kind, seed, players, sample=True, net=net,
                        player_id=seat)
 

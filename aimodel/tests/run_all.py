@@ -40,11 +40,14 @@ DOCS = {
     "test_fastshanten.py":  "快速向听，与既有实现交叉验证",
     "test_engine.py":       "对局引擎：守恒、规则、状态机",
     "test_encode.py":       "特征编码：全局特征 / 动作特征 / 掩码",
+    "test_state_features.py": "整场状态特征：振听/场次/本场/供托/连任/剩余/顺位/摸切/叫牌张",
+    "test_legacy_encode.py": "冻结老 encoder：486/560 逐位金值 + 维度分发（保老权重）",
     "test_net.py":          "神经网络：数值梯度、掩码、存档、PPO 截断",
     "test_logs.py":         "牌谱管线：MJAI 读写 / 重放对拍 / 数据抽取",
     "test_danger_model.py": "危险度模型接入：布局一致性 / 人数维度守卫 / 退回手写路径",
     "test_repo_hygiene.py": "仓库卫生：天鳳牌谱的保护规则必须一直生效",
     "test_external.py":    "外部 mjai AI 协议桥：正常/超时/崩溃/非法动作/确定性",
+    "test_strong.py":      "规则强 agent：无役不鸣 / 有役该鸣 / 弃和安全 / 确定性 / 四三麻整局",
 }
 
 #: 明确不跑的（目前没有）。放这里而不是「不写进列表」✗ —— 那样会变成静默跳过 ✓

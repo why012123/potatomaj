@@ -169,7 +169,7 @@ JSON 配置（`POTATOMAJ_EXTERNAL_CONFIG=/abs/external.json`）：
 
 ## 3. 安装外部 AI
 
-### 3.1 mjai-manue-go（推荐先试，本次已验证）
+### 3.1 mjai-manue-go（**平台/天梯已接，本次已验证**）
 
 需要 Go **1.27+**（仓库 README 明确要求）。
 
@@ -241,8 +241,15 @@ export POTATOMAJ_EXTERNAL_MORTAL_AKAGI_CMD="$PWD/_data/external/Akagi-MjaiBot-Mo
 ```
 
 适配层给 `mortal-akagi` 开了 `batch_events=True`：一批事件发一行 JSON
-数组，Akagi bot 每批只回一行。**本次状态**：包已下载、Python 3.12 环境
-已建，torch 安装/端到端对局属于「第二优先」，见最终报告。
+数组，Akagi bot 每批只回一行。
+
+**本次状态：已跑通**。Python 3.12 + torch 2.8 装好后，实测：
+
+- 四麻 1 局：39 次决策，0 错误，`avg_decide_ms=7.57`，`max_decide_ms=20.2`
+- `arena_test --a mortal-akagi --b teacher --games 10`：
+  Δ = **+6.36**，SE = **13.22**，n = 10（样本小，不显著）
+- `arena_test --a mortal-akagi --b maj-pro4v1.1_mac_rl --games 4`：
+  Δ = **−10.55**，SE = **21.38**，n = 4（样本小，不显著）
 
 ### 3.4 akochan（只能 TCP）
 
@@ -253,9 +260,18 @@ make -f Makefile_MacOS          # 需要 Boost；本机未装
 # mjai：./system.exe mjai_client <port> setup_mjai.json
 ```
 
-它不是 stdio bot，本桥会明确拒绝（`ExternalAIUnsupported`）。要接的话，
-需要先跑一个 mjai server（`gimite/mjai`），把 akochan 当 TCP client，
-桥这边再写一个 TCP↔Agent 的适配 —— 目前**没做**。
+它不是 stdio bot，本桥会明确拒绝（`ExternalAIUnsupported`）。为此新增了
+`aimodel/mjai_tcp.py`：
+
+- `MJaiTCPServer`：监听 127.0.0.1、发 `hello`、读 `join`、发 `start_game`；
+- `ExternalTCPAgent`：复用 `ExternalMJaiAgent` 的事件翻译/超时/决策映射，
+  只把 subprocess 换成 TCP；
+- CLI：`python -m aimodel.mjai_tcp --port 11600`，启动后按提示运行
+  `./system.exe mjai_client 11600 setup_mjai.json`。
+
+**已验证**：用假 TCP client 跑完一局四麻（23 次决策，0 错误）。
+**没验证**：真实 akochan——这台机器没有 Boost，`make -f Makefile_MacOS`
+编译不了；见「卡点」。
 
 ### 3.5 Kanachan（没有权重，跑不了）
 
@@ -268,63 +284,44 @@ make -f Makefile_MacOS          # 需要 Boost；本机未装
 
 ---
 
-## 4. 平台接入（`webapp/`）
+## 4. 平台接入（`webapp/`）—— **已接**
 
-本任务按约定**没有改 webapp/**（改动只在 `aimodel/`、`tools/`、`docs/`）。
-下面给出精确到文件+行的接法；每一处都很小。
+`external:manue` 已经能在平台模型列表里选到，并且 `AISeat` 能真的跑完一局
+（实测 2 局、39 次决策、0 错误、平均 **264 ms/步**、最大 **1427 ms/步**）。
+下面是实际改动的文件与位置（如果之后有人重构，按这些锚点找）。
 
-### 4.1 模型列表：`webapp/server/agents.py`
+### 4.1 模型列表 + 座位构造：`webapp/server/agents.py`（已改）
 
-1. 文件顶部 import 区（约 **L20–L24**，`from aimodel import variants` 附近）加：
+1. 顶部（L26 附近）：`from aimodel import external, variants`。
+2. `available_models()`：在 `rows = list(out.values())` 之前加
+   `for row in external.external_models(4): out.setdefault(row["name"], row)`。
+   行里带 `name / external / spec / title / license / language / repo /
+   players / usable / note`，前端现有下拉会直接显示；没装的置灰。
+3. `AISeat.__init__` 增加 `players: int = 4`，并保存 `self.players` /
+   `self._external = None`。
+4. `AISeat._build()` 在 `strong` 分支之后加外部分支：`external.normalize_key(name)`
+   → 非四麻直接降级 → 构造 `ExternalMJaiAgent(..., timeout=2.0,
+   max_restarts=1, fallback=self.teacher)`；构造失败降级教师并标 `degraded`。
+5. `AISeat.decide()` 在记录决策前检查 `self._external.degraded`，把运行中
+   降级同步到座位（前端「座位标灰」靠 `ai_degraded`）。
+6. `AISeat.summary()` 增加 `"external": self._external.summary()`，
+   里面有 `avg_decide_ms / max_decide_ms / errors / restarts / fallback_steps`。
 
-   ```python
-   from aimodel import external
-   ```
+### 4.1b 天梯：`aimodel/arena.py`（已改）
 
-2. `available_models()` 里，在 `rows = list(out.values())`（约 **L237**）
-   之前加一行：
+- `collect()` 里，四麻池会通过 `external.check_spec()` **只收装好的** stdio
+  外部 AI，注册成 `Participant(kind="external", source=<spec key>,
+  style="外部 AI", label="<名字>（外部·<license>·<语言>）")`。
+  天梯统计的 `table()` / `player_detail()` 都多了 `"类型": p.kind`，
+  nn 模型是 `"model"`、外部 AI 是 `"external"`。
+- `_agent(p, seed, seat)` 对 `kind=="external"` 构造
+  `ExternalMJaiAgent(..., timeout=2.0, max_restarts=1, fallback=HeuristicAgent)`。
+- `run_match()` 在 `Game.play()` 外包 `external.attach(game)` +
+  `finally: external.close_external(agents)`。
 
-   ```python
-   for row in external.external_models(4):
-       out[row["name"]] = row
-   ```
+### 4.2 事件转发 + 生命周期：`webapp/server/table.py`（已改）
 
-   `external_models()` **只检查文件是否存在，不启动进程**；每行带
-   `name / external / spec / title / license / repo / players / usable / note`，
-   前端现有的下拉（`webapp/static/app/app.js` 的 `models.filter(...)`）
-   会直接把它当普通模型显示；`usable=False` 的置灰/显示 note。
-
-3. `AISeat._build()`（约 **L473–L503**）在
-   `name = (model or "").strip().lower()` 之后、`try: spec = variants.get(name)`
-   之前加分支：
-
-   ```python
-   ext_key = external.normalize_key(name)
-   if ext_key is not None:
-       if self.players != 4:
-           self.degraded = True
-           self.degrade_reason = "外部 AI 只支持四麻"
-           return self.teacher
-       try:
-           return external.ExternalMJaiAgent(
-               ext_key, seed=self.seed, player_id=self.seat,
-               players=4, timeout=APPROX_20S,
-               fallback=self.teacher,          # 平台要的是「桌子别崩」
-               log_path=self.cfg.log_dir / f"external-{self.seat}.log",
-           )
-       except Exception as exc:
-           self.degraded = True
-           self.degrade_reason = f"{type(exc).__name__}: {exc}"
-           return self.teacher
-   ```
-
-   `AISeat.__init__` 里已经有 `self.teacher`；`AISeat.decide` 的线程池
-   超时是 20s（`fut.result(timeout=20.0)`），桥默认 `timeout=20`，对得上。
-
-### 4.2 事件转发：`webapp/server/table.py`
-
-`Room._on_action()`（**L633** 起）在 `kind = ev.get("kind")`（**L648**）
-之后加：
+`Room._on_action()`（L635 附近）在 `kind = ev.get("kind")` 之后加：
 
 ```python
 # 外部 mjai AI 需要看到完整事件流（桥自己缓冲，feed 很快、不推理）
@@ -334,17 +331,21 @@ for seat_agent in getattr(self.game, "agents", ()) or ():
         inner.feed(ev)
 ```
 
-文件顶部同样加 `from aimodel import external`。
+文件顶部同样加 `from aimodel import external`。另外：
+- `_build_agents()` 的 `AISeat(...)` 传 `players=self.players`；
+- `_run()` 的 `finally` 和 `Room.close()` 都调用
+  `external.close_external(self._agents)`；
+- `aimodel/external.py` 自己在 `atexit` 里也注册了 `close_all()`，
+  所以 **Ctrl-C / 进程退出** 也会 kill 子进程。
 
 > 为什么要在这里：`ExternalMJaiAgent` 在收到 `start_hand` / `draw` /
 > `dahai` / `call` 后只在内存里排队，真正发给子进程是在下一次 `decide()`
 > 时。`feed` 本身不做 IO 等待，放在引擎线程里不会拖慢推帧。
 
-### 4.3 房间创建：`webapp/server/table.py` L363–L370
+### 4.3 房间创建：`webapp/server/table.py` L365–L375
 
-`AISeat(i, s.ai or "teacher", ...)` 不用改：`s.ai` 直接传
-`"external:mortal"` 就行。**但**要在创建前做一次可用性检查，避免选了一个
-没装的模型整桌降级：
+`s.ai` 直接传 `"external:manue"` 即可；`AISeat` 构造失败会降级教师。
+建议在创建前再做一次检查，避免整桌静默降级：
 
 ```python
 if external.is_external_spec(s.ai):
@@ -359,6 +360,21 @@ if external.is_external_spec(s.ai):
 「必填字段」校验，给 `external` 行补 `external: true`、`title`、`repo`、
 `license` 即可；`webapp/static/app/app.js` 是打包产物，改完客户端要
 重新 `pnpm build`。**本任务没有改这些文件。**
+
+### 4.4 实测每步耗时（天梯吞吐）
+
+| 外部 AI | 决策数 | avg_decide_ms | max_decide_ms | 备注 |
+|---|---:|---:|---:|---|
+| mjai-manue-go | 39 | 263.87 | 1426.87 | 纯 Go，无权重；4 麻 2 局 |
+| Mortal（Akagi 包） | 39 | 7.57 | 20.20 | 预编译 libriichi + torch；1 局 |
+
+单步默认超时 2s（平台）；manue 的 p99 在这台机器上约 1.4s，余量不大。
+并发多桌时建议每桌最多 1 个外部 AI，或把 `timeout` 调到 3s。
+Mortal 首次加载模型明显更慢（实测第一手前约 10s），平台若选 Mortal
+建议 `timeout=5`、`start_timeout=120`。
+
+天梯里 `kind="external"` 的参战者还有 `external_failures` 计数：
+每次超时/崩溃/降级会累加，`Arena.table()` 的 `"外部失败"` 字段能直接看到。
 
 ---
 
@@ -387,9 +403,17 @@ export POTATOMAJ_EXTERNAL_MANUE_BIN=/abs/path/mjai-manue
 
 - [ ] 上游 **Mortal** 的编译与权重获取：本机没有 Rust；权重不随仓库分发。
       需要确认 macOS 下 `libriichi` 的文件名，以及 `mortal.pth` 的合法来源。
-- [ ] **Akagi 打包版**的 torch 端到端：包已下载、Python 3.12 环境已建，
-      但 torch 安装/跑通未在本轮完成。
-- [ ] **akochan** 的 TCP ↔ stdio 桥：没写。需要先跑 mjai server。
+- [x] **Akagi 打包版**的 torch 端到端：包已下载（30MB 压缩 / 93MB 解压）、
+      Python 3.12 + torch 2.8 已装；四麻 1 局 39 次决策、0 错误、
+      avg 7.57ms/步、max 20.2ms/步；`arena_test` 能跑。
+- [x] **manue 上平台**：`webapp/server/agents.py` + `table.py` 已接，
+      `external:manue` 在 `/api/models` 里可选，AISeat 实测能跑完一局。
+- [x] **manue 上天梯**：`aimodel/arena.py` 的 `collect()` 会注册
+      `external:manue`（kind="external"），实测可参与 `run_match`。
+- [x] **akochan** 的 TCP server 壳：`aimodel/mjai_tcp.py` 已写，假 client
+      跑通；真实 akochan 因缺 Boost 未能编译，**卡点 = 本机没有 Boost /
+      LLVM 的 Polly**。装好 `brew install boost llvm` 后按 `Makefile_MacOS`
+      编译，再 `python -m aimodel.mjai_tcp`。
 - [ ] **Kanachan**：没有权重，未跑。
 - [ ] **赤 5**：当前按普通 5 归一化；恢复赤 dora 需要先处理引擎 chi 的
       `red` 计数（或桥里维护完整手牌模型）。
