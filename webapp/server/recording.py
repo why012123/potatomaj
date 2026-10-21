@@ -882,11 +882,17 @@ class GameRecorder:
         self._write("hand_start", {"hand_no": hand_no, **(extra or {})})
 
     def end_hand(self, *, hand_no: int, game: Any, result: Any,
-                 detail: dict | None) -> None:
+                 detail: dict | None, scores_after: list[int] | None = None) -> None:
         """一局结束：**四家手牌 + 和牌详情全部落盘**。
 
         这是危险度模型的正样本来源 —— 谁打出的哪张牌被谁荣和了、多少钱，
         都能对上。
+
+        ⚠️ ``scores_after`` 必须由调用方给**那一手自己的**累计点数 ✗
+           默认 `list(game.scores)` 只在「一手一记」时才对 ✓；
+           若一次批记多手（`_record_hand_end` 的 while 循环），
+           那些手会**共用同一份最终点数** ✗ —— 2026-10-21 用户报的
+           「记录有问题」就是这个（8 手 `scores_after` 全一样 ✗）。
         """
         if self._closed:
             return
@@ -944,7 +950,8 @@ class GameRecorder:
             "tenpai": list(result.tenpai),
             "turns": result.turns,
             "note": result.note,
-            "scores_after": list(game.scores),
+            "scores_after": (list(scores_after) if scores_after is not None
+                             else list(game.scores)),
             "sticks": game.sticks,
             "dora_indicators": [tile_id(game._indicator(i))
                                 for i in range(game.dora_slots)],
