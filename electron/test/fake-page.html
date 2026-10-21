@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>potatomaj 测试台</title>
+<style>body{font:14px -apple-system,sans-serif;background:#12161f;color:#dfe7f1;padding:24px}</style>
+</head>
+<body>
+  <h2>土豆麻将 · 本地测试台</h2>
+  <p>这个页面会连本地 WebSocket，用来验证 preload 里的钩子能不能抓到帧。</p>
+  <pre id="log"></pre>
+<script>
+  const log = (m) => {
+    document.getElementById('log').textContent += m + '\n';
+  };
+  const ws = new WebSocket('ws://127.0.0.1:8799');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    log('已连上服务端');
+    for (let i = 1; i <= 5; i++) {
+      const buf = new Uint8Array([1, 2, 3, i, i * 2]);
+      ws.send(buf);
+    }
+  };
+  let n = 0;
+  ws.onmessage = (ev) => {
+    n += 1;
+    log(`收到第 ${n} 帧，${ev.data.byteLength} 字节`);
+  };
+  ws.onerror = (e) => log('WS 错误: ' + e.message);
+</script>
+</body>
+</html>
