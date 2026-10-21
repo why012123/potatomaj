@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>土豆麻将 · 牌桌（空白）</title>
+<link rel="stylesheet" href="/table/table.css" />
+</head>
+<body>
+  <div id="table">
+    <!-- 中央指示区：四条边各一家的「自风 + 点数」，正中嵌一个小深蓝方块 -->
+    <div id="center">
+      <!-- 正中：第几局（大字偏上）+ **剩余牌数**（最大）+ 几本场（小字偏下） -->
+      <div class="mid-core">
+        <div class="mid-round">东一局</div>
+        <div class="mid-wall">55</div>
+        <div class="mid-honba">一本场</div>
+      </div>
+
+      <!-- 每条边：外圈是立直棒槽，里圈是点数条 -->
+      <!-- 南家（对家）轮到出牌：槽在闪 -->
+      <div class="stick-slot slot-top is-turn"></div>
+      <div class="mid-side mid-top"><span>南</span><b>31000</b></div>
+
+      <!-- 东家（自己）已经立直，而且**正轮到他出牌**：槽里有棒 + 在闪 -->
+      <div class="stick-slot slot-bottom is-turn"><i></i></div>
+      <div class="mid-side mid-bottom"><span>东</span><b>25000</b></div>
+
+      <!-- 北家：没立直，槽是空的 -->
+      <div class="stick-slot slot-left is-empty"></div>
+      <div class="mid-side mid-left"><span>北</span><b>22000</b></div>
+
+      <!-- 西家：也有立直棒（对比两根的样子） -->
+      <div class="stick-slot slot-right"><i></i></div>
+      <div class="mid-side mid-right"><span>西</span><b>22000</b></div>
+    </div>
+
+    <!-- 四条牌河：位置全部由下面的脚本按屏幕坐标摆 -->
+    <div class="pond pond--top" id="pond-top"></div>
+    <div class="pond pond--right" id="pond-right"></div>
+    <div class="pond pond--bottom" id="pond-bottom"></div>
+    <div class="pond pond--left" id="pond-left"></div>
+
+    <!-- 四家的手牌：定宽 14.5 牌条、严格居中、贴自己那面墙（位置永远不动） -->
+    <div class="hand hand--top" id="hand-top"></div>
+    <div class="hand hand--left" id="hand-left"></div>
+    <div class="hand hand--right" id="hand-right"></div>
+    <div class="hand hand--bottom" id="hand-bottom"></div>
+    <!-- 四家的副露：贴各自那面墙的最外圈，第一组在最右、后面的往左排 -->
+    <div class="melds melds--top" id="melds-top"></div>
+    <div class="melds melds--left" id="melds-left"></div>
+    <div class="melds melds--right" id="melds-right"></div>
+    <div class="melds melds--bottom" id="melds-bottom"></div>
+    <!-- 拔北（三麻）：北牌亮在第 14 张格的正上方、略往左上斜；**从右往左**摆 -->
+    <div class="kita kita--top" id="kita-top"></div>
+    <div class="kita kita--left" id="kita-left"></div>
+    <div class="kita kita--right" id="kita-right"></div>
+    <div class="kita kita--bottom" id="kita-bottom"></div>
+  </div>
+  <script src="/table/table.js"></script>
+  <script>
+// ---- 下边（自己）：3 排，一排 6 张，往下磊；立直宣言牌 = 第 10 张（第 2 排第 4 张）
+pond(document.getElementById("pond-bottom"), 17, 3, 0, atBottom, 9);
+
+// ---- 上边（对家）：1 排，往上磊（牌面转 180°）；立直宣言牌 = 第 3 张
+pond(document.getElementById("pond-top"), 6, 1, 180, atTop, 2);
+
+// ---- 右边（下家）：2 排，往右磊（牌面转 -90°）；立直宣言牌 = 第 2 排第 2 张
+pond(document.getElementById("pond-right"), 12, 2, -90, atRight, 7);
+
+// ---- 左边（上家）：3 排 + 加放区，往左磊（牌面转 90°）；立直宣言牌 = 第 3 排第 3 张
+//      24 张 = 牌河 3 排 18 张 + 加放区 1 排 6 张（第一排右边接着摆）
+pond(document.getElementById("pond-left"), 24, 3, 90, atLeft, 14);
+
+/* ---- 四家各来一种副露，专门用来验布局 ----
+ *   自己 = 碰（对家打的）、对家 = 吃（只能吃上家）、
+ *   上家 = 暗杠、下家 = 明杠（下家打的）
+ * 副露之后手牌少 3 张（13 → 10），但**手牌第一张的位置一点不动**。
+ * 拔北（三麻）再从手牌里少掉同样多的张数（拔几张少几张）。
+ */
+seat("bottom",
+     ["1m", "2m", "3m", "7p", "8p", "9p", "2s", "3s"], "1z",
+     [{ kind: "pon", tiles: ["5z", "5z", "5z"], from: "across" }]);
+seat("top", Array(8).fill(null), null,
+     [{ kind: "chi", tiles: ["3m", "4m", "5m"], from: "left" }]);
+seat("left", Array(9).fill(null), null,
+     [{ kind: "ankan", tiles: ["2s", "2s", "2s", "2s"], from: null }]);
+seat("right", Array(9).fill(null), null,
+     [{ kind: "minkan", tiles: ["7p", "7p", "7p", "7p"], from: "right" }]);
+
+/* ---- 拔北（三麻）：四家都亮出来 ----
+ * 位置见 CSS 的 `.kita--*`：锚在**固定的第 14 格**上（手牌盒子定宽，
+ * 这一格永不动），略斜 −14°，**从右往左**排 —— 第一个是 DOM 里第一个，
+ * 靠 `row-reverse` / `column-reverse` 落到自己右手边那个基准位置。
+ */
+const KITA = {
+  bottom: ["4z", "4z"],                  // 自己拔了两张
+  top: ["4z", "4z"],                     // 对家两张
+  left: ["4z"],                          // 上家一张
+  right: ["4z"],                         // 下家一张
+};
+Object.keys(KITA).forEach((name) => {
+  const S = SEAT[name];
+  const host = document.getElementById("kita-" + name);
+  host.style.setProperty("--hw", S.base + "px");
+  KITA[name].forEach((id) => {
+    const el = tile(S.base, S.face, S.turned, id);   // 4z = 北
+    el.dataset.role = "kita";
+    host.appendChild(el);
+  });
+});
+
+/* ---- 每家右手边桌布上的名牌（浅色）----
+ * 真页面（对战页 / 直播页）由 renderState() 按 state 里的座位填：
+ * AI 座位写**模型名**，真人写昵称。沙盘页没有 state，这里写死的，
+ * 纯粹给设计稿看 —— 位置见 CSS 的 `.seatname--*`。
+ */
+setSeatName("bottom", "自己");
+setSeatName("top", "maj-N4");
+setSeatName("left", "maj-F4");
+setSeatName("right", "maj-M4");
+
+  
+  </script>
+</body>
+</html>

@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>土豆麻将</title>
+<!-- 牌桌样式/几何/外壳都在 /table/ 下，跟沙盘页、直播页**共用同一份** -->
+<link rel="stylesheet" href="/table/table.css" />
+<link rel="stylesheet" href="/table/layout.css" />
+<style>
+/* 这一页自己的东西：座位上那几块提示（等开局 / 结算） */
+.pane { display: flex; flex-direction: column; gap: 8px; }
+.pane__row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.pane__row b { color: #f2f7f4; }
+.pane__row i { color: #8fb0a3; font-style: normal; font-size: 12px; }
+.seat-chip {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 5px 8px; border-radius: 8px; font-size: 12px;
+  background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.08);
+}
+.seat-chip.is-me { border-color: #e8c46a; background: rgba(232, 196, 106, 0.12); }
+.seat-chip em { font-style: normal; color: #8fb0a3; }
+.win-line { font-size: 13px; padding: 2px 0; }
+.win-line b { color: #ffd479; }
+.win-line i { color: #8fb0a3; font-style: normal; }
+.win-line.is-loss b { color: #ff9b86; }
+.handline { font-size: 12px; color: #9fc6b3; letter-spacing: 0.06em; padding: 2px 0 6px; }
+/* 轮到自己时的思考条（服务端给 ms_left，纯 CSS 收缩） */
+.timer { height: 6px; border-radius: 3px; background: rgba(255, 255, 255, 0.12); overflow: hidden; }
+.timer > i { display: block; height: 100%; background: linear-gradient(90deg, #e8c46a, #ff9b86);
+             transition: width 0.25s linear; }
+/* 和了确认页：一局打完盖住牌桌，亮出赢家的**牌面 + 役 + 番符 + 点数**，
+   所有真人点过「确认」才开下一局（服务端 `_between` 等 next_ack）。 */
+#over {
+  position: absolute; inset: 0; z-index: 40;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(3, 10, 6, 0.82);
+  padding: 16px;
+}
+#over[hidden] { display: none; }
+.over__panel {
+  width: min(760px, 94vw); max-height: 92%; overflow-y: auto;
+  background: linear-gradient(180deg, #0c2016, #071510);
+  border: 1px solid rgba(232, 196, 106, 0.35); border-radius: 14px;
+  padding: 14px 16px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+}
+.over__hd { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.over__hd h2 { margin: 0; font-size: 20px; color: #ffd479; }
+.over__hd em { color: #8fb0a3; font-style: normal; font-size: 13px; }
+.rtile { width: 34px; height: 38px; border-radius: 4px; margin-right: 2px;
+         box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45); vertical-align: middle; }
+.rtile--meld { width: 30px; height: 34px; margin-left: 6px; }
+.rtile--win { box-shadow: 0 0 0 2px #ff5347; }
+.rrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 5px 0; }
+.rrow .who { min-width: 8.5em; color: #cfe3d6; }
+.ryaku { color: #9fc6b3; font-size: 13px; }
+.rnum { color: #ffd479; font-weight: 700; }
+.over__deltas { margin-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 8px; }
+.over__deltas div { padding: 2px 0; }
+.over__ft { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.over__wait { color: #8fb0a3; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- 操作区：宽屏在牌桌**左边**那一片空白里；窄屏由 layout.css 落到牌桌下面 -->
+  <aside id="ops">
+    <div class="ops__title" id="opstitle">操作</div>
+    <div id="opsbtns"></div>
+    <div class="ops__hint" id="opshint">连接中…</div>
+    <div id="opsmeta"></div>
+  </aside>
+
+  <div id="stage">
+    <div id="hud">连接中…</div>
+    <!-- 团体战：队名 / 当前角色 / 先锋→大将进度 / 四队总分（普通局隐藏） -->
+    <div id="teambar" hidden></div>
+    <!-- 和了确认页：一局打完盖住牌桌；真人都确认过才开下一局 -->
+    <div id="over" hidden></div>
+
+    <div id="table">
+      <div id="center">
+        <div class="mid-core">
+          <div class="mid-round">--</div>
+          <div class="mid-wall">--</div>
+          <div class="mid-honba">--</div>
+        </div>
+      </div>
+      <div class="pond pond--top" id="pond-top"></div>
+      <div class="pond pond--right" id="pond-right"></div>
+      <div class="pond pond--bottom" id="pond-bottom"></div>
+      <div class="pond pond--left" id="pond-left"></div>
+      <div class="hand hand--top" id="hand-top"></div>
+      <div class="hand hand--left" id="hand-left"></div>
+      <div class="hand hand--right" id="hand-right"></div>
+      <div class="hand hand--bottom" id="hand-bottom"></div>
+      <div class="melds melds--top" id="melds-top"></div>
+      <div class="melds melds--left" id="melds-left"></div>
+      <div class="melds melds--right" id="melds-right"></div>
+      <div class="melds melds--bottom" id="melds-bottom"></div>
+      <div class="kita kita--top" id="kita-top"></div>
+      <div class="kita kita--left" id="kita-left"></div>
+      <div class="kita kita--right" id="kita-right"></div>
+      <div class="kita kita--bottom" id="kita-bottom"></div>
+    </div>
+  </div>
+
+  <aside id="side">
+    <section class="card"><div class="card__hd">对局信息</div><div class="card__bd" id="info"></div></section>
+    <section class="card"><div class="card__hd">牌局日志</div><div class="card__bd" id="log"></div></section>
+    <section class="card">
+      <div class="card__hd">聊天</div><div class="card__bd" id="chat"></div>
+      <div class="chat__bar">
+        <input id="chatinput" maxlength="60" placeholder="说点什么…" />
+        <button id="chatsend">发送</button>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<script src="/table/table.js"></script>
+<script src="/table/page.js"></script>
+<script>
+/* ====================================================================
+ * 对战页（正式入口，服务端把 /room/{id} 发到这一份）
+ *
+ *   /room/XXXX   进这张桌子：先按**座位凭证**坐回自己的位子，
+ *                坐不上（房满 / 已开打 / 凭证过期）就退成观战；
+ *   /            不带房间号：自己开一桌（席位 0 是真人，其余 AI）
+ *
+ * ★ 按钮永远由服务端 `state.actions.options` 生成 —— 前端不自己造动作。
+ * ★ 凭证用 `maj:token:<ROOM>`，跟老前端同一个 key，两边能互相接手座位。
+ * ================================================================== */
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const qs = new URLSearchParams(location.search);
+  const RID = (location.pathname.match(/\/room\/([A-Za-z0-9]+)/i) || [])[1]
+    || (qs.get("room") || "").trim().toUpperCase();
+  const players = Number(qs.get("p") || 3) === 4 ? 4 : 3;
+
+  let me = -1, asked = false, spectating = false, triedSpectate = false;
+  /* 「不拔北、直接打这张」的待打出牌：点了手牌先回不拔，回到出牌决策时再打出去 */
+  let pendingDiscard = null;
+
+  const page = majPage({
+    name: qs.get("name") || "",
+    onHello: (lobby) => {
+      // 重连之后 onHello 会再来一次：这时要**带着凭证回去坐**（服务端留座 300s）
+      if (asked) { if (RID) joinRoom(); return; }
+      asked = true;
+      if (RID) { joinRoom(); return; }
+      createRoom(lobby);
+    },
+    onJoined: (m) => {
+      me = m.seat;
+      spectating = m.spectator;
+      if (m.token) page.saveToken(m.room, m.token);
+    },
+    onRefuse: (m) => {
+      // 坐不上（房满了 / 已经开打 / 没凭证被别人坐了）→ 先退成观战再试一次
+      if (RID && !triedSpectate && !spectating) {
+        triedSpectate = true;
+        page.say("坐不上（" + esc(m.message || "位子被人占了") + "），先看着…", true);
+        page.spectate(RID);
+        return;
+      }
+      // 连观战都进不去 = 房间号写错 / 房间已经结束被清掉 → 给一条回大厅的路
+      noRoom(m && m.message);
+    },
+    onState: (st) => {
+      if (me < 0 && st.viewer && st.viewer.seat >= 0) me = st.viewer.seat;
+      spectating = !!(st.viewer && st.viewer.spectator);
+      renderState(st, me);
+      paintOps(st);
+      page.say(
+        "房间 <b>" + (st.room ? st.room.id : "?") + "</b> · " +
+        (st.room ? st.room.name : "") + " · <b>" + st.seats.length + " 人</b> · " +
+        (st.phase === "playing" ? "第 " + ((st.round && st.round.hand_no) || 1) + " 局"
+                                : { lobby: "等人齐", hand_end: "本局结束", finished: "已结束" }[st.phase] || st.phase) +
+        " · 我" + (spectating ? "观战" : (me >= 0 ? "坐 " + me + " 号位" : "")) +
+        "　<a href='/'>回大厅</a>"
+      );
+    },
+  });
+  window.__page = page;
+
+  function joinRoom() {
+    page.join(RID, {
+      seat: null, token: page.readToken(RID),
+      spectator: false, reveal: false, autostart: false,
+    });
+  }
+
+  function createRoom(lobby) {
+    const usable = ((lobby && lobby.models) || [])
+      .filter((m) => m.players === players && m.usable).map((m) => m.name);
+    /* 自动挑 AI 要**真随机**（以前 `usable[i % n]` 是固定轮换，看着不像随机） */
+    const pickAI = () => (usable.length
+      ? usable[Math.floor(Math.random() * usable.length)] : "teacher");
+    const seats = Array.from({ length: players }, (_, i) =>
+      i === 0 ? { kind: "human" } : { kind: "ai", ai: pickAI() });
+    page.create({ name: players === 3 ? "我的三麻桌" : "我的四麻桌",
+                  players, rounds: 0, ai_delay: 0.8, seats,
+                  spectator_reveal: true, autostart: true });
+  }
+
+  // ---------------------------------------------------------------- 操作区 --
+
+  function btn(text, cls, onClick) {
+    const b = document.createElement("button");
+    b.className = "btn" + (cls ? " " + cls : "");
+    b.textContent = text;
+    b.addEventListener("click", onClick);
+    return b;
+  }
+
+  function seatChips(st) {
+    const box = document.createElement("div");
+    box.className = "pane";
+    for (const s of st.seats) {
+      const row = document.createElement("div");
+      row.className = "seat-chip" + (s.seat === me ? " is-me" : "");
+      const kind = s.kind === "ai" ? ("AI " + (s.ai || "")) : (s.kind === "human" ? "真人" : "空位");
+      row.innerHTML = "<span>" + s.seat + " · " + (s.name || "空位") +
+        "</span><em>" + kind + (s.host ? " · 房主" : "") + "</em>";
+      box.appendChild(row);
+    }
+    return box;
+  }
+
+  /** 团体战队伍条：角色进度 + 本轮四名上场者 + 四队总分。普通局整条隐藏。 */
+  function paintTeam(st) {
+    const bar = $("teambar");
+    if (!bar) return;
+    const tm = (st.room && st.room.team) || null;
+    if (!tm) {
+      bar.hidden = true;
+      document.body.classList.remove("has-team");
+      return;
+    }
+    const roles = ["先锋", "次锋", "副将", "大将"];
+    const cur = Number(tm.round || 0);
+    const chips = roles.map((r, i) =>
+      `<span class="trole${i === cur ? " is-cur" : ""}${i < cur ? " is-done" : ""}">${r}</span>`
+    ).join("");
+    const scores = tm.scores || [];
+    const who = (tm.lineup || []).map((x) => {
+      const sc = scores[x.team] === undefined ? "" : scores[x.team];
+      const label = x.kind === "ai"
+        ? (x.ai || "AI") : (x.name || "真人");
+      return `<span class="tteam"><i>${esc(x.team_name)}</i> ${esc(x.role)}`
+        + ` · ${esc(x.name || "")}${x.kind === "ai" ? `<span style="color:#8fb0a3">（${esc(label)}）</span>` : ""}`
+        + ` <b>${sc}</b></span>`;
+    }).join("");
+    bar.innerHTML = `<div class="teambar__row">${chips}`
+      + `<span class="hint">第 ${cur + 1}/4 个半庄</span></div>`
+      + `<div class="teambar__row">${who}</div>`;
+    bar.hidden = false;
+    document.body.classList.add("has-team");
+  }
+
+  function paintOps(st) {
+    paintTeam(st);
+    const title = $("opstitle");
+    const box = $("opsbtns");
+    const hint = $("opshint");
+    const meta = $("opsmeta");
+    box.replaceChildren();
+    meta.replaceChildren();
+
+    const acts = st.actions;
+    const mine = !spectating && acts && acts.seat === me;
+
+    if (st.phase === "lobby") {
+      title.textContent = "等人齐";
+      hint.textContent = spectating ? "观战中（开局后自动跟上）" : "等房主开始对局";
+      meta.appendChild(seatChips(st));
+      const isHost = (st.seats[me] || {}).host;
+      if (isHost) box.appendChild(btn("开始对局", "", () => page.start()));
+      if (st.room) {
+        box.appendChild(btn("复制邀请链接", "btn--pass", () => {
+          const url = location.origin + "/room/" + st.room.id;
+          navigator.clipboard?.writeText(url);
+          page.say("链接已复制：<b>" + url + "</b>");
+        }));
+      }
+      return;
+    }
+
+    if (st.phase === "hand_end") {
+      title.textContent = "本局结果";
+      /* 确认页由共用外壳（page.js）画 —— 直播页也要有同一页，
+         所以只留一份实现，这里不再自己拼。 */
+      page.showResult(st);
+      hint.textContent = "确认后开下一局";
+      return;
+    }
+    $("over").hidden = true;
+
+    if (st.phase === "finished") {
+      title.textContent = "对局结束";
+      const m = st.match;
+      hint.textContent = m ? ("seed " + m.seed + "　共 " + ((m.hands || []).length) + " 局") : "";
+      if (m) {
+        const pane = document.createElement("div");
+        pane.className = "pane";
+        for (let i = 0; i < st.seats.length; i++) {
+          const line = document.createElement("div");
+          line.className = "win-line";
+          const rp = (m.rank_points || [])[i];
+          /* ★ `ranks` 是**从 0 数**的（0 = 一位，见 aimodel/sanma.py 的 ranks_of），
+             界面上要 +1 —— 不然就会出现「第 0 位」这种东西。 */
+          const rank = (m.ranks || [])[i];
+          line.innerHTML = "第 " + (rank === undefined ? "-" : rank + 1) + " 位　" +
+            esc(seatLabel(st.seats[i])) + "　<b>" + ((m.scores || [])[i] ?? "") + "</b>　" +
+            ((m.deltas || [])[i] > 0 ? "+" : "") + ((m.deltas || [])[i] ?? 0) +
+            (rp !== undefined ? "　段位 " + (rp > 0 ? "+" : "") + rp : "");
+          pane.appendChild(line);
+        }
+        for (const h of (m.hands || []).slice(-12)) {
+          const line = document.createElement("div");
+          line.className = "win-line";
+          const ds = (h.deltas || []).map((v, i) =>
+            (st.seats[i] || {}).seat_wind + (v > 0 ? "+" : "") + v).join(" ");
+          line.innerHTML = "<span class='hint'>第 " + h.turns + " 巡</span>　" + esc(h.text || h.kind) +
+            "　<span class='hint'>" + esc(ds) + "</span>";
+          pane.appendChild(line);
+        }
+        meta.appendChild(pane);
+      }
+      box.appendChild(btn("再来一桌", "", () => { location.href = "/"; }));
+      return;
+    }
+
+    // ---- 对局中 ----
+    title.textContent = "操作";
+    if (!mine) {
+      hint.textContent = spectating ? "观战中" : "等别家出牌…";
+      if (spectating) meta.appendChild(seatChips(st));
+      return;
+    }
+    hint.innerHTML = acts.kind === "discard"
+      ? "点<b>手牌</b>出牌"
+      : (acts.kind_cn || acts.kind) + "？";
+    /* 思考条：服务端给了 ms_left（快照），纯 CSS 收缩，不再自己计时。
+       房里只有一个真人时服务端给 no_timeout（ms_left/deadline 都是 null）
+       → 这里自然不画条，也不显示「剩 Ns」。 */
+    if (acts.deadline || acts.ms_left) {
+      const total = (acts.timeout || 30) * 1000;
+      const bar = document.createElement("div");
+      bar.className = "timer";
+      const inner = document.createElement("i");
+      inner.style.width = Math.max(0, Math.min(100,
+        Math.round((acts.ms_left || 0) / total * 100))) + "%";
+      bar.appendChild(inner);
+      meta.appendChild(bar);
+    }
+    /* 免记录开关：坐在位子上才显示（服务端只认座位上的连接） */
+    if (!spectating && me >= 0) {
+      const wrap = document.createElement("label");
+      wrap.className = "seat-chip";
+      const box2 = document.createElement("input");
+      box2.type = "checkbox";
+      box2.checked = !!(st.seats[me] || {}).no_record;
+      box2.addEventListener("change", () => page.send({ t: "privacy", no_record: box2.checked }));
+      wrap.append(box2, document.createTextNode(" 本局不记录我的数据"));
+      meta.appendChild(wrap);
+    }
+    /* ★ 出牌**不摆按钮**：手牌本身就是按钮。只有吃 / 碰 / 杠 / 胡 / 自摸
+       这类「必须确认」的动作才画按钮。 */
+    if (acts.kind === "discard") {
+      /* 刚才在拔北决策里点了手牌 = 不拔、要打这张 —— 现在牌面回来了，打出去 */
+      if (pendingDiscard) {
+        const want = pendingDiscard;
+        pendingDiscard = null;
+        const opt = (acts.options || []).find((o) => o.tile === want);
+        if (opt) { page.act("discard", opt.index); return; }
+      }
+      if (acts.no_timeout) hint.innerHTML = "点<b>手牌</b>出牌（不限时，慢慢想）";
+      return;
+    }
+    /* ★ 拔北：**只留一个「拔北」按钮**（用户要求）。
+       不想拔就直接点手牌 —— 点牌时先替你回一个「不拔」，等牌面回到出牌
+       决策再自动打出去（`pendingDiscard`），不用多按一个「不拔」。 */
+    if (acts.kind === "kita") {
+      const yes = (acts.options || []).find((o) => /拔北/.test(o.cn || o.label || ""));
+      hint.innerHTML = "拔北？<b>不拔就直接点手牌</b>";
+      if (yes) box.appendChild(btn("拔北", "btn--win", () => page.act("kita", yes.index)));
+      else (acts.options || []).forEach((o) =>
+        box.appendChild(btn(o.cn || o.label, "", () => page.act("kita", o.index))));
+      return;
+    }
+    /* 思考条：服务端给了 ms_left（快照），纯 CSS 收缩，不再自己计时 */
+    if (acts.deadline || acts.ms_left) {
+      const total = (acts.timeout || 30) * 1000;
+      const bar = document.createElement("div");
+      bar.className = "timer";
+      const inner = document.createElement("i");
+      inner.style.width = Math.max(0, Math.min(100,
+        Math.round((acts.ms_left || 0) / total * 100))) + "%";
+      bar.appendChild(inner);
+      meta.appendChild(bar);
+    }
+    /* 免记录开关：坐在位子上才显示（服务端只认座位上的连接） */
+    if (!spectating && me >= 0) {
+      const wrap = document.createElement("label");
+      wrap.className = "seat-chip";
+      const box2 = document.createElement("input");
+      box2.type = "checkbox";
+      box2.checked = !!(st.seats[me] || {}).no_record;
+      box2.addEventListener("change", () => page.send({ t: "privacy", no_record: box2.checked }));
+      wrap.append(box2, document.createTextNode(" 本局不记录我的数据"));
+      meta.appendChild(wrap);
+    }
+    for (const o of acts.options || []) {
+      const label = o.label || o.cn || (o.tile ? o.tile : "选项 " + (o.index + 1));
+      const isPass = /过|取消|skip|pass/i.test(String(label));
+      const isWin = acts.kind === "win" || acts.kind === "ron" || acts.kind === "tsumo";
+      box.appendChild(btn(label, isWin ? "btn--win" : isPass ? "btn--pass" : "",
+                          () => page.act(acts.kind, o.index)));
+    }
+    if (!(acts.options || []).length) hint.textContent = "（服务端没给选项）";
+  }
+
+  /** 进不去这间房（房间号错 / 已结束被清掉）：别让人对着空牌桌发呆，
+      操作栏和状态条都给一条回大厅的路。 */
+  function noRoom(msg) {
+    const box = $("opsbtns");
+    const meta = $("opsmeta");
+    if ($("opstitle")) $("opstitle").textContent = "进不去";
+    if (box) box.replaceChildren();
+    if (meta) {
+      meta.innerHTML = '<div class="seat-chip" style="display:block">'
+        + "<div>房间 <b>" + esc(RID) + "</b> 进不去</div>"
+        + "<div class='hint'>" + esc(msg || "房间号可能写错了，或者这局已经结束被清掉了")
+        + "</div></div>";
+    }
+    if ($("opshint")) $("opshint").textContent = "";
+    if (box) box.appendChild(btn("回大厅", "", () => { location.href = "/"; }));
+    page.say("房间 <b>" + esc(RID) + "</b> 不存在或已结束　<a href='/'>回大厅</a>", true);
+  }
+  $("stage").addEventListener("click", (e) => {
+    const tile = e.target.closest("#hand-bottom .tile");
+    const st = page.lastState;
+    if (!tile || !st || !st.actions || st.actions.seat !== me) return;
+    const img = tile.querySelector("img");
+    const id = img ? img.getAttribute("alt") : null;
+    if (!id) return;
+    /* 拔北决策时点手牌 = 「不拔，就打这张」：先回不拔，等回到出牌决策自动打 */
+    if (st.actions.kind === "kita") {
+      const no = (st.actions.options || []).find((o) => /不拔|不要|no/i.test(o.cn || o.label || ""));
+      if (no) page.act("kita", no.index);
+      pendingDiscard = id;
+      return;
+    }
+    if (st.actions.kind !== "discard") return;
+    /* ★ 赤 5 的 id 两边不一样，必须**归一化**再比：
+         手牌视图（hand_list 带 red）给的是 `0p`，
+         而出牌选项（index_to_id 不带 red）给的是 `5p` ——
+       直接 `o.tile === id` 永远匹配不上，点了赤 5 没反应。
+       这就是自检里「点手牌出牌 0 → 0」偶发失败的根因（抓到赤 5 就失败）。 */
+    const base = (s) => String(s || "").replace(/^0(?=[mpsz]$)/, "5");
+    const opt = (st.actions.options || []).find((o) => base(o.tile) === base(id));
+    if (opt) page.act("discard", opt.index);
+  });
+
+  /* 屏幕尺寸/朝向变了要**重画一遍操作区**：手机横竖屏切换之后，
+     出牌那一排「牌名按钮」该显示还是该收起来，是靠 media query 判断的，
+     而操作区只在收到新 state 时才重画 —— 不等下一帧就会留着旧样子。 */
+  const repaint = () => {
+    const st = page.lastState;
+    if (st) paintOps(st);
+  };
+  window.addEventListener("resize", repaint);
+  window.addEventListener("orientationchange", repaint);
+
+  // 观战者：全亮牌开关（服务端只对纯 AI 房放行）
+  const revealWrap = document.createElement("label");
+  revealWrap.className = "seat-chip";
+  const revealBox = document.createElement("input");
+  revealBox.type = "checkbox";
+  revealWrap.append(revealBox, document.createTextNode(" 全亮牌（纯 AI 房才行）"));
+  revealBox.addEventListener("change", () => page.reveal(revealBox.checked));
+  const obs = new MutationObserver(() => {
+    const on = !!(page.lastState && page.lastState.viewer && page.lastState.viewer.spectator);
+    if (on && !revealWrap.isConnected) $("opsmeta").appendChild(revealWrap);
+    if (!on && revealWrap.isConnected) revealWrap.remove();
+  });
+  obs.observe($("opsmeta"), { childList: true });
+
+  page.connect();
+})();
+</script>
+</body>
+</html>

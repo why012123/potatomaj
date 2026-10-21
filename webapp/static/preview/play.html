@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>土豆麻将 · 对战</title>
+<link rel="stylesheet" href="/table/table.css" />
+<link rel="stylesheet" href="/table/layout.css" />
+</head>
+<body>
+<div id="app">
+  <!-- 操作区：宽屏在牌桌**左边**那一片空白里；手机上由 layout.css 落到牌桌下面 -->
+  <aside id="ops">
+    <div class="ops__title">操作</div>
+    <div id="opsbtns"></div>
+    <div class="ops__hint" id="opshint">轮到你时会亮按钮</div>
+  </aside>
+
+  <div id="stage">
+    <div id="hud">连接中…</div>
+
+    <div id="table">
+      <div id="center">
+        <div class="mid-core">
+          <div class="mid-round">--</div>
+          <div class="mid-wall">--</div>
+          <div class="mid-honba">--</div>
+        </div>
+      </div>
+      <div class="pond pond--top" id="pond-top"></div>
+      <div class="pond pond--right" id="pond-right"></div>
+      <div class="pond pond--bottom" id="pond-bottom"></div>
+      <div class="pond pond--left" id="pond-left"></div>
+      <div class="hand hand--top" id="hand-top"></div>
+      <div class="hand hand--left" id="hand-left"></div>
+      <div class="hand hand--right" id="hand-right"></div>
+      <div class="hand hand--bottom" id="hand-bottom"></div>
+      <div class="melds melds--top" id="melds-top"></div>
+      <div class="melds melds--left" id="melds-left"></div>
+      <div class="melds melds--right" id="melds-right"></div>
+      <div class="melds melds--bottom" id="melds-bottom"></div>
+      <div class="kita kita--top" id="kita-top"></div>
+      <div class="kita kita--left" id="kita-left"></div>
+      <div class="kita kita--right" id="kita-right"></div>
+      <div class="kita kita--bottom" id="kita-bottom"></div>
+    </div>
+  </div>
+
+  <aside id="side">
+    <section class="card"><div class="card__hd">对局信息</div><div class="card__bd" id="info"></div></section>
+    <section class="card"><div class="card__hd">牌局日志</div><div class="card__bd" id="log"></div></section>
+    <section class="card">
+      <div class="card__hd">聊天</div><div class="card__bd" id="chat"></div>
+      <div class="chat__bar">
+        <input id="chatinput" maxlength="60" placeholder="说点什么…" />
+        <button id="chatsend">发送</button>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<script src="/table/table.js"></script>
+<script src="/table/page.js"></script>
+<script>
+/* 对战页：自己开一桌（0 号位是真人的位置），按钮全由服务端给的
+ * `state.actions.options` 生成 —— **前端绝不自己造「碰/吃/立直」按钮**，
+ * 服务端说有哪些合法动作，就画哪几个。
+ *
+ *   ?p=3（默认）/ ?p=4     三麻 / 四麻
+ *   ?room=XXXX&seat=N      进别人的房间坐 N 号位
+ */
+(() => {
+  const qs = new URLSearchParams(location.search);
+  const players = Number(qs.get("p") || 3) === 4 ? 4 : 3;
+  const wantRoom = (qs.get("room") || "").trim().toUpperCase();
+  const wantSeat = qs.get("seat") === null ? 0 : Number(qs.get("seat"));
+
+  let me = -1, asked = false, phase = "", lastHand = -1;
+
+  const page = majPage({
+    name: qs.get("name") || "玩家",
+    onHello: (lobby) => {
+      if (asked) return;
+      asked = true;
+      if (wantRoom) {
+        page.seatAt(wantRoom, wantSeat);
+        return;
+      }
+      // 自己开一桌：0 号位是人，其余全 AI（模型从服务端给的名单里挑能用的）
+      const usable = ((lobby && lobby.models) || [])
+        .filter((m) => m.players === players && m.usable).map((m) => m.name);
+      const seats = Array.from({ length: players }, (_, i) =>
+        i === 0 ? { kind: "human" }
+                : { kind: "ai", ai: usable.length ? usable[(i - 1) % usable.length] : "teacher" });
+      page.create({ name: players === 3 ? "我的三麻桌" : "我的四麻桌",
+                    players, rounds: 0, ai_delay: 0.8, seats,
+                    spectator_reveal: true, autostart: true });
+    },
+    onJoined: (m) => { me = m.seat; },
+    onState: (st) => {
+      if (me < 0 && st.viewer && st.viewer.seat >= 0) me = st.viewer.seat;
+      renderState(st, me);
+      paintOps(st);
+      page.say("房间 <b>" + (st.room ? st.room.id : "?") + "</b> · " + st.seats.length +
+               " 人 · 第 " + ((st.round && st.round.hand_no) || 1) + " 局 · 我坐 " +
+               (me >= 0 ? me + " 号位" : "观战"));
+    },
+  });
+
+  /* ---- 按钮：一份 state.actions 一把画 ---- */
+  function paintOps(st) {
+    const box = $("opsbtns");
+    const hint = $("opshint");
+    const acts = st.actions;
+
+    // 局间：一条「下一局」
+    if (st.phase === "hand_end") {
+      if (lastHand !== (st.round && st.round.hand_no)) {
+        lastHand = st.round && st.round.hand_no;
+      }
+      box.innerHTML = "";
+      const b = document.createElement("button");
+      b.className = "btn";
+      b.textContent = "下一局";
+      b.addEventListener("click", () => page.next());
+      box.appendChild(b);
+      hint.textContent = "本局结束";
+      return;
+    }
+    if (st.phase === "finished") {
+      box.innerHTML = "";
+      hint.textContent = "对局结束";
+      return;
+    }
+
+    if (!acts || acts.seat !== me) {
+      box.innerHTML = "";
+      hint.textContent = acts ? "等 " + acts.seat + " 号位决定…" : "等别家出牌…";
+      return;
+    }
+
+    // 出牌：不摆一串牌名按钮，直接点手牌（服务端给的 options 里有 tile）
+    hint.innerHTML = acts.kind === "discard"
+      ? "点<b>手牌</b>出牌（也可以按下面的按钮）"
+      : (acts.kind_cn || acts.kind) + "？";
+
+    box.innerHTML = "";
+    for (const o of acts.options || []) {
+      const b = document.createElement("button");
+      const label = o.label || o.cn || (o.tile ? o.tile : "选项 " + (o.index + 1));
+      const isPass = /过|取消|skip|pass/i.test(String(label));
+      const isWin = acts.kind === "win" || acts.kind === "ron" || acts.kind === "tsumo";
+      b.className = "btn" + (isWin ? " btn--win" : isPass ? " btn--pass" : "");
+      b.textContent = label;
+      b.addEventListener("click", () => page.act(acts.kind, o.index));
+      box.appendChild(b);
+    }
+    if (!(acts.options || []).length) hint.textContent = "（服务端没给选项）";
+  }
+
+  /* ---- 点手牌出牌：手牌上的 alt 就是牌 id，去 options 里找同名牌的 index ----
+         （点到的可能是牌身 div，也可能是里面那张图 —— 都往上找 `.tile`） */
+  $("stage").addEventListener("click", (e) => {
+    const tile = e.target.closest("#hand-bottom .tile");
+    if (!tile) return;
+    const img = tile.querySelector("img");
+    if (!img) return;
+    const st = page.lastState;
+    if (!st || !st.actions || st.actions.seat !== me || st.actions.kind !== "discard") return;
+    const id = img.getAttribute("alt");
+    const opt = (st.actions.options || []).find((o) => o.tile === id);
+    if (opt) page.act("discard", opt.index);
+  });
+
+  page.connect();
+  window.__page = page;      // 自检脚本（_dbg_play.py）靠它读状态
+})();
+</script>
+</body>
+</html>

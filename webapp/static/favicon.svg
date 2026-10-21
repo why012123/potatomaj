@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- 土豆麻将的图标：一张立直麻将牌，牌面是「東」 -->
+  <rect x="4" y="4" width="56" height="56" rx="8" fill="#f3efe9" stroke="#c8c1b4" stroke-width="2"/>
+  <rect x="8" y="8" width="48" height="48" rx="6" fill="none" stroke="#e2ddd2" stroke-width="1"/>
+  <text x="32" y="45" font-size="40" font-family="serif" font-weight="700"
+        text-anchor="middle" fill="#1b4d8f">東</text>
+</svg>

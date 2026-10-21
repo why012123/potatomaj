@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>土豆麻将 · 大厅</title>
+<link rel="stylesheet" href="/table/lobby.css" />
+</head>
+<body>
+<div class="shell">
+  <header class="top">
+    <div class="brand"><span class="mark">東</span>
+      <div><h1>土豆麻将</h1><p>网页版日本麻将对战平台 · 三麻 / 四麻 · AI 对战与观战</p></div>
+    </div>
+    <div class="me">
+      <label>昵称<input id="nick" maxlength="16" placeholder="取个名字" autocomplete="nickname" /></label>
+      <span id="stats" class="hint"></span>
+    </div>
+  </header>
+
+  <div class="bar">
+    <button class="btn btn--primary" id="mk">建立房间</button>
+    <button class="btn" id="mkteam">团体战</button>
+    <button class="btn" id="join">用房间号加入</button>
+    <button class="btn btn--ghost" id="reload">刷新列表</button>
+    <span class="hint">点「入座」坐下，点「观战」看牌（桌上有真人时不会全亮）</span>
+  </div>
+
+  <!-- 建房面板（默认收起） -->
+  <section class="card build" id="build" hidden></section>
+  <!-- 团体战：4 队 × 4 角色，先锋→次锋→副将→大将各打一个半庄 -->
+  <section class="card build" id="teambuild" hidden></section>
+
+  <main class="rooms card">
+    <div class="card__hd">房间列表</div>
+    <div class="card__bd" id="rooms"></div>
+  </main>
+
+  <section class="foot">
+    <div class="card"><div class="card__hd">规则</div><div class="card__bd" id="rules"></div></div>
+    <div class="card"><div class="card__hd">数据记录</div><div class="card__bd" id="privacy"></div></div>
+  </section>
+</div>
+
+<div id="hud"></div>
+
+<script src="/table/page.js"></script>
+<script>
+/* ====================================================================
+ * 大厅页（服务端把 `/` 发到这里）
+ *
+ * 功能跟老前端一一对应：昵称、房间列表（入座 / 观战 / 复制邀请链接）、
+ * 建房面板（人数 / 局数 / AI 节拍 / 每个座位真人还是 AI 用哪个模型 / 预设）、
+ * 房间号加入、规则与隐私说明。
+ *
+ * 建房或入座之后**整页跳到 `/room/{id}`** —— 牌桌在那边（新样式）。
+ * ================================================================== */
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  const ROUNDS = [[0, "东风战（按人数：三麻 3 / 四麻 4 局）"], [1, "只打 1 局"],
+                  [2, "打 2 局"], [4, "打 4 局"]];
+  /* 局数下拉里那一项「半荘」是**另一个字段**（hanchan），不是局数：
+     半荘 = 东风打满无条件南入，再打一遍南风才结束（引擎 Rule.hanchan）。 */
+  const HANCHAN = "hanchan";
+  /* 大厅没引 table.js（那里面是摆牌的，还要求页面有 #table），
+     所以这个小标签函数在这里自己写一份：AI 座位显示**模型名**。 */
+  const aiName = (s) => String(s.ai || "").replace(/v\d+(\.\d+)*$/i, "") || "AI";
+  const seatLabel = (s) => (s.kind === "ai" ? aiName(s) : (s.name || ("P" + s.seat)));
+  const DELAYS = [["", "跟随服务端"], ["0", "全速（0s）"], ["0.1", "很快（0.1s）"],
+                  ["0.5", "较快（0.5s）"], ["1.2", "正常（1.2s）"], ["2", "慢（2s）"]];
+  const PRESETS = [
+    ["人机混合：我 + 3 AI", ["human", "ai", "ai", "ai"], 4],
+    ["三麻：我 + 2 AI", ["human", "ai", "ai"], 3],
+    ["纯 AI 四麻观战", ["ai", "ai", "ai", "ai"], 4],
+    ["纯 AI 三麻观战", ["ai", "ai", "ai"], 3],
+  ];
+
+  let models = [], rooms = [], stats = null, cfg = {}, draft = null, record = true;
+
+  const page = majPage({
+    name: "",
+    onHello: (lobby) => {
+      /* ★ 这里**不能**碰 `page` —— 它是 `const page = majPage({...})` 的返回值，
+         此刻还在 TDZ 里（引用一下就 ReferenceError，整个回调炸掉，
+         表现就是「大厅一直不出来」）。要用的东西都在 lobby 参数里。 */
+      models = lobby.models || [];
+      if (lobby.config) cfg = lobby.config;
+      renderPrivacy();
+      newBuild(4);
+      drawBuild();
+      pickStats(lobby.stats);
+      drawRooms(lobby.rooms || []);
+    },
+    onLobby: (m) => {
+      if (m.models) models = m.models;
+      if (m.record !== undefined) { record = !!m.record; renderPrivacy(); }
+      pickStats(m.stats);
+      drawRooms(m.rooms || []);
+    },
+    onState: () => { /* 大厅不看局面；进房由 room.create / room.join 负责跳转 */ },
+  });
+  window.__page = page;
+
+  function pickStats(s) {
+    stats = s || stats;
+    $("stats").textContent = stats
+      ? `${stats.rooms} 桌 · ${stats.humans} 人 · ${stats.ais} AI · ${stats.conns} 连接`
+      : "";
+  }
+
+  // ------------------------------------------------------------ 昵称 --
+
+  const nick = $("nick");
+  try { nick.value = window.localStorage.getItem("maj:name") || ""; } catch { /* 无痕 */ }
+  function commitName() {
+    const n = nick.value.trim().slice(0, 16);
+    nick.value = n;
+    if (!n) return;
+    try { window.localStorage.setItem("maj:name", n); } catch { /* 无痕 */ }
+    page.send({ t: "hello", name: n });
+    // 服务端的名片（签名 cookie）走 HTTP，失败也不影响 WebSocket 那条路
+    fetch("/api/name", { method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: n }) }).catch(() => undefined);
+  }
+  nick.addEventListener("change", commitName);
+  nick.addEventListener("blur", commitName);
+
+  // ------------------------------------------------------ 房间列表 --
+
+  function drawRooms(list) {
+    rooms = list;
+    const box = $("rooms");
+    if (!list.length) {
+      box.innerHTML = '<div class="empty">还没有房间。点「建立房间」开一桌，'
+        + '或者直接建一桌纯 AI 观战。</div>';
+      return;
+    }
+    box.replaceChildren();
+    for (const r of list) {
+      const card = document.createElement("article");
+      card.className = "room";
+      const mode = r.humans === 0 ? "纯 AI" : (r.ais ? "人机混合" : "纯真人");
+      const seats = (r.seats || []).map((s) => {
+        /* AI 座位写**模型名**（maj-flash4 这种），不写「AI·速攻」风格标签 */
+        const kind = s.kind === "ai" ? aiName(s) : (s.kind === "human" ? "真人" : "空位");
+        return `<span class="pill${s.host ? " pill--ok" : ""}">${s.seat} ${esc(seatLabel(s))}`
+          + ` · ${esc(kind)}${s.ai_degraded ? " · <i class='warn'>降级</i>" : ""}</span>`;
+      }).join("");
+      card.innerHTML = `
+        <div class="room__hd">
+          <b>${esc(r.id)}</b><span>${esc(r.name || "未命名")}</span>
+          <em>${r.players} 人 · ${mode} · ${r.phase === "playing" ? "对局中" : r.phase === "lobby" ? "等人" : r.phase}</em>
+          ${r.spectator_ok ? '<span class="pill pill--ok">可全亮观战</span>' : ""}
+        </div>
+        <div class="room__seats">${seats}</div>
+        <div class="room__ops">
+          <span class="hint">观战 ${r.spectators || 0} · 连接 ${r.conns || 0}</span>
+          <button class="btn btn--sm btn--primary" data-act="seat" data-id="${esc(r.id)}">入座</button>
+          <button class="btn btn--sm" data-act="watch" data-id="${esc(r.id)}">观战</button>
+          <button class="btn btn--sm btn--ghost" data-act="link" data-id="${esc(r.id)}">复制邀请链接</button>
+        </div>`;
+      box.appendChild(card);
+    }
+  }
+
+  $("rooms").addEventListener("click", (e) => {
+    const b = e.target.closest("button[data-act]");
+    if (!b) return;
+    const id = b.dataset.id;
+    const rid = id.toUpperCase();
+    if (b.dataset.act === "link") {
+      const url = location.origin + "/room/" + rid;
+      navigator.clipboard?.writeText(url);
+      page.say("链接已复制：<b>" + url + "</b>");
+      return;
+    }
+    commitName();
+    // 入座：直接走 /room/{id}，由对战页带凭证坐回去；观战加 ?watch=1
+    location.assign("/room/" + rid + (b.dataset.act === "watch" ? "?watch=1" : ""));
+  });
+
+  // ---------------------------------------------------------- 建房 --
+
+  function newBuild(players) {
+    draft = { name: "", players, rounds: 0, hanchan: false, aiDelay: null,
+              password: "", reveal: true,
+              seats: Array.from({ length: players }, () => ({ kind: "ai", ai: "" })) };
+    draft.seats[0] = { kind: "human", ai: "" };
+  }
+
+  function modelOptions(cur) {
+    return models.filter((m) => m.players === draft.players).map((m) =>
+      `<option value="${esc(m.name)}"${cur === m.name ? " selected" : ""}>`
+      + `${esc(m.cn)} · ${esc(m.name)}${m.usable ? "" : "（缺权重）"}</option>`).join("");
+  }
+
+  function drawBuild() {
+    const d = draft;
+    $("build").hidden = false;
+    $("build").innerHTML = `
+      <div class="card__hd">建立房间</div>
+      <div class="card__bd grid">
+        <label>房间名<input id="bname" maxlength="24" placeholder="随便写" value="${esc(d.name)}" /></label>
+        <label>人数
+          <select id="bplayers">
+            <option value="4"${d.players === 4 ? " selected" : ""}>四麻（136 张 · 有吃）</option>
+            <option value="3"${d.players === 3 ? " selected" : ""}>三麻（108 张 · 有拔北）</option>
+          </select>
+        </label>
+        <label>局数
+          <select id="brounds">${ROUNDS.map(([v, t]) =>
+            `<option value="${v}"${d.rounds === v ? " selected" : ""}>${t}</option>`).join("")}
+            <option value="${HANCHAN}"${d.hanchan ? " selected" : ""}>半荘（东风 + 南风，打完南 4 才结束）</option>
+          </select>
+        </label>
+        <label>AI 节拍
+          <select id="bdelay">${DELAYS.map(([v, t]) =>
+            `<option value="${v}"${String(d.aiDelay ?? "") === v ? " selected" : ""}>${t}</option>`).join("")}</select>
+        </label>
+        <label>房间口令（可空）<input id="bpw" maxlength="24" value="${esc(d.password)}" /></label>
+        <div class="seats" id="bseats"></div>
+      </div>
+      <div class="card__bd bar">
+        <span>快速预设：</span>
+        ${PRESETS.map(([label, kinds, n]) =>
+          `<button class="btn btn--sm" data-preset="${kinds.join(",")}|${n}">${label}</button>`).join("")}
+        <button class="btn btn--primary" id="bgo">开桌并开始</button>
+        <button class="btn btn--ghost" id="bcancel">取消</button>
+      </div>`;
+    drawSeats();
+    $("bname").addEventListener("input", (e) => { d.name = e.target.value; });
+    $("bplayers").addEventListener("change", (e) => {
+      const n = Number(e.target.value);
+      const seats = Array.from({ length: n }, (_, i) =>
+        d.seats[i] || { kind: "ai", ai: "" });
+      draft = Object.assign({}, d, { players: n, seats });
+      drawBuild();
+    });
+    $("brounds").addEventListener("change", (e) => {
+      if (e.target.value === HANCHAN) { d.hanchan = true; d.rounds = 0; }
+      else { d.hanchan = false; d.rounds = Number(e.target.value); }
+    });
+    $("bdelay").addEventListener("change", (e) => {
+      d.aiDelay = e.target.value === "" ? null : Number(e.target.value);
+    });
+    $("bpw").addEventListener("input", (e) => { d.password = e.target.value; });
+    $("bgo").addEventListener("click", go);
+    $("bcancel").addEventListener("click", () => { $("build").hidden = true; });
+    $("build").querySelectorAll("[data-preset]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const [kinds, n] = btn.dataset.preset.split("|");
+        const seats = kinds.split(",").map((k) => ({ kind: k, ai: "" }));
+        draft = Object.assign({}, draft, { players: Number(n), seats });
+        drawBuild();     // 人数可能变了，重建一遍（下拉框要按人数列模型）
+      });
+    });
+  }
+
+  function drawSeats() {
+    const box = $("bseats");
+    if (!box) return;
+    box.innerHTML = draft.seats.map((s, i) => `
+      <div class="seat-row">
+        <span>${i} 号位</span>
+        <select data-seat="${i}" data-role="kind">
+          <option value="human"${s.kind === "human" ? " selected" : ""}>真人</option>
+          <option value="ai"${s.kind === "ai" ? " selected" : ""}>AI</option>
+        </select>
+        <select data-seat="${i}" data-role="ai"${s.kind === "ai" ? "" : " disabled"}>
+          <option value="">（自动挑一个）</option>${modelOptions(s.ai)}
+        </select>
+      </div>`).join("");
+    box.querySelectorAll("select").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        const i = Number(sel.dataset.seat);
+        if (sel.dataset.role === "kind") draft.seats[i].kind = sel.value;
+        else draft.seats[i].ai = sel.value;
+        drawSeats();
+      });
+    });
+  }
+
+  function go() {
+    commitName();
+    if (!nick.value.trim()) { page.say("先取个昵称再开房", true); nick.focus(); return; }
+    const usable = models.filter((m) => m.players === draft.players && m.usable).map((m) => m.name);
+    /* ★ 「自动挑一个 AI」要**真随机**：以前是 `usable[i % n]` —— 每桌都按同样的
+       顺序轮着上（这一桌 maj-flash、下一桌 maj-huge…），看着就像「bot 不随机」。
+       现在每个 AI 座位独立随机抽一个可用模型。 */
+    const pickAI = () => (usable.length
+      ? usable[Math.floor(Math.random() * usable.length)] : "teacher");
+    const seats = draft.seats.map((s) => s.kind === "ai"
+      ? { kind: "ai", ai: s.ai || pickAI() }
+      : { kind: "human" });
+    const pureAI = seats.every((s) => s.kind === "ai");
+    page.create({
+      name: draft.name || (draft.players === 3 ? "三麻桌" : "四麻桌"),
+      players: draft.players, rounds: draft.rounds,
+      hanchan: !!draft.hanchan,
+      ai_delay: draft.aiDelay, seats,
+      password: draft.password || "",
+      // 纯 AI 房：房主自己变观战者（服务端只对纯 AI 房放行全亮）
+      spectator_reveal: true, autostart: true,
+    });
+  }
+
+  $("mk").addEventListener("click", () => {
+    if ($("build").hidden) { newBuild(draft ? draft.players : 4); drawBuild(); }
+    else $("build").hidden = true;
+  });
+  $("join").addEventListener("click", () => {
+    const rid = window.prompt("输入房间号（例如 7K3QP）");
+    if (!rid || !rid.trim()) return;
+    commitName();
+    location.assign("/room/" + rid.trim().toUpperCase());
+  });
+  $("reload").addEventListener("click", () => page.send({ t: "lobby" }));
+
+  // ---------------------------------------------------- 团体战 --
+  /* 4 队 × 4 角色 = 16 人，先锋→次锋→副将→大将各打一个半庄（分数继承）。
+   *
+   * 这一版是**够用**、不是豪华：队名 4 个输入框、16 行角色（名字预填
+   * 「红队·先锋」、AI 随机抽、每行一个「真人」勾选框），开赛前校验
+   * 「同一个半庄最多一个真人」（即同一个角色轮里不能勾两个真人）。
+   * 真人是可以占多个角色的（打满全场）；只占一个角色时，另外三个半庄
+   * 他退成观战 —— 那条座位轮换还没做，先只暴露全 AI / 打满全场两种。
+   */
+  const TEAM_ROLES = ["先锋", "次锋", "副将", "大将"];
+  let teamDraft = null;
+
+  function newTeamDraft() {
+    const teams = ["红队", "蓝队", "绿队", "黄队"];
+    teamDraft = {
+      teams,
+      names: [...teams],
+      // roster 索引 = 角色轮 * 4 + 队号（跟服务端 _team_lineup 一致）
+      roster: TEAM_ROLES.flatMap((role) =>
+        teams.map((t) => ({ name: `${t}·${role}`, kind: "ai", ai: "" }))),
+    };
+  }
+
+  function drawTeamBuild() {
+    const box = $("teambuild");
+    box.hidden = false;
+    $("build").hidden = true;
+    const modelOpts = (cur) => models.filter((m) => m.players === 4).map((m) =>
+      `<option value="${esc(m.name)}"${cur === m.name ? " selected" : ""}>`
+      + `${esc(m.cn)} · ${esc(m.name)}${m.usable ? "" : "（缺权重）"}</option>`).join("");
+    const rowHtml = teamDraft.roster.map((s, i) => {
+      const role = TEAM_ROLES[Math.floor(i / 4)];
+      const team = teamDraft.teams[i % 4];
+      return `<div class="seat-row">
+        <span>${team}·${role}</span>
+        <input data-ti="${i}" data-role="name" maxlength="12" value="${esc(s.name)}"
+               placeholder="角色名" />
+        <select data-ti="${i}" data-role="kind">
+          <option value="ai"${s.kind === "ai" ? " selected" : ""}>AI</option>
+          <option value="human"${s.kind === "human" ? " selected" : ""}>真人</option>
+        </select>
+        <select data-ti="${i}" data-role="ai"${s.kind === "ai" ? "" : " disabled"}>
+          <option value="">（自动随机）</option>${modelOpts(s.ai)}
+        </select>
+      </div>`;
+    }).join("");
+    box.innerHTML = `
+      <div class="card__hd">团体战 · 4 队 × 4 角色</div>
+      <div class="card__bd grid">
+        ${teamDraft.teams.map((t, i) =>
+          `<label>${i + 1} 队队名<input data-team="${i}" maxlength="10"
+             value="${esc(teamDraft.names[i])}" /></label>`).join("")}
+        <div class="seats">${rowHtml}</div>
+      </div>
+      <div class="card__bd bar">
+        <span class="hint">先锋→次锋→副将→大将各打一个半庄，初始 100000 分，
+          不击飞、不中途流局。同一个半庄最多一个真人。</span>
+        <button class="btn btn--primary" id="tgo">开赛</button>
+        <button class="btn btn--ghost" id="tcancel">取消</button>
+      </div>`;
+    box.querySelectorAll("[data-team]").forEach((el) => {
+      el.addEventListener("input", () => {
+        teamDraft.names[Number(el.dataset.team)] = el.value;
+      });
+    });
+    box.querySelectorAll("[data-ti]").forEach((el) => {
+      const i = Number(el.dataset.ti);
+      const role = el.dataset.role;
+      el.addEventListener(role === "name" ? "input" : "change", () => {
+        if (role === "kind") {
+          teamDraft.roster[i].kind = el.value;
+          /* 切成真人就把「模型」下拉禁掉（真人没有模型）；切回 AI 放开。
+             直接改兄弟节点，不整块重画 —— 16 行重画会把正在输入的名字丢焦点。 */
+          const sib = box.querySelector(`select[data-ti="${i}"][data-role="ai"]`);
+          if (sib) sib.disabled = el.value !== "ai";
+        } else if (role === "ai") {
+          teamDraft.roster[i].ai = el.value;
+        } else {
+          teamDraft.roster[i].name = el.value;
+        }
+      });
+    });
+    $("tgo").addEventListener("click", startTeam);
+    $("tcancel").addEventListener("click", () => { box.hidden = true; });
+  }
+
+  function startTeam() {
+    commitName();
+    if (!nick.value.trim()) { page.say("先取个昵称再开赛", true); nick.focus(); return; }
+    // 同一个角色轮里最多一个真人
+    for (let rd = 0; rd < TEAM_ROLES.length; rd++) {
+      const humans = teamDraft.roster.slice(rd * 4, rd * 4 + 4)
+        .filter((s) => s.kind === "human");
+      if (humans.length > 1) {
+        page.say(`${TEAM_ROLES[rd]}战勾了 ${humans.length} 个真人 —— ` +
+                 "同一个半庄最多一个真人", true);
+        return;
+      }
+    }
+    const usable = models.filter((m) => m.players === 4 && m.usable).map((m) => m.name);
+    const pickAI = () => (usable.length
+      ? usable[Math.floor(Math.random() * usable.length)] : "teacher");
+    const roster = teamDraft.roster.map((s) => (s.kind === "ai"
+      ? { name: s.name, kind: "ai", ai: s.ai || pickAI() }
+      : { name: s.name, kind: "human", ai: "" }));
+    page.create({
+      name: "团体战", players: 4, rounds: 0, ai_delay: 0.6,
+      seats: [0, 1, 2, 3].map(() => ({ kind: "ai", ai: "teacher" })),
+      team: { teams: [...teamDraft.names], roster },
+      spectator_reveal: true, autostart: true,
+    });
+  }
+
+  $("mkteam").addEventListener("click", () => {
+    if ($("teambuild").hidden) { newTeamDraft(); drawTeamBuild(); }
+    else $("teambuild").hidden = true;
+  });
+
+  // 建房成功 → 服务端推 state，这里只负责跳过去
+  const jump = setInterval(() => {
+    const st = page.lastState;
+    if (st && st.room && st.room.id) {
+      clearInterval(jump);
+      location.assign("/room/" + st.room.id);
+    }
+  }, 300);
+
+  // ------------------------------------------------------ 说明文本 --
+
+  $("rules").innerHTML = `<ul>
+    <li>默认东风战：三麻 3 局、四麻 4 局；一位未满返し点会南入。</li>
+    <li>三麻 108 张（万子只有 1m / 9m）、有拔北；四麻 136 张、有吃。</li>
+    <li>赤 5：三麻赤 5p / 5s，四麻再加赤 5m；双响有效，不聴罰符三麻 2000 / 四麻 3000。</li>
+    <li>真人思考超时会由内置教师托管，不会把整桌卡死。</li>
+    <li>观战全亮牌只在纯 AI 房生效；桌上有真人时服务端直接拒绝。</li></ul>`;
+
+  function renderPrivacy() {
+    $("privacy").innerHTML = record
+      ? `<p><strong>本局对局数据会被记录，用于模型训练。</strong></p>
+         <p class="hint">记录的是决策级数据（局面 / 合法动作 / 选择 / 用时），
+         玩家名只以匿名串出现；进房后可以在左侧关掉「本局记录我的数据」。</p>`
+      : `<p class="hint">本服务当前<strong>未开启</strong>对局数据记录，牌局不会被落盘。</p>`;
+  }
+
+  page.connect();
+})();
+</script>
+</body>
+</html>

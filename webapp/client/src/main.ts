@@ -84,6 +84,26 @@ class App {
           m.spectator ? `进入观战：房间 ${m.room}` : `入座成功：房间 ${m.room} · ${m.seat + 1} 号位`,
           "ok",
         );
+        // ★ **入座之后要把画面切到牌桌**。
+        //
+        // 只弹个 toast 不算完：`setScreen("game")` 是由 `onState` 触发的，
+        // 而服务端在 `_enter_room()` 里是先推 `joined` 再推第一帧 `state`。
+        // 正常情况下这两条会到，画面也就切过去了；但只要第一帧因为任何原因
+        // 没到（或晚到），玩家就会**卡在大厅里，只看到一句「入座成功」**——
+        // 明明已经坐在牌桌上了，屏幕上却还是房间列表（实测踩过）。
+        //
+        // 所以这里显式切一下，并且把地址栏也改成 `/room/{id}`：
+        // 刷新之后能直接回到这张桌子（服务端对 `/room/{id}` 发的是同一份
+        // index.html，前端靠 `location.pathname` 判断该显示哪个画面）。
+        this.setScreen("game");
+        // ★ 牌桌已经**整页换成新页面**了（服务端 `/room/{id}` 发的是
+        //   `static/game/`，样式与摆牌在 `static/table/`）。
+        //   所以这里必须**整页跳过去**：再用 `history.pushState` 留在老前端里，
+        //   看到的就是旧牌桌 —— 两套牌桌同时存在，正是要避免的。
+        //   座位凭证已经在 `onJoined` 里存进 localStorage（同一个 key），
+        //   新页面读它就能坐回这个位子。
+        location.assign(`/room/${m.room}`);
+        return;
       },
       onReveal: (m: RevealMsg) => {
         // 服务端可能拒绝（桌上有真人），**要把原因显示出来**
@@ -224,7 +244,7 @@ class App {
       <label class="spectbar" id="revealwrap" hidden>
         <input type="checkbox" id="revealbox" /> 全亮牌（仅纯 AI 房）
       </label>
-      <button class="btn btn--sm" id="btn-panel">面板</button>
+      <button class="btn btn--sm" id="btn-panel" title="显示 / 隐藏右侧信息栏（快捷键 Tab）">侧栏</button>
       <button class="btn btn--sm" id="btn-leave">离开房间</button>
     `;
 
@@ -267,7 +287,23 @@ class App {
     game.append(topbar, playfield, bottombar);
 
     topbar.querySelector("#btn-leave")?.addEventListener("click", () => this.leaveToLobby());
-    topbar.querySelector("#btn-panel")?.addEventListener("click", () => side.classList.toggle("is-hidden"));
+    // 右侧信息栏收起 / 展开。收起时把 `--side-bar` 归零 —— 牌桌立刻把
+    // 右边那一条收回来，下家的手牌和牌河就完整可见了。
+    const toggleSide = (): void => {
+      const hidden = side.classList.toggle("is-hidden");
+      game.classList.toggle("is-side-hidden", hidden);
+      const btn = topbar.querySelector("#btn-panel");
+      if (btn) btn.textContent = hidden ? "侧栏 ▸" : "侧栏 ◂";
+      this.table.scheduleRefit();
+    };
+    topbar.querySelector("#btn-panel")?.addEventListener("click", toggleSide);
+    // Tab 也能切（键盘流用起来顺手；Tab 默认会把焦点挪走，所以拦掉）
+    window.addEventListener("keydown", (ev) => {
+      if (ev.key === "Tab" && this.screen === "game") {
+        ev.preventDefault();
+        toggleSide();
+      }
+    });
     this.revealWrap = topbar.querySelector("#revealwrap");
     this.revealBox = topbar.querySelector("#revealbox");
     this.revealBox?.addEventListener("change", () => {

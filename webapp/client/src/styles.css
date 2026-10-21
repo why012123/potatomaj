@@ -34,8 +34,11 @@
   /* 150~250ms、ease-out：出牌/鸣牌要有动画，不要瞬移 */
   --anim: 0.2s cubic-bezier(0.22, 0.61, 0.36, 1);
 
-  /* 牌尺寸 —— 全场唯一的尺寸源头 */
-  --tile-w: min(4.3vw, 4.9vh, 54px);
+  /* 牌尺寸 —— 全场唯一的尺寸源头。
+     系数是**算出来的**：牌河 6 张 + 副露 + 手牌 14 张要放进宽度里；
+     同时左右两家的手牌是竖着摆的，一张牌的高度不能超过屏高的 1/21。
+     用户反馈「略小」，两个系数各放大一档（4.3→5.0vw，4.9→5.6vh）。 */
+  --tile-w: min(5.0vw, 5.6vh, 62px, var(--tile-cap, 999px));
   --tile-h: calc(var(--tile-w) / 0.96);   /* 真牌 26x28mm，略高 */
   --tile-gap: calc(var(--tile-w) * 0.045);
 
@@ -113,11 +116,23 @@ input, select { font: inherit; }
 
 /* ----------------------------------------------------------------- 牌 -- */
 
+/*
+ * ★ 每张牌的尺寸用 **`--tw`**，不要写 `--tile-w`。
+ *
+ * 踩过的坑（很隐蔽）：尺寸档原来写成
+ *     .tile--xs { --tile-w: calc(var(--tile-w) * 0.5); }
+ * —— **在同一个元素上先定义、再读取同名变量**，这是一个自引用，CSS 里
+ * 属于无效值。于是 `.tile` 的 `width: var(--tile-w)` 解析不出来，
+ * 盒子尺寸变成「由内容决定」，而内容是一张 300×400 的 `<img>`：
+ * **中央那张宝牌指示器就渲染成一张巨大的牌，压在四家点数上面。**
+ * （`--tile-w` 是全局牌宽，`--tw` 是这张牌实际用的宽度，两者分开。）
+ */
 .tile {
+  --tw: var(--tile-w);
   position: relative;
   display: block;
-  width: var(--tile-w);
-  height: var(--tile-h);
+  width: var(--tw);
+  height: calc(var(--tw) / 0.96);
   padding: 0;
   border: 0;
   background: none;
@@ -134,15 +149,44 @@ input, select { font: inherit; }
   pointer-events: none;
   user-select: none;
 }
-.tile--xs { --tile-w: calc(var(--tile-w) * 0.5); }
-.tile--sm { --tile-w: calc(var(--tile-w) * 0.74); }
-.tile--md { --tile-w: calc(var(--tile-w) * 1); }
-.tile--lg { --tile-w: calc(var(--tile-w) * 1.12); }
+/*
+ * 牌面图加载失败时的兜底。
+ *
+ * 有些浏览器 / 网络环境下 SVG 拿不到（或整张解析失败），`<img>` 就会是空的 ——
+ * 而牌的尺寸、手牌跨度、副露/牌河的偏移全都要量它，图一空整桌布局就歪
+ * （表现是「牌乱飞」）。所以失败时**用纯色把它画出来**，尺寸由 CSS 保证：
+ * 白牌身 + 牌面文字，至少还能看清是什么牌。
+ */
+.tile__fallback { display: none; }
+.tile.is-broken {
+  background: #fbf8f1;
+  border-radius: 4px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+.tile.is-broken img { visibility: hidden; }
+.tile.is-broken .tile__fallback {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  font-size: calc(var(--tile-w) * 0.42);
+  font-weight: 800;
+  color: #2b2b2b;
+  white-space: nowrap;
+}
+.tile.is-broken.is-back { background: linear-gradient(180deg, #2f8a63, #184f39); }
+.tile.is-broken.is-back .tile__fallback { display: none; }
+.tile--xs { --tw: calc(var(--tile-w) * 0.5); }
+.tile--sm { --tw: calc(var(--tile-w) * 0.74); }
+.tile--md { --tw: calc(var(--tile-w) * 1); }
+.tile--lg { --tw: calc(var(--tile-w) * 1.12); }
 
 /* 横放（立直宣言牌 / 碰杠里被叫的那张）：盒子自己转 90°，图片再补一次
-   旋转把它转回正的 —— 这样「横着的牌」不会变成「躺倒的牌面」。 */
-.tile.is-rot { width: var(--tile-h); height: var(--tile-w); }
-.tile.is-rot img { transform: rotate(-90deg) scale(calc(var(--tile-h) / var(--tile-w))); }
+   旋转把它转回正的 —— 这样「横着的牌」不会变成「躺倒的牌面」。
+   用 `--tw` 而不是 `--tile-w`：后者在 `.tile` 上被 `--tw` 引用，
+   同时读它会在部分浏览器里算不出来（自引用的老问题）。 */
+.tile.is-rot { width: calc(var(--tw) / 0.96); height: var(--tw); }
+.tile.is-rot img { transform: rotate(-90deg) scale(0.96); }
 
 .tile.is-dim { filter: brightness(0.62) saturate(0.7); }
 .tile.is-back img { filter: drop-shadow(var(--shadow-tile)) brightness(0.98); }
@@ -206,7 +250,29 @@ input, select { font: inherit; }
 
 /* ------------------------------------------------------------- 牌桌 -- */
 
-.table { position: absolute; inset: 0; overflow: hidden; }
+/*
+ * 牌的落点**全部写死**，只有自家手牌会动。
+ *
+ * 用户的要求：牌河里第一张牌的位置钉死，后面的往右一张张加，一行 6 张；
+ * 副露钉在每家自己的右手边，第二组磊在第一组上方；画面里**只有手牌能动**。
+ *
+ * 之前的实现违反这一条：副露 / 牌河 / 整家的位置都是 JS 先量手牌跨度、
+ * 再算偏移（`--melds-lead` / `--pond-lead` / `--pond-gap`），手牌一张数变化
+ * 所有东西跟着跳 —— 看起来就是「牌一直在乱动」。现在这些量全部改成
+ * **跟手牌无关的固定值**。
+ */
+.table {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  /*
+   * 牌桌的**安全区**：手牌、副露、牌河、名牌都落在这个范围里。
+   * 右侧栏是盖在牌桌上的（`position: fixed`），所以右边要多留出侧栏的宽度，
+   * 否则下家（右侧那家）的手牌和牌河会被压住看不见。
+   */
+  --side-bar: clamp(240px, 17vw, 320px);
+  --safe-right: calc(var(--side-bar) + var(--tile-w) * 0.6);
+}
 
 .table__felt {
   position: absolute;
@@ -239,6 +305,20 @@ input, select { font: inherit; }
   top: 50%;
   transform: translate(-50%, -50%);
   z-index: 4;
+}
+
+/*
+ * 每家占的那条边：**座位盒子的水平范围是算死的** ——
+ * 左右各让开「安全区」（右侧栏 + 一个牌厚），而不是让盒子 `inset: 0`
+ * 再靠 JS 去挪。这是「牌不乱动」的地基：盒子位置固定了，
+ * 牌河里第一张牌、副露第一组才有一个稳定的参照物。
+ *
+ * 只用 `left` / `right` 两个属性（**不写 inset**）：上下方向各有各的
+ * 锚法（下家 bottom、上家 top、侧家 top:50%），交给 `.edge--*` 去定。
+ */
+.seat {
+  left: var(--safe-right);
+  right: var(--safe-right);
 }
 
 .centerbox {
@@ -276,6 +356,86 @@ input, select { font: inherit; }
 .turn__who.is-mine { color: #7ee0aa; }
 .turn__timer { margin-left: 8px; font-variant-numeric: tabular-nums; color: var(--muted); }
 .turn__timer.is-urgent { color: var(--red); font-weight: 700; }
+
+/*
+ * 四家点数 / 场风自风指示器。
+ *
+ * 放在中央信息块里，一行一家：自风 · 名字 · 点数。**正在出牌的那家高亮**
+ * （左边一条金边 + 底色），这样不用去看名牌就知道轮到谁了 ——
+ * 天凤和雀魂的中央区都是这个作用。
+ *
+ * 自己那一家额外加 `is-me`，颜色跟别家区分开（和下方手牌呼应）。
+ */
+.scorestrip {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
+  gap: 4px 8px;
+  margin-top: 2px;
+}
+.scoreline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 7px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: rgba(255, 255, 255, 0.03);
+  font-size: 12px;
+  line-height: 1.5;
+  transition: background var(--anim), border-color var(--anim);
+}
+.scoreline__wind {
+  flex: 0 0 auto;
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  font-size: 11px;
+  font-weight: 800;
+  color: #dfe9e3;
+}
+.scoreline__name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+.scoreline__score {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: #e8efe9;
+}
+/* 庄家：自风标红 */
+.scoreline.is-dealer .scoreline__wind { background: rgba(214, 74, 74, 0.28); color: #ffd9d9; }
+/* 自己 */
+.scoreline.is-me .scoreline__name { color: #9fe8bf; font-weight: 700; }
+/* 立直：名字旁边加个小杠 */
+.scoreline.is-riichi .scoreline__name::after {
+  content: "立";
+  margin-left: 5px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: rgba(232, 196, 106, 0.22);
+  color: var(--gold);
+  font-size: 10px;
+  font-weight: 700;
+}
+/* 正在出牌的那一家：金边 + 亮底 —— 这就是「出牌玩家指示」 */
+.scoreline.is-active {
+  background: linear-gradient(90deg, rgba(232, 196, 106, 0.20), rgba(232, 196, 106, 0.06));
+  border-color: rgba(232, 196, 106, 0.55);
+  box-shadow: 0 0 12px rgba(232, 196, 106, 0.18);
+}
+.scoreline.is-active .scoreline__name { color: var(--gold); }
+.scoreline.is-active .scoreline__score { color: #fff3cf; }
+/* 掉线 */
+.scoreline.is-offline { opacity: 0.5; }
 
 .table__curtain {
   position: absolute;
@@ -327,15 +487,29 @@ input, select { font: inherit; }
   height: var(--edge-h, calc(var(--tile-h) + var(--hand-pad) * 2));
 }
 
-/* 下 / 上家也要带 translate：它们的 `--fix-x` / `--fix-y` 是 JS 写进去的
-   居中修正，**CSS 不读这两个变量，修正就等于白算**（踩过：下家和上家的手牌
-   一直贴在桌子左边，怎么调 JS 都没用）。 */
-.edge--bottom { left: 0; bottom: 0; transform: translate(var(--fix-x, 0px), var(--fix-y, 0px)); }
+/*
+ * 下 / 上家：盒子**横向钉在座位中间**（`left: 50%` + `translateX(-50%)`），
+ * 不再靠 JS 把 `--fix-x` 补到「手牌居中」上。
+ *
+ * 为什么必须这样（这是「牌一直在乱动」的最后一环）：`--edge-w` 现在是固定的
+ * （按最大手牌算），但如果盒子还是从 `left: 0` 起算、靠 JS 去补一个
+ * 「让手牌居中」的位移，那个位移量是**根据手牌跨度算的** —— 手牌一换张数，
+ * 整条边（连同牌河、副露）就横移十几像素。实测：手牌 16 张时 edgeX=562、
+ * 13 张时 edgeX=546，牌河跟着在 976 / 961 之间来回跳。
+ *
+ * 现在盒子位置只由「座位盒子宽度」决定（座位盒子由 `.seat` 的安全区定死），
+ * 手牌在盒子里自己居中（`--hand-center`）。**盒子和牌河全程不动，只有手牌动。**
+ */
+.edge--bottom {
+  left: 50%;
+  bottom: 0;
+  transform: translateX(-50%);
+}
 /* 顶家整体转 180°：`.edge__hand` 因此要贴自己的下边缘 —— 转过来才落到屏幕上方 */
 .edge--top {
-  left: 0;
+  left: 50%;
   top: 0;
-  transform: translate(var(--fix-x, 0px), var(--fix-y, 0px)) rotate(180deg);
+  transform: translateX(-50%) rotate(180deg);
 }
 
 /*
@@ -391,55 +565,115 @@ input, select { font: inherit; }
   top: auto;
   right: auto;
 }
-/* 副露摆在自己手牌**右侧**（天凤式）。`--melds-lead` 由 JS 按手牌跨度算：
-   贴桌沿的话「我 + 三副露」会一路顶出牌桌右边。 */
-.edge--bottom .edge__melds { left: var(--melds-lead, 0px); }
-.edge--top .edge__melds { left: auto; right: var(--melds-lead, 0px); }
-/* 侧家：手牌贴墙（局部 x = 0..牌厚），副露在局部 x = 牌厚.. 即朝桌心一侧 */
+/* 副露：**钉在每家自己的右手边**（下家 = 盒子右端、上家 = 局部左端，
+   因为顶家整体转了 180°）。
+   第一组贴着手牌那一侧，**后面的往上磊**（`column-reverse`：新的一组装在
+   上面），所以副露永远只往一个方向长，不会忽然跳位置。
+   位置是固定值，**跟手牌张数无关** —— 手牌怎么变，副露都不动。 */
+.edge--bottom .edge__melds {
+  left: auto;
+  right: var(--melds-lead, 0px);
+  bottom: var(--side-slack, 0px);
+  top: auto;
+  flex-direction: column-reverse;
+  align-items: flex-end;
+}
+/* 顶家整体转了 180°：局部 x 反过来，所以「右手边」在它那边是左 */
+.edge--top .edge__melds {
+  left: var(--melds-lead, 0px);
+  right: auto;
+  bottom: var(--side-slack, 0px);
+  top: auto;
+  flex-direction: column-reverse;
+  align-items: flex-start;
+}
+/* 侧家：手牌贴墙（局部 x = 0..牌厚），副露在局部 x = 牌厚.. 即朝桌心一侧；
+   同样往「第二个在上」的方向磊。 */
 .edge--side .edge__melds {
   left: var(--hand-thick, 0px);
   bottom: var(--side-slack, 0px);
-  flex-direction: column;
+  flex-direction: column-reverse;
   align-items: flex-start;
 }
 
-/* 牌河：每行 6 张、最多 3 行。
-   竖直方向的偏移是 table.ts 算好的像素值（`--pond-gap` / `--pond-shift`）——
-   别在这里写 `calc(100% - var(--x))`：百分比和自定义属性混着写，在旋转过的
-   元素上会被静默算成 0（踩过，牌河直接贴到桌沿上）。 */
+/* 牌河：**第一张牌的位置钉死，后面的往右一张张加**，一行 6 张、最多 3 行
+   （第 6 张之后换行，行内继续往右）。
+   位置是固定 px，**跟手牌张数完全无关** —— 手牌怎么变，牌河都不动。
+   竖直方向的偏移用 JS 给的 px（`--pond-gap`）；别在这里写
+   `calc(100% - var(--x))`：百分比和自定义属性混着写，在旋转过的元素上会被
+   静默算成 0（踩过，牌河直接贴到桌沿上）。 */
 .edge__pond {
   position: absolute;
   display: grid;
-  grid-template-columns: repeat(6, auto);
+  /* 6 列 × 3 行的**固定格子**：格子先占好，牌一张张往里填。
+     这样第 1 张永远在左上角，第 7 张永远在第二行第一列 —— 不会因为
+     已打出的张数变化而整块重排。 */
+  grid-template-columns: repeat(6, var(--tw, var(--tile-w)));
+  grid-template-rows: repeat(3, calc(var(--tile-w) / 0.96));
   gap: calc(var(--tile-w) * 0.06);
   align-content: start;
   justify-content: start;
 }
-/* 下 / 上家：牌河右端与手牌右端对齐（按列对齐，天凤的牌河就是这么看的）。
-   偏移量 `--pond-lead` 是 JS 算好的 px —— 这里**不写 `calc(50% - var(--x))`**：
-   百分比和自定义属性混在一条 calc 里会被静默算成 0（实测牌河贴到桌子边上）。 */
-.edge--bottom .edge__pond {
-  right: var(--pond-lead, 0px);
-  left: auto;
-  bottom: var(--pond-gap, 0px);
-  top: auto;
-}
-/* 顶家整体转 180°：局部 x / y 都翻了过来，所以它的偏移要用「另一边」量
-   （`right` / `bottom`），否则牌河会跑到桌子外面去（`top` 会变成往上走）。 */
+/* 下 / 上家：牌河**钉在盒子中线上**（固定，不随手牌动）。
+   `left: 50%` 只用来取中点，位移量是 0 —— 没有 translate，
+   所以第一张牌的落点由盒子决定，盒子又由 `.seat` 的安全区决定。 */
+.edge--bottom .edge__pond,
 .edge--top .edge__pond {
-  right: var(--pond-lead, 0px);
-  left: auto;
-  bottom: var(--pond-gap, 0px);
-  top: auto;
-}
-/* 侧家：牌河由「手牌靠桌心那一侧」往桌心叠，跨过副露那一条带子 ——
-   两个偏移都是 JS 算好的 px（见 table.ts 的 fitHandSpan）。 */
-.edge--side .edge__pond {
-  left: var(--pond-lead, 0px);
+  left: 50%;
   right: auto;
   bottom: var(--pond-gap, 0px);
   top: auto;
-  grid-template-columns: repeat(3, auto);
+}
+/* 侧家：牌河由「手牌靠桌心那一侧」往桌心叠，跨过副露那一条带子。
+   两个偏移都是 JS 算好的 px（见 table.ts 的 fitHandSpan）。
+   ★ 格子和下 / 上家一样是 **6 列 × 2 行**（一行 6 张、最多 2 行）。
+   侧家整家转了 ±90°，所以本地的「一行 6 张」在屏幕上是**纵向的 6 张**，
+   本地 2 行在屏幕上是 2 列 —— 也就是「沿手牌方向磊 6 张、朝桌心方向 2 列」，
+   和下 / 上家旋转过来的样子一致。
+   （之前写成 2 列 × 6 行，方向正好反了：顺着桌心方向一排排铺开，
+   看起来既不像牌河、位置也歪。） */
+/*
+ * 侧家的牌河：两个方向的分量都**直接按局部坐标写死**，不再靠 `translate`
+ * 或边锚点去凑。
+ *
+ * 为什么（这是绕了最久的一处）：`.edge--side` 带 `rotate(±90deg)`，
+ * 它把局部的 x/y 在屏幕上互换了 —— 实测变换矩阵是 `[0 ∓1; ±1 0]`。
+ * 于是「沿手牌方向」（屏幕上纵向）在局部是 **x**，「朝桌心方向」（屏幕上横向）
+ * 在局部是 **y**，而且右家的号还要翻。用 `translate` / `bottom` 这类写法
+ * 根本表达不清，怎么调都有一头是歪的（左边偏上、右边偏下，或者压住手牌）。
+ *
+ * 直接把两件事分开：
+ *   - 沿手牌方向：由 `--pond-x` 给（局部 x），右家翻号
+ *   - 朝桌心方向：由 `--pond-y` + 牌河自己的高度给（局部 y），右家翻号
+ * 牌河的高度在局部是 `--pond-h`（转 90° 之后屏幕上量到的宽变成高），
+ * 所以用 `calc(var(--pond-y) - var(--pond-h))` 把盒子推到手牌那一侧。
+ */
+/*
+ * ★ 右家的手牌**沿盒子长轴放在相反的一端**。
+ *
+ * 实测：左家的手牌在局部 x = 0 那一端，右家的手牌在局部 x = span 那一端
+ * （两条 `.edge` 的 `rotate(±90deg)` 方向相反，而手牌在屏幕上都是居中的，
+ * 于是它在各自的局部坐标系里落在了相反的两头）。
+ *
+ * 后果就是牌河怎么摆都不对称：同一个 `--pond-x`，左家量出来离手牌 31px、
+ * 右家 463px；`--melds-lead` 也一样，右家的副露会长到手牌另一头去。
+ *
+ * 把右家的手牌挪到和左家相同的一端，两家的局部布局就完全一致了，
+ * 牌河 / 副露都用同一套偏移。
+ */
+.edge--right .edge__hand { left: var(--hand-center, 0px); right: auto; }
+.edge--left .edge__hand { left: 0; right: auto; }
+
+/* 侧家牌河：沿手牌方向由 `--pond-x` 定（局部 x），朝桌心方向由
+   `--pond-y` + 牌河高度定（局部 y）。见 table.ts 里那段说明。 */
+.edge--side .edge__pond {
+  left: var(--pond-x, 0px);
+  right: auto;
+  top: calc(var(--pond-y, 0px) - var(--pond-h, 120px));
+  bottom: auto;
+  grid-template-columns: repeat(6, var(--tw, var(--tile-w)));
+  grid-template-rows: repeat(2, calc(var(--tile-w) / 0.96));
+  translate: none;
 }
 
 /* ------------------------------------------------------------- 名牌 -- */
@@ -461,10 +695,30 @@ input, select { font: inherit; }
   transition: box-shadow var(--anim), border-color var(--anim);
   z-index: 5;
 }
-.seat--bottom .seat__plate { left: 50%; bottom: calc(var(--hand-pad) * 0.28); transform: translateX(-50%); }
-.seat--top .seat__plate { left: 50%; top: calc(var(--hand-pad) * 0.28); transform: translateX(-50%); }
-.seat--right .seat__plate { top: 50%; right: calc(var(--hand-pad) * 0.28); transform: translateY(-50%); }
-.seat--left .seat__plate { top: 50%; left: calc(var(--hand-pad) * 0.28); transform: translateY(-50%); }
+/* 名牌：贴在桌子**外侧**那一条窄带里，也就是手牌背后（手牌在盒子的内侧一截）。
+   上家要特别小心 —— 它的手牌就在自己的下边（屏幕上方那一排），名牌要是也放在
+   下边就会**盖住手牌**（踩过）。所以四家统一：名牌离桌沿 `--hand-pad`，
+   朝桌子中心再让开一截，正好落在手牌与桌沿之间的空当里。 */
+.seat--bottom .seat__plate {
+  left: 50%;
+  bottom: calc(var(--hand-pad) * 0.9 + var(--tile-h));
+  transform: translateX(-50%);
+}
+.seat--top .seat__plate {
+  left: 50%;
+  top: calc(var(--hand-pad) * 0.9);
+  transform: translateX(-50%);
+}
+.seat--right .seat__plate {
+  top: 50%;
+  right: calc(var(--hand-pad) * 0.9);
+  transform: translateY(-50%);
+}
+.seat--left .seat__plate {
+  top: 50%;
+  left: calc(var(--hand-pad) * 0.9);
+  transform: translateY(-50%);
+}
 
 .seat.is-active .seat__plate {
   border-color: var(--gold);
@@ -555,11 +809,18 @@ input, select { font: inherit; }
 .actionbar__timer.is-urgent i { background: linear-gradient(90deg, #ff9b8c, var(--red)); }
 .actionbar__hint { color: var(--muted); font-size: 12px; }
 
+/*
+ * 右侧信息栏：**浮在牌桌上面**（`position: absolute`），所以它可以随时收起，
+ * 收起来之后那一块就还给牌桌 —— 下家的手牌 / 牌河能完整看到。
+ *
+ * 宽度走 `--side-bar`（`.table` 也用同一个变量算安全区），
+ * 收起时把 `--side-bar` 归零，牌桌随即占满整宽。
+ */
 .side {
   position: absolute;
   top: 8px;
   right: 12px;
-  width: min(300px, 24vw);
+  width: var(--side-bar, min(300px, 24vw));
   max-height: calc(100% - 16px);
   display: grid;
   grid-template-rows: auto 1fr auto;
@@ -569,6 +830,8 @@ input, select { font: inherit; }
 }
 .side > * { pointer-events: auto; }
 .side.is-hidden { display: none; }
+/* 收起时：牌桌把右边那一条收回来（`.table` 的 `--side-bar` 归零） */
+.game.is-side-hidden { --side-bar: 0px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px 10px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); }
 .card h3 { font-size: 13px; color: var(--gold); }
 .logbox { overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.45; color: #cfe3d6; max-height: 30vh; }
@@ -592,19 +855,37 @@ input, select { font: inherit; }
 
 /* --------------------------------------------------------- 结算面板 -- */
 
+/*
+ * 结算 / 结果弹窗。
+ *
+ * 用户的要求：**可隐藏、不能挡住右边的手牌和牌河**。所以：
+ *   - 遮罩不再是「整屏压黑」，改成**只把中央一块压暗**（四周透明），
+ *     下家（右侧那家）的手牌和牌河都还看得见；
+ *   - 面板本身有「×」（`panel__x`）和「收起」两条路，esc 也能关；
+ *   - 面板宽度收到 720px，靠中央信息区那一带，不铺满整屏。
+ * `pointer-events: none` 在遮罩上：点空白处穿到牌桌上，不误挡操作。
+ */
 .overlay {
   position: fixed;
   inset: 0;
-  background: rgba(3, 10, 7, 0.72);
+  /* 只在中央压一小块暗，四边留白 —— 这样右侧手牌 / 牌河不会被糊住 */
+  background: radial-gradient(
+    ellipse 46% 52% at 50% 50%,
+    rgba(3, 10, 7, 0.82) 0%,
+    rgba(3, 10, 7, 0.72) 58%,
+    rgba(3, 10, 7, 0) 100%
+  );
   display: grid;
   place-items: center;
   z-index: 50;
   padding: 16px;
+  pointer-events: none;
 }
 .overlay[hidden] { display: none; }
 .panel {
-  width: min(1040px, 96vw);
-  max-height: 92vh;
+  pointer-events: auto;
+  width: min(720px, 68vw);
+  max-height: 88vh;
   display: grid;
   grid-template-rows: auto 1fr auto;
   background: linear-gradient(180deg, #10241b, #08150f);
@@ -624,9 +905,12 @@ input, select { font: inherit; }
 .agari__who { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .agari__who .gain { font-weight: 800; font-size: 16px; }
 .agari__hand { display: flex; align-items: flex-end; gap: 2px; flex-wrap: wrap; padding: 6px 0 10px; }
-.agari__hand .tile { --tile-w: clamp(24px, 2.6vw, 42px); }
+/* 结算面板里的手牌单独定尺寸：同样写 `--tw`，不能写 `--tile-w`
+   （`.tile` 的宽度读的是 `--tw`，改 `--tile-w` 在这里既没用、
+   又会让 `.tile--md` 那几条 `calc(var(--tile-w) * 1)` 读到被改过的值）。 */
+.agari__hand .tile { --tw: clamp(24px, 2.6vw, 42px); }
 .meld-inline { display: inline-flex; gap: 1px; margin-left: 8px; }
-.meld-inline .tile { --tile-w: clamp(18px, 1.9vw, 30px); }
+.meld-inline .tile { --tw: clamp(18px, 1.9vw, 30px); }
 .agari__yaku { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
 .yaku-col h4 { font-size: 12px; color: var(--muted); letter-spacing: 1px; }
 .yaku-list li { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; border-bottom: 1px dashed rgba(255, 255, 255, 0.07); }
@@ -773,10 +1057,11 @@ input, select { font: inherit; }
 
 .toast {
   position: fixed;
-  left: 50%;
-  /* 挂在**顶栏下方**：底部是自己手牌的地盘，压在那儿会挡牌 */
-  top: 46px;
-  transform: translateX(-50%) translateY(20px);
+  left: 12px;
+  /* 贴在**左下角**。中央下方是自己手牌的地盘（牌桌占满整个视口），
+     中央上方是上家的手牌，都不能压。3.6 秒自动淡出。 */
+  bottom: 88px;
+  transform: translateY(20px);
   background: rgba(10, 24, 18, 0.96);
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -785,9 +1070,10 @@ input, select { font: inherit; }
   opacity: 0;
   pointer-events: none;
   transition: opacity var(--anim), transform var(--anim);
-  max-width: 80vw;
+  /* 窄一点、最多两行：它飘在牌桌上方，太宽会盖住左侧那家的手牌 */
+  max-width: min(30ch, 26vw);
 }
-.toast.is-on { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.is-on { opacity: 1; transform: translateY(0); }
 .toast.is-warn { border-color: #d9a03f; }
 .toast.is-bad { border-color: var(--red); }
 
@@ -814,10 +1100,14 @@ input, select { font: inherit; }
 @media (max-width: 980px) {
   .side { display: none; }
 }
-/* 矮屏：牌再小一档，保证四家的手牌 + 牌河都在屏内 */
+/* 矮屏：牌再小一档，保证四家的手牌 + 牌河都在屏内（同样各放大一档）。
+   **每一处都要带上 `var(--tile-cap)`** —— 这个上限是 JS 按实际可用空间
+   算出来挂在 `.table` 上的（见 capTileSize）。漏掉一处，那一条断点就会
+   把上限盖掉：实测 1920x1080 下 `--tile-w` 一路解析成 999px 的兜底值，
+   手牌 16 张直接冲出屏幕。 */
 @media (max-height: 800px) {
-  :root { --tile-w: min(4.0vw, 4.6vh, 48px); }
+  :root { --tile-w: min(4.6vw, 5.2vh, 56px, var(--tile-cap, 999px)); }
 }
 @media (max-height: 680px) {
-  :root { --tile-w: min(3.6vw, 4.2vh, 42px); }
+  :root { --tile-w: min(4.2vw, 4.8vh, 50px, var(--tile-cap, 999px)); }
 }

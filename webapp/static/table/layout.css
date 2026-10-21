@@ -1,0 +1,344 @@
+/*
+ * 土豆麻将 · 对战页外壳（共用）
+ *
+ * 牌桌是**正方形**的，所以宽屏下表的两边天然空得出来：左边放操作按钮、
+ * 右边放「对局信息 / 聊天 / 牌局日志」—— 不再像旧版那样把侧栏压在右侧那家
+ * 的手牌上（README 里记的老毛病）。
+ *
+ * 窄屏（手机）竖过来：按钮落到**牌桌下面**，面板收成抽屉，牌桌占满宽度。
+ *
+ * 布局就三块：
+ *   #app  = flex 行
+ *     ├─ #ops    操作按钮（宽屏在左、手机上在下）
+ *     ├─ #stage  牌桌（table.css 里的 #table 缩放居中）
+ *     └─ #side   对局信息 / 聊天 / 日志（宽屏在右，手机上折叠）
+ */
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #06120c;
+  color: #e6f2ea;
+  font: 14px/1.6 system-ui, "Microsoft YaHei", sans-serif;
+  overflow: hidden;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: stretch;
+}
+
+/* 牌桌那一块：占满剩下的空间，牌桌自己在里面等比缩放居中（table.css 的 #table） */
+#stage {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ---------------------------------------------------------------- 按钮列 -- */
+
+#ops {
+  flex: 0 0 168px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 10px;
+  background: linear-gradient(180deg, #0a1c14, #071510);
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.ops__title {
+  font-size: 12px;
+  color: #7fa895;
+  letter-spacing: 0.06em;
+  margin-bottom: 2px;
+}
+
+/* 一个按钮：吃 / 碰 / 杠 / 立直 / 拔北 / 和 / 过 */
+.btn {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 10px;
+  padding: 10px 12px;
+  font: 700 15px/1.2 system-ui, "Microsoft YaHei", sans-serif;
+  color: #06120c;
+  background: linear-gradient(180deg, #ffe6a6, #e8c46a);
+  cursor: pointer;
+  text-align: center;
+}
+.btn:hover { filter: brightness(1.08); }
+.btn:active { transform: translateY(1px); }
+/* 和了 / 荣和这种「大事」用红金，过用灰 */
+.btn--win { background: linear-gradient(180deg, #ffd27a, #e0574a); color: #2a0d08; }
+.btn--pass { background: linear-gradient(180deg, #43596b, #2b3a48); color: #dfe9f2; }
+.btn:disabled { opacity: 0.45; cursor: default; }
+
+.ops__hint { font-size: 12px; color: #86a596; margin-top: 6px; }
+.ops__hint b { color: #ffd479; }
+
+/* ---------------------------------------------------------------- 侧栏 -- */
+
+#side {
+  flex: 0 0 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  background: linear-gradient(180deg, #0a1c14, #071510);
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+  min-height: 0;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  /* ★ 三块卡片**平分这一栏的高度**（flex-basis 0），内容各自在卡片内部滚。
+     不这么写的话：牌局日志一行行变多 → 卡片跟着长 → 整栏被顶长（用户看到的
+     「右侧牌局日志一直在拉长」）。 */
+  flex: 1 1 0;
+  min-height: 0;
+  background: rgba(4, 14, 9, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.card__hd {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #9fc6b3;
+  letter-spacing: 0.06em;
+  background: rgba(255, 255, 255, 0.04);
+}
+.card__bd {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+/* 对局信息：一行一条 */
+.info__row { display: flex; justify-content: space-between; gap: 8px; }
+.info__row span { color: #8fb0a3; }
+.info__row b { color: #f2f7f4; font-variant-numeric: tabular-nums; }
+
+/* 日志 / 聊天：小字，一行一条 */
+.log__line { color: #b9d3c6; font-size: 12px; padding: 1px 0; }
+.log__line b { color: #ffd479; }
+.chat__line { font-size: 12px; padding: 2px 0; color: #d8e8df; }
+.chat__line i { color: #8fd0ff; font-style: normal; }
+.chat__line.is-sys { color: #8fb0a3; }
+
+/* 聊天输入 */
+.chat__bar { display: flex; gap: 6px; padding: 6px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.chat__bar input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: #071510;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 8px;
+  color: #e6f2ea;
+  padding: 6px 8px;
+  font: inherit;
+}
+.chat__bar button {
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #2f8a63;
+  color: #04120b;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* 顶部状态条（两个页面共用） */
+#hud {
+  position: absolute;
+  left: 10px;
+  top: 10px;
+  z-index: 20;
+  max-width: 46ch;
+  padding: 7px 11px;
+  border-radius: 9px;
+  background: rgba(6, 20, 13, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  font-size: 13px;
+}
+#hud b { color: #ffd479; }
+#hud .off { color: #ff9b86; }
+#hud a { color: #8fd0ff; }
+
+/* ------------------------------------------------------------- 手机 -- */
+
+@media (max-width: 900px), (orientation: portrait) {
+  #app { flex-direction: column; }
+  /* 牌桌占上面那块，按钮落到下面 */
+  #stage { order: 1; flex: 1 1 auto; }
+  #ops {
+    order: 2;
+    flex: 0 0 auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: center;
+    border-right: 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 8px;
+    gap: 8px;
+  }
+  .ops__title, .ops__hint { display: none; }
+  /* 按钮排紧一点：一行 3~4 个，手指点得着就行；操作区可滚，别把牌桌挤没 */
+  #ops { max-height: 32vh; overflow-y: auto; padding: 6px; gap: 6px; }
+  #opsbtns { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; justify-content: center; }
+  .btn { flex: 1 1 28%; padding: 10px 6px; font-size: 14px; min-width: 72px; }
+  #opsmeta { width: 100%; }
+  /* 侧栏收成底下一块，**默认折起来**（手机上牌桌和按钮才是主角），
+     点右上角「面板」展开；展开后整块可以滚 */
+  #side {
+    order: 3;
+    flex: 0 1 auto;
+    max-height: 42vh;
+    overflow-y: auto;
+    border-left: 0;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 6px;
+    gap: 6px;
+  }
+  #side.is-folded { display: none; }
+  .info__row, .log__line, .chat__line { font-size: 12px; }
+  /* 状态条在手机上要短，别盖住牌桌上半张脸 */
+  #hud {
+    left: 6px; top: 6px; right: auto;
+    max-width: 62vw; padding: 5px 8px; font-size: 12px; line-height: 1.35;
+  }
+  /* 竖屏时提一句：这桌子是方的，横过来看更清楚 */
+  #stage::after {
+    content: "横屏看得更清楚";
+    position: absolute; left: 50%; bottom: 6px; transform: translateX(-50%);
+    font-size: 11px; color: rgba(255, 255, 255, 0.35); pointer-events: none;
+  }
+}
+
+/* 触摸设备：去掉 300ms 延迟和双击缩放，点牌更快 */
+.btn, .tile, .seat-chip, #fold { touch-action: manipulation; }
+* { -webkit-tap-highlight-color: transparent; }
+
+/* ---------------------------------------------------- 和了确认页 -- */
+/* 一局打完盖住牌桌：赢家牌面 + 役 + 番符 + 点数；所有在场的人确认后才开下一局。
+   直播页（纯 AI 房）等的是观战的人，对战页等的是真人座位 —— 同一份实现。 */
+#over {
+  position: absolute; inset: 0; z-index: 40;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(3, 10, 6, 0.82); padding: 16px;
+}
+#over[hidden] { display: none; }
+.over__panel {
+  width: min(760px, 94vw); max-height: 92%; overflow-y: auto;
+  background: linear-gradient(180deg, #0c2016, #071510);
+  border: 1px solid rgba(232, 196, 106, 0.35); border-radius: 14px;
+  padding: 14px 16px; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.6);
+}
+.over__hd { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.over__hd h2 { margin: 0; font-size: 20px; color: #ffd479; }
+.over__hd em { color: #8fb0a3; font-style: normal; font-size: 13px; }
+.rtile { width: 34px; height: 38px; border-radius: 4px; margin-right: 2px;
+         box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45); vertical-align: middle; }
+/* ★ 结算页里**所有牌一个尺寸**（之前副露那组被我改小了，看着一边横一边竖、
+   像两个牌桌拼起来）。分组靠**留白 + 虚线分隔**，不靠改尺寸。 */
+.rtile--meld { width: 34px; height: 38px; }
+.rtile--win { box-shadow: 0 0 0 2px #ff5347; margin-left: 10px; }
+/* ★ 一行里的牌必须**底边齐平**：`img` 默认按基线对齐，副露那组是 inline-flex
+   盒子、基线不同 → 两组牌一高一低（用户说的「两端位置不平齐」）。
+   统一 `vertical-align: middle` 就好了，不要靠改尺寸。 */
+.rhand > img, .rhand .rmeld, .rhand .rmeld > img { vertical-align: middle; }
+.rmeld { margin-left: 12px; display: inline-flex; align-items: center;
+         border-left: 1px dashed rgba(255, 255, 255, 0.22); padding-left: 10px; }
+/* ★ 牌面那一行用**行内流**（不是 flex）：flex 会按 item 换行，于是每组副露
+   各占一行、看着像竖着堆。行内流跟文字一样从左往右排、排不下才整体换行，
+   一组副露内部永远不会断开。 */
+.rrow--tiles { display: block; }
+.rhand { display: inline; line-height: 1.9; }
+.rrow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 5px 0; }
+.rrow .who { min-width: 8.5em; color: #cfe3d6; }
+.ryaku { color: #9fc6b3; font-size: 13px; }
+.rnum { color: #ffd479; font-weight: 700; }
+.over__deltas { margin-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 8px; }
+.over__deltas div { padding: 2px 0; }
+.over__ft { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+.over__wait { color: #8fb0a3; font-size: 13px; }
+
+/* ---------------------------------------------------- 团体战队伍条 -- */
+/* 牌桌顶部一排：角色进度（先锋→大将）+ 本轮四名上场者与四队总分。
+   普通局隐藏；观战时这排就是「红队·先锋 vs 蓝队·先锋 …」的说明。 */
+#teambar {
+  position: absolute; left: 0; right: 0; top: 0; z-index: 15;
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 4px 10px;
+  background: rgba(4, 14, 9, 0.86);
+  border-bottom: 1px solid rgba(232, 196, 106, 0.35);
+  font-size: 12px; color: #cfe3d6;
+}
+#teambar[hidden] { display: none; }
+.teambar__row {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  align-items: center; justify-content: center;
+}
+.trole { padding: 1px 9px; border-radius: 999px; background: rgba(255, 255, 255, 0.07); }
+.trole.is-cur { background: #e8c46a; color: #201503; font-weight: 700; }
+.trole.is-done { color: #6f8f80; text-decoration: line-through; }
+.tteam { padding: 1px 9px; border-radius: 8px; background: rgba(255, 255, 255, 0.05); }
+.tteam i { font-style: normal; color: #ffd479; }
+.tteam b { color: #fff; margin-left: 5px; font-variant-numeric: tabular-nums; }
+/* 队伍条在的时候，状态条往下让，别叠在一起 */
+body.has-team #hud { top: 54px; }
+
+/* 中间那块深蓝方块：**点一下就切换**「剩余牌数 ↔ 宝牌指示牌」。
+   手机上右侧面板默认折着，指示牌在那儿根本看不到；点中间最顺手。 */
+#center .mid-core { cursor: pointer; user-select: none; }
+/* 中间方块里的宝牌指示牌：**上三下二、两行都居中**。
+   用 flex + 固定「三张宽」的容器：第一行塞满 3 张，第二行剩 2 张自动居中
+   （grid 三列会把第二行顶到左边，两行不对中）。 */
+.mid-dora {
+  display: none; flex-wrap: wrap; justify-content: center;
+  align-items: center; gap: 3px;
+  width: calc(3 * 30px + 2 * 3px);        /* 正好三张牌宽 */
+  max-width: 100%;
+}
+.mid-dora .minitile {
+  width: 30px; height: 34px; margin: 0; flex: 0 0 auto;
+  background: #fbf8f1;
+}
+/* 没翻开的格子用**牌背**（橙黄那张），不是深蓝方块 —— 牌背的颜色要统一 */
+.mid-dora .minitile.is-back { background: transparent; }
+.minitile.is-back { opacity: 0.95; }
+#center.show-dora .mid-wall, #center.show-dora .mid-honba { display: none; }
+#center.show-dora .mid-dora { display: flex; }
+@media (max-width: 900px), (orientation: portrait) {
+  .rtile { width: 26px; height: 29px; }
+  .rrow .who { min-width: 100%; }
+}
+
+/* 手机上那个「面板」开关（宽屏下面板一直在，不需要它） */
+#fold {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  z-index: 20;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  background: rgba(6, 20, 13, 0.78);
+  color: #dff3e8;
+  padding: 6px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+@media (min-width: 901px) and (orientation: landscape) {
+  #fold { display: none; }
+}

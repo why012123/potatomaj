@@ -1,4 +1,25 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
+
+/**
+ * 给 `index.html` 里引用的 js / css 追加 `?v=<构建时间戳>`。
+ *
+ * 产物是固定名（`app.js` / `asset.css`，不带内容哈希），牌桌又是长期开着的
+ * 页面，所以必须有办法让浏览器丢掉旧的。加时间戳而不是开哈希命名的理由：
+ * `index.html` 本身已经带 `Cache-Control: no-store`（见服务端 `index_handler`），
+ * 它每次都会被重新取，所以只要它引用的 URL 变了，新产物就一定生效；
+ * 而固定文件名对人肉排障、无头浏览器自检都省事得多（不用去翻新文件名）。
+ */
+function cacheBust(): Plugin {
+  const stamp = Date.now().toString(36);
+  return {
+    name: "maj-cache-bust",
+    enforce: "post",
+    transformIndexHtml(html: string): string {
+      return html
+        .replace(/(src|href)="(\/app\/[^"?]+\.(?:js|css))"/g, `$1="$2?v=${stamp}"`);
+    },
+  };
+}
 
 /**
  * 前端构建配置。
@@ -11,13 +32,10 @@ import { defineConfig } from "vite";
  * 2. `outDir: "../static/app"` —— 服务端只从这里读 `index.html` 和静态资源。
  * 3. `emptyOutDir: true` —— 不清理的话上一版带 hash 的旧产物会一直躺着，
  *    排查「为什么改了代码没生效」时会白掉很多头发。
- *
- * 产物**不带 hash**（`app.js` / `asset.css`）是刻意的：`index.html` 由 Vite
- * 生成、自己引用正确的文件名，而人肉排障 / CDP 自检时固定路径省事得多。
- * 静态资源本来就带 `Cache-Control: no-store`（`index_handler`），不怕缓存。
  */
 export default defineConfig({
   base: "/app/",
+  plugins: [cacheBust()],
   build: {
     outDir: "../static/app",
     emptyOutDir: true,

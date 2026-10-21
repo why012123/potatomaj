@@ -32,6 +32,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -279,6 +280,20 @@ def register_elo_proxy(app: web.Application) -> None:
 
 def create_app(cfg: Config) -> web.Application:
     app = web.Application(client_max_size=256 * 1024)
+
+    # ★ `/table/` 和 `/preview/` 下的东西是**改一处就全站生效**的共用代码
+    #   （牌桌样式 / 摆牌 / 外壳 / 大厅皮肤）。`add_static` 默认会给
+    #   Last-Modified + ETag，浏览器有可能直接吃本地缓存 —— 表现就是
+    #   「我改完了、你刷新了、看到的还是上一版」，每次都得让你 Ctrl+F5。
+    #   这两个前缀统一改成 no-cache（仍然带 ETag，没变就是 304，不费流量）。
+    @web.middleware
+    async def _no_cache_shared(request: web.Request, handler):
+        resp = await handler(request)
+        if request.path.startswith(("/table/", "/preview/")):
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+    app.middlewares.append(_no_cache_shared)
     app["cfg"] = cfg
     app["clients"] = set()
     app["started_at"] = time.time()
@@ -332,11 +347,25 @@ def create_app(cfg: Config) -> web.Application:
     register_elo_proxy(app)
     app.router.add_get("/tiles/{name}", tile_handler)
     app.router.add_get("/", index_handler)
-    app.router.add_get("/room/{rid}", index_handler)
+    # 对战页：新牌桌（static/game/ + static/table/），房间号在 URL 上
+    app.router.add_get("/room/{rid}", room_handler)
+    # 结尾多一个斜杠也要能吃（用户手打 / 复制粘贴很常见）。
+    # `index_handler` 不读 `rid`，它只发同一份 index.html ——
+    # 具体是哪张桌子由前端看 `location.pathname` 决定。
+    app.router.add_get("/room/{rid}/", index_handler)
     app.router.add_static("/app/", path=str(STATIC / "app"), show_index=False,
                           follow_symlinks=False)
+    # 牌桌的共用代码（样式 / 几何摆牌 / 外壳）：老前端、新对战页、直播页、
+    # 沙盘页都引这里那一份 —— 改样式只改一处。不设长缓存，
+    # 刷一下就能看到改动（对战页那边还会再挂一个 ?v=<mtime>）。
+    app.router.add_static("/table/", path=str(STATIC / "table"),
+                          show_index=False, follow_symlinks=False)
     app.router.add_static("/assets/", path=str(STATIC), show_index=False,
                           follow_symlinks=False)
+    # 纯静态的**外观预览页**（`webapp/static/preview/`）：不连后端、数据写死，
+    # 用来单独调牌桌构图。放在这里只为方便在同一个端口上看，跟正式前端无关。
+    app.router.add_static("/preview/", path=str(STATIC / "preview"),
+                          show_index=True, follow_symlinks=False)
     app.router.add_get("/favicon.ico", favicon_handler)
     return app
 
@@ -354,7 +383,64 @@ def _client_uid(request: web.Request) -> dict:
     return who
 
 
+async def room_handler(request: web.Request) -> web.StreamResponse:
+    """`/room/{id}` —— **新牌桌的对战页**。
+
+    大头（`/`）还是老大厅（建房 / 进房 / 房间列表），一进房间就整页跳到
+    `/room/{id}`，从这里往后走的是新牌桌（`static/game/`，样式和摆牌跟
+    `static/table/` 共用）。
+
+    页内要知道房间号，房间号在 URL 上（`location.pathname`），
+    所以这里只是把同一份 HTML 发出去。
+    """
+    who = _client_uid(request)
+    html = STATIC / "game" / "index.html"
+    if not html.exists():
+        return web.Response(status=503, text="新对战页还没就位（static/game/）",
+                            content_type="text/plain")
+    text = html.read_text(encoding="utf-8")
+    try:
+        stamp = str(int(max(f.stat().st_mtime
+                            for f in (STATIC / "table").glob("*"))))
+    except (ValueError, OSError):
+        stamp = "0"
+    # 牌桌那几个共用文件挂了静态路由，但里面的引用写死了 `/table/x.css`，
+    # 为了「改了样式刷新就能看到」还是给它带个版本号（no-store + ?v=）
+    text = re.sub(r'(/table/[A-Za-z0-9_.-]+\.(?:js|css))(\?[^"\']*)?',
+                  rf"\1?v={stamp}", text)
+    resp = web.Response(text=text, content_type="text/html", charset="utf-8")
+    resp.headers["Cache-Control"] = "no-store"
+    resp.set_cookie("maj_id", sign_uid(who["uid"], who["name"]),
+                    max_age=90 * 24 * 3600, httponly=True, samesite="Lax")
+    return resp
+
+
 async def index_handler(request: web.Request) -> web.StreamResponse:
+    """`/` —— **新大厅**（房间列表 / 建房 / 房间号加入）。
+
+    老前端（`static/app/`）还留着，但已经不是入口了：大厅和对战页
+    都是新页面，共用 `static/table/` 里那一份牌桌代码。
+    """
+    who = _client_uid(request)
+    html = STATIC / "home" / "index.html"
+    if html.exists():
+        text = html.read_text(encoding="utf-8")
+        try:
+            stamp = str(int(max(f.stat().st_mtime
+                                for f in (STATIC / "table").glob("*"))))
+        except (ValueError, OSError):
+            stamp = "0"
+        text = re.sub(r'(/table/[A-Za-z0-9_.-]+\.(?:js|css))(\?[^"\']*)?',
+                      rf"\1?v={stamp}", text)
+        resp = web.Response(text=text, content_type="text/html", charset="utf-8")
+        resp.headers["Cache-Control"] = "no-store"
+        resp.set_cookie("maj_id", sign_uid(who["uid"], who["name"]),
+                        max_age=90 * 24 * 3600, httponly=True, samesite="Lax")
+        return resp
+    return await _legacy_index(request)
+
+
+async def _legacy_index(request: web.Request) -> web.StreamResponse:
     who = _client_uid(request)
     html = STATIC / "app" / "index.html"
     if not html.exists():
@@ -363,7 +449,18 @@ async def index_handler(request: web.Request) -> web.StreamResponse:
             text=("前端还没构建。\n在 webapp/client 下跑： npm install && npm run build\n"),
             content_type="text/plain",
         )
-    resp = web.FileResponse(html)
+    # 产物用的是**固定文件名**（app.js / asset.css），所以必须给它挂一个
+    # 跟构建时间走的版本号 —— 否则浏览器会一直用缓存里的旧 JS，
+    # 表现就是「改了前端、刷新没变化、看到的还是上一版」。
+    # index.html 自己是 no-store，所以每次都会走这里，注入的版本号一定是最新的。
+    text = html.read_text(encoding="utf-8")
+    try:
+        stamp = str(int(max(f.stat().st_mtime for f in (STATIC / "app").glob("*"))))
+    except (ValueError, OSError):
+        stamp = "0"
+    text = re.sub(r'(/app/[A-Za-z0-9_.-]+\.(?:js|css))(\?[^"\']*)?',
+                  rf"\1?v={stamp}", text)
+    resp = web.Response(text=text, content_type="text/html", charset="utf-8")
     resp.headers["Cache-Control"] = "no-store"
     resp.set_cookie("maj_id", sign_uid(who["uid"], who["name"]),
                     max_age=90 * 24 * 3600, httponly=True, samesite="Lax")
@@ -638,6 +735,10 @@ async def _handle(request: web.Request, client: WSClient, data: dict) -> None:
                 host_uid=("" if host_is_ai else client.uid),
                 host_name=client.name,
                 rounds=int(data.get("rounds") or 0),
+                # 半荘（东 + 南）：引擎那边要 Rule.hanchan 才无条件南入
+                hanchan=bool(data.get("hanchan")),
+                # 团体战：{teams: 4 个队名, roster: 16 个 {name, kind, ai}}
+                team=(data.get("team") if isinstance(data.get("team"), dict) else None),
                 ai_delay=(None if data.get("ai_delay") is None
                           else max(0.0, min(5.0, float(data["ai_delay"])))),
                 seats=spec,
@@ -710,7 +811,8 @@ async def _handle(request: web.Request, client: WSClient, data: dict) -> None:
         return
 
     if t == "next":
-        room.ack_next()
+        # ★ 只确认**这一条连接**（座位或观战）—— 见 Room.ack_next 的注释
+        room.ack_next(client.conn)
         return
 
     if t == "reveal":
@@ -811,12 +913,93 @@ async def _enter_room(
     room.push_state()
 
 
+def _alive(pid: int) -> bool:
+    """这个 PID 还在不在？
+
+    **Windows 上不能用 ``os.kill(pid, 0)``** 探活 —— 它会抛
+    ``SystemError: <built-in function kill> returned a result with an
+    exception set``（CPython 在 Windows 上的已知怪癖，实测踩过）。
+    所以 Windows 走 ``OpenProcess`` + ``GetExitCodeProcess``，
+    别的平台才用 ``os.kill(pid, 0)``。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _pid_lock(lock_path: Path) -> None:
+    """同一时刻只允许一个服务进程写这个数据目录。
+
+    **为什么必须有**：对局记录是**追加写 gzip** 的（``gzip.open(path, "ab")``）。
+    两个进程同时往同一个分片里追加，gzip 成员会交错，整个文件从交错点起
+    变成「invalid block type」——**已经写好的记录一起废掉**（实测踩过：
+    手工重启时漏杀一个旧进程，2.5MB 的分片只剩 26KB 能救回来）。
+
+    gzip 本身没有任何跨进程保护，所以只能在这一层挡住。用 ``O_EXCL`` 建锁
+    文件是原子的，顺便把 PID 写进去，方便运维看是谁占着。
+    """
+    import atexit
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in (1, 2):
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                old = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+            except (OSError, ValueError):
+                old = 0
+            if _alive(old):
+                log.error(
+                    "已经有一个服务进程（PID %d）在写这个数据目录：%s\n"
+                    "记录是追加写 gzip 的，两个进程同时写会把分片写坏。"
+                    "先停掉那个进程（deploy\\maj.ps1 stop）再启动。",
+                    old, lock_path.parent,
+                )
+                raise SystemExit(3)
+            if attempt == 2:
+                log.error("锁文件 %s 用不了，退出", lock_path)
+                raise SystemExit(3)
+            log.warning("发现残留的锁文件（PID %s 已经不在了），清掉重来", old)
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+        atexit.register(lambda: lock_path.unlink(missing_ok=True))
+        return
+
+
 def main(argv: list[str] | None = None) -> None:
     from .config import parse_args
     from .logging_setup import setup
 
     cfg = parse_args(argv)
     setup(cfg.log_dir, cfg.log_level, cfg.log_max_bytes, cfg.log_backups)
+    if cfg.record:
+        _pid_lock(cfg.data_dir.parent / "maj-server.lock")
     app = create_app(cfg)
     web.run_app(app, host=cfg.host, port=cfg.port, access_log=None,
                 print=lambda *a, **k: None)

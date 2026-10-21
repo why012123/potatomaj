@@ -1,18 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 300 400">
-    <defs xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
-      <mask xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" id="Regular-Back_svg__c">
-        <rect xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="300.059" height="400.778" x="-451.938" y="-1325.603" ry="40" opacity="1" fill="#ff3737" fill-opacity="1" fill-rule="nonzero" stroke="none" stroke-width="10" stroke-linecap="butt" stroke-linejoin="round" stroke-miterlimit="4" stroke-dasharray="none" strokeDashoffset="0" stroke-opacity="1" transform="scale(-1)" />
-      </mask>
-      <mask xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" id="Regular-Back_svg__b">
-        <rect xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="300.059" height="400.778" y="652.284" ry="40" opacity="1" fill="#ff3737" fill-opacity="1" fill-rule="nonzero" stroke="none" stroke-width="10" stroke-linecap="butt" stroke-linejoin="round" stroke-miterlimit="4" stroke-dasharray="none" strokeDashoffset="0" stroke-opacity="1" />
-      </mask>
-      <filter xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" id="Regular-Back_svg__a" width="1.05" height="1.109" x="-0.025" y="-0.054">
-        <feGaussianBlur xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" />
-      </filter>
-    </defs>
-    <g xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" transform="translate(0 -652.362)">
-      <rect xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="300.059" height="400.778" y="652.284" ry="40" opacity="1" fill="#ff3737" fill-opacity="1" fill-rule="nonzero" stroke="none" stroke-width="10" stroke-linecap="butt" stroke-linejoin="round" stroke-miterlimit="4" stroke-dasharray="none" strokeDashoffset="0" stroke-opacity="1" />
-      <path xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" d="M-4.769 775.071c-4.881-33.076-12.077-100.834 3.49-123.007 20.277-26.12 234.78-20.433 264.593 1.846 12.9 8.739-204.155 2.567-227.406 31.19C13.2 712.468.651 818.187-4.769 775.071" mask="url(#Regular-Back_svg__b)" fill="#fff" fill-opacity="0.78431373" fill-rule="evenodd" stroke="none" stroke-width="1" stroke-linecap="butt" stroke-linejoin="miter" stroke-opacity="1" filter="url(#Regular-Back_svg__a)" />
-      <path xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" d="M151.736 1025.018c-3.327-9.314-10.249-68.454 5.318-90.627 20.277-26.12 219.436-16.458 231.555-9.932 11.074 5.317-178.604.06-204.851 34.867-21.594 30-26.501 82.178-32.022 65.692" mask="url(#Regular-Back_svg__c)" fill="#000" fill-opacity="0.39215687" fill-rule="evenodd" stroke="none" stroke-width="1" stroke-linecap="butt" stroke-linejoin="miter" stroke-opacity="1" filter="url(#Regular-Back_svg__a)" transform="rotate(180 225.969 988.943)" />
-    </g>
-  </svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 400" width="300" height="400"><defs><linearGradient id="rs" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2f8a63"/><stop offset="0.5" stop-color="#226b4d"/><stop offset="1" stop-color="#184f39"/></linearGradient></defs><rect x="0" y="0" width="300" height="400" rx="26" fill="#fbf8f1"/><rect x="4" y="4" width="292" height="392" rx="24" fill="none" stroke="#ddd6c8" stroke-width="3"/><rect x="22" y="22" width="256" height="356" rx="16" fill="url(#rs)"/><rect x="22" y="22" width="256" height="356" rx="16" fill="none" stroke="rgba(0,0,0,.30)" stroke-width="3"/><rect x="36" y="36" width="228" height="328" rx="10" fill="none" stroke="rgba(255,255,255,.20)" stroke-width="2"/><circle cx="150" cy="200" r="34" fill="none" stroke="rgba(255,255,255,.16)" stroke-width="3"/></svg>

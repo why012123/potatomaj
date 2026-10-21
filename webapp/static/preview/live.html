@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>土豆麻将 · 直播</title>
+<link rel="stylesheet" href="/table/table.css" />
+<link rel="stylesheet" href="/table/layout.css" />
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="hud">启动中…</div>
+
+    <!-- 牌桌：中央信息区 + 四家的牌河/手牌/副露/拔北（三麻用不到的那家会被清空藏起来） -->
+    <div id="table">
+      <div id="center">
+        <div class="mid-core">
+          <div class="mid-round">--</div>
+          <div class="mid-wall">--</div>
+          <div class="mid-honba">--</div>
+        </div>
+      </div>
+      <div class="pond pond--top" id="pond-top"></div>
+      <div class="pond pond--right" id="pond-right"></div>
+      <div class="pond pond--bottom" id="pond-bottom"></div>
+      <div class="pond pond--left" id="pond-left"></div>
+      <div class="hand hand--top" id="hand-top"></div>
+      <div class="hand hand--left" id="hand-left"></div>
+      <div class="hand hand--right" id="hand-right"></div>
+      <div class="hand hand--bottom" id="hand-bottom"></div>
+      <div class="melds melds--top" id="melds-top"></div>
+      <div class="melds melds--left" id="melds-left"></div>
+      <div class="melds melds--right" id="melds-right"></div>
+      <div class="melds melds--bottom" id="melds-bottom"></div>
+      <div class="kita kita--top" id="kita-top"></div>
+      <div class="kita kita--left" id="kita-left"></div>
+      <div class="kita kita--right" id="kita-right"></div>
+      <div class="kita kita--bottom" id="kita-bottom"></div>
+    </div>
+  </div>
+
+  <aside id="side">
+    <section class="card"><div class="card__hd">对局信息</div><div class="card__bd" id="info"></div></section>
+    <section class="card"><div class="card__hd">牌局日志</div><div class="card__bd" id="log"></div></section>
+    <section class="card">
+      <div class="card__hd">聊天</div><div class="card__bd" id="chat"></div>
+      <div class="chat__bar">
+        <input id="chatinput" maxlength="60" placeholder="说点什么…" />
+        <button id="chatsend">发送</button>
+      </div>
+    </section>
+  </aside>
+</div>
+
+<script src="/table/table.js"></script>
+<script src="/table/page.js"></script>
+<script>
+/* 直播页：连上就找一桌**纯 AI** 观战（没有就自己开一桌，房主自动变观战者）。
+ * 只有纯 AI 房服务端才给全亮 —— 别家的手牌在协议层就是 null。
+ *   ?room=XXXX  看指定房间      ?p=3 / ?p=4  没人头合适的房就自己开一桌
+ */
+(() => {
+  const qs = new URLSearchParams(location.search);
+  const want = Number(qs.get("p") || 0);
+  const wantRoom = (qs.get("room") || "").trim().toUpperCase();
+  let asked = false;
+
+  const page = majPage({
+    name: "直播",
+    onHello: (lobby) => pick(lobby),
+    onLobby: (lobby) => pick(lobby),
+    onState: (st) => {
+      const dirs = renderState(st, -1);
+      page.say(
+        "房间 <b>" + (st.room ? st.room.id : "?") + "</b> · " +
+        (st.room ? st.room.name : "") + " · <b>" + st.seats.length + " 人</b> · 第 " +
+        ((st.round && st.round.hand_no) || 1) + " 局 · 观战 " + (st.spectator_count || 0) +
+        " 人　<a href='?p=" + (st.seats.length === 3 ? 4 : 3) + "'>看" +
+        (st.seats.length === 3 ? "四麻" : "三麻") + "</a>"
+      );
+      void dirs;
+    },
+  });
+
+  function pick(lobby) {
+    if (asked) return;
+    asked = true;
+    const rooms = (lobby && lobby.rooms) || [];
+    const pure = (r) => r.ais === r.players && r.humans === 0;
+    const n = want === 3 || want === 4 ? want : 0;
+    const hit = (wantRoom && rooms.find((r) => r.id === wantRoom)) ||
+                rooms.find((r) => pure(r) && (!n || r.players === n));
+    if (hit) {
+      page.say("观战房间 <b>" + hit.id + "</b>（" + hit.players + " 人）");
+      page.spectate(hit.id);
+      return;
+    }
+    // 没有现成的：自己开一桌纯 AI（第 0 格也标 ai，房主才自动变观战者）
+    const players = n || 3;
+    const usable = ((lobby && lobby.models) || [])
+      .filter((m) => m.players === players && m.usable).map((m) => m.name);
+    page.say("没有可看的房间，开一桌 " + players + " 人纯 AI…");
+    page.create({
+      name: players === 3 ? "直播三麻" : "直播四麻",
+      players, rounds: 0, ai_delay: 0.8,
+      seats: Array.from({ length: players }, (_, i) => ({
+        kind: "ai", ai: usable.length ? usable[i % usable.length] : "teacher",
+      })),
+      spectator_reveal: true, autostart: true,
+    });
+  }
+
+  page.connect();
+  window.__page = page;      // 自检脚本（_dbg_live.py）靠它读服务端快照
+})();
+</script>
+</body>
+</html>
