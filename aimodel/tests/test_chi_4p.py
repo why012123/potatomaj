@@ -25,7 +25,7 @@ from aimodel import sanma as S  # noqa: E402
 from aimodel.agents import (  # noqa: E402
     STYLES, HeuristicAgent, MLAgent, TeacherStyle,
 )
-from aimodel.encode import HEAD_SIZE, action_index, action_mask  # noqa: E402
+from aimodel.encode import HEAD_SIZE, action_index, action_mask, layout_for  # noqa: E402
 from aimodel.engine import ACTION_TABLE, Decision, Game, View  # noqa: E402
 from aimodel.net import KINDS, Net  # noqa: E402
 from aimodel.train import RecordingAgent  # noqa: E402
@@ -172,14 +172,14 @@ def main() -> int:
     print("\n== MLAgent 的兜底教师必须跟着风格走 ==")
     # 老代码恒为 HeuristicAgent(seed)（normal）-> flash/huge 的吃牌规则
     # 和 normal 一模一样。这里直接看兜底教师拿到了什么 style。
-    net = Net(dim=560, hidden=(8,), seed=0)
+    net = Net(dim=layout_for(4)[1], hidden=(8,), seed=0)
     for name in STYLES:
         ag = MLAgent(net, seed=0, style=name)
         check(getattr(ag.fallback, "style", None) == STYLES[name],
               f"style={name} 的 MLAgent 兜底教师应是 {name}，得到 "
               f"{getattr(getattr(ag.fallback, 'style', None), 'name', None)}")
     # 端到端：网络没有 chi 头 -> 走兜底 -> 兜底必须按风格回答
-    old_net = Net(dim=560, hidden=(8,), seed=0)
+    old_net = Net(dim=layout_for(4)[1], hidden=(8,), seed=0)
     old_net.kinds = [k for k in KINDS if k != "chi"]
     # 选项顺序是 ACTION_TABLE["chi"] = ("pass", "chi")：index 1 = 吃。
     # 老代码 HeuristicAgent.decide 把它写反了（`0 if _want_chi else 1`），
@@ -218,7 +218,7 @@ def main() -> int:
     check(mm.tolist() == [1.0, 1.0], f"逐吃法选项的掩码应是 [1,1]，得到 {mm.tolist()}")
     check(action_index(dm, 1) == 1 and action_index(dm, 2) == 1,
           "逐吃法选项都应映射到 chi 头（下标 1）")
-    probe = MLAgent(Net(dim=560, hidden=(8,), seed=0), seed=0)
+    probe = MLAgent(Net(dim=layout_for(4)[1], hidden=(8,), seed=0), seed=0)
     check(probe._head_to_option(dm, 1) == 1,
           "head=1 必须映射到第一个吃法选项，不能静默变成 0（pass）")
     print("  ✅ chi 掩码 2 维 / 下标映射正确（含逐吃法写法）")
@@ -271,7 +271,7 @@ def main() -> int:
     print("\n== l2 必须存档并恢复（P0-4，与加头同批改动）==")
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "l2.npz"
-        n1 = Net(dim=560, hidden=(8,), seed=0, lr=3e-4, l2=1e-3)
+        n1 = Net(dim=layout_for(4)[1], hidden=(8,), seed=0, lr=3e-4, l2=1e-3)
         n1.save(p)
         n2 = Net.load(p)
         check(abs(n2.l2 - 1e-3) < 1e-12, f"l2 应恢复为 1e-3，得到 {n2.l2}")

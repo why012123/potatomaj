@@ -208,7 +208,8 @@ class FullInfoAgent(Agent):
         head = action_index(decision, choice)
 
         # inputs: exactly what this seat may see
-        self._note("X", encode(view))
+        _enc_view = getattr(self.inner, "encode_view", None)
+        self._note("X", _enc_view(view) if _enc_view is not None else encode(view))
         self._note("kind", kind)
         self._note("action", head)
         self._note("turn", view.turn)
@@ -224,7 +225,8 @@ class FullInfoAgent(Agent):
         self._note("shanten_all", shanten_all)
 
         if kind == DISCARD:
-            af = action_features(view)
+            _af_of = getattr(self.inner, "action_features_of", None)
+            af = _af_of(view) if _af_of is not None else action_features(view)
             self._note("actfeat", af)
             # per-tile danger for everything in hand
             d_all = np.zeros(34, dtype=np.int8)

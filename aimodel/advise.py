@@ -32,7 +32,8 @@ import numpy as np
 
 from . import sanma as S
 from .agents import HeuristicAgent
-from .encode import action_features, action_mask, encode
+from .encode import action_mask
+from .feature_dispatch import action_features_for, encode_for
 from .engine import Decision, View
 from .fastshanten import shanten, ukeire, useful_tiles
 from .net import Net
@@ -126,7 +127,9 @@ def suggest(view: View, net: Net | None, topk: int = 3) -> list[tuple[str, float
     mask = action_mask(decision)
     if net is None:
         return []
-    p = net.policy(encode(view), "discard", mask, action_features(view))
+    _dim = int(getattr(net, "dim", 0) or 0)
+    p = net.policy(encode_for(_dim, view.rule.players, view), "discard", mask,
+                   action_features_for(_dim, view.rule.players, view))
     order = np.argsort(-p)[:topk]
     return [(S.tile_cn(int(t)), float(p[int(t)])) for t in order if p[int(t)] > 1e-6]
 

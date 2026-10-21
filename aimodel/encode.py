@@ -68,6 +68,12 @@ def feature_blocks(players: int = 3) -> list[tuple[str, int]]:
         ("meld_count", players), ("seat_onehot", players), ("round_wind", 2),
         ("is_dealer", 1), ("menzen", 1), ("safe_exit", 1), ("tenpai", 1),
     ]
+    # -- 2026-10-21 追加的三块（**只加在末尾** -> 已有块的 offset/宽度完全不变）
+    # ``match_state`` 统一 17 维（三麻/四麻同宽，缺的项补 0）；
+    # ``called_tile`` = 当前决策被叫/被和的那张牌 one-hot；
+    # ``last_discard`` = 场上最近一次被打出的牌 one-hot。
+    # 逐维含义见 :func:`encode` 里 ``match_state`` 的注释。
+    blocks += [("match_state", 17), ("called_tile", 34), ("last_discard", 34)]
     return blocks
 
 
@@ -95,10 +101,20 @@ DIM = layout_for(3)[1]
 
 
 def visible_counts(view: View) -> list[int]:
-    """从该玩家视角能看到的每一种牌各有几张（含自己手牌）。"""
+    """从该玩家视角能看到的每一种牌各有几张（含自己手牌）。
+
+    ⚠️ **自己那一份只能加一次**（2026-10-21 修的 bug）：
+    旧实现先 ``for m in view.melds`` 加自己的副露，随后
+    ``for p in range(n): for m in view.melds_all[p]`` 又加一遍
+    （``melds_all[player]`` 就是自己的副露）-> 自己碰的 5s 被算成 6 张。
+    拔北同理：先 ``kita[player]``、再遍历所有 ``kita[p]`` -> 自己的北算两遍。
+    这会让 ``visible`` / ``ukeire`` / ``safe_exit`` 全部偏小（剩余枚数少算），
+    带副露或拔北的局面尤其严重。
+    """
     vis = [0] * 34
     for i in range(34):
         vis[i] = view.hand[i]
+    #: 自己的副露（只在这里加一次）
     for m in view.melds:
         # 注意：吃是顺子，要把三张**不同的**牌分别记上，
         # 不能拿 start 那张加 3（之前的 bug）
@@ -108,14 +124,18 @@ def visible_counts(view: View) -> list[int]:
     for p in range(n):
         for t in view.discards[p]:
             vis[t] += 1
+        if p == view.player:
+            continue  # 自己的副露上面已经加过，别重复
         for m in view.melds_all[p]:
             for t in m.tiles:
                 vis[t] += 1
     for d in view.dora_indicators:
         vis[d] += 1
+    #: 拔北：自己的只加一次，别家的在这里补（旧代码自己的加了两遍）
     vis[S.NORTH] += view.kita[view.player]
-    for p in range(len(view.kita)):
-        vis[S.NORTH] += view.kita[p]
+    kitas = list(view.kita)
+    kitas[view.player] = 0
+    vis[S.NORTH] += sum(kitas)
     return vis
 
 
@@ -475,6 +495,76 @@ def encode(view: View) -> np.ndarray:
         x[O["safe_exit"]] = min(
             (tile_danger(view, t, vis=vis) for t in range(34) if hand[t] > 0), default=0.0
         )
+
+    # ------------------------------------------------------------------
+    # 整场状态（match_state，17 维，三麻/四麻同宽）
+    # ------------------------------------------------------------------
+    # 0      honba/4                       (clip 0..1)
+    # 1      (kyoku-1)/7                   (clip 0..1)
+    # 2..5   kyoku one-hot 4               (东1..东4 -> 2..5；kyoku>4（南入）全 0)
+    # 6      kyotaku/3                     (clip 0..1)
+    # 7      dealer_repeat                 (0/1)
+    # 8      hands_left/8                  (clip 0..1)
+    # 9      furiten                       (0/1)
+    # 10..13 rank one-hot 4                (rank==1 -> 10 ... rank==4 -> 13；缺失/0 全 0)
+    # 14     自己牌河摸切占比              (自己 pond 空则 0)
+    # 15     自己最近一张打出的是否摸切    (没打过则 0)
+    # 16     (自己点数 - 场上最高)/50000   (clip -1..1)
+    #
+    # 用 getattr 兜底：``View`` 的新字段都有默认值，但如果调用方传的是
+    # 鸭子类型的旧对象（外部/回放），这里也不会炸，缺的项就是 0。
+    ms = O["match_state"]
+    honba = int(getattr(view, "honba", 0) or 0)
+    x[ms + 0] = min(max(honba, 0), 4) / 4.0
+
+    kyoku = int(getattr(view, "kyoku", 1) or 1)
+    x[ms + 1] = min(max(kyoku - 1, 0), 7) / 7.0
+    if 1 <= kyoku <= 4:
+        x[ms + 2 + (kyoku - 1)] = 1.0
+
+    kyotaku = int(getattr(view, "kyotaku", 0) or 0)
+    x[ms + 6] = min(max(kyotaku, 0), 3) / 3.0
+    x[ms + 7] = 1.0 if getattr(view, "dealer_repeat", False) else 0.0
+
+    hands_left = int(getattr(view, "hands_left", 0) or 0)
+    x[ms + 8] = min(max(hands_left, 0), 8) / 8.0
+    x[ms + 9] = 1.0 if getattr(view, "furiten", False) else 0.0
+
+    ranks = tuple(getattr(view, "ranks", ()) or ())
+    rank = int(ranks[view.player]) if view.player < len(ranks) else 0
+    if 1 <= rank <= 4:          # rank 0 / 缺失 -> 全 0（老 View 兼容）
+        x[ms + 10 + (rank - 1)] = 1.0
+
+    tsumogiri = tuple(getattr(view, "tsumogiri", ()) or ())
+    own_tsumogiri = tsumogiri[view.player] if view.player < len(tsumogiri) else ()
+    if own_tsumogiri:
+        x[ms + 14] = sum(1 for v in own_tsumogiri if v) / len(own_tsumogiri)
+        x[ms + 15] = 1.0 if own_tsumogiri[-1] else 0.0
+
+    if view.player < len(view.scores) and view.scores:
+        diff = (view.scores[view.player] - max(view.scores)) / 50000.0
+        x[ms + 16] = min(max(diff, -1.0), 1.0)
+
+    # ------------------------------------------------------------------
+    # called_tile：当前决策「被叫 / 被和」的那张牌 one-hot
+    # ------------------------------------------------------------------
+    # 非鸣牌/荣和决策（摸打 / 立直 / 自摸 / 暗杠 / 拔北）由 engine 置 None -> 全 0。
+    # 吃碰时 decision.tile 就是别人打出的那张，敌我都看得见，不构成信息泄漏。
+    called = getattr(view, "called_tile", None)
+    if called is not None:
+        t = int(called)
+        if 0 <= t < 34:
+            x[O["called_tile"] + t] = 1.0
+
+    # ------------------------------------------------------------------
+    # last_discard：场上最近一次被打出的牌 one-hot
+    # ------------------------------------------------------------------
+    # 只取牌型；打牌者身份不在这里重复编码（turn / scores / 牌河已有）。
+    last = getattr(view, "last_discard", None)
+    if last is not None:
+        t = int(last[1])
+        if 0 <= t < 34:
+            x[O["last_discard"] + t] = 1.0
     return x
 
 
@@ -494,7 +584,7 @@ def encode(view: View) -> np.ndarray:
 # 关于牌 t 的值。通道含义见 :data:`ENCODE_V2_CHANNELS`（顺序即行号）。
 
 #: ``(C, 34)`` 里每个通道的含义，**顺序即通道号**。
-#: 写进这里是为了让下一个人不用对着 (16, 34) 猜哪个通道是什么。
+#: 写进这里是为了让下一个人不用对着 (18, 34) 猜哪个通道是什么。
 ENCODE_V2_CHANNELS: tuple[str, ...] = (
     "hand",            # 自己的手牌计数 /4
     "hand_onehot",     # 手上有这张（>=1）
@@ -512,10 +602,12 @@ ENCODE_V2_CHANNELS: tuple[str, ...] = (
     "dora_indicator",  # 宝牌**指示**牌 one-hot
     "dora_tile",       # 宝牌 one-hot
     "yakuhai",         # 见下方 note：这不是逐张牌的项，占位保留以便对齐
+    "called_tile",     # 当前决策被叫/被和的那张牌 one-hot（非鸣牌/荣和全 0）
+    "last_discard",    # 场上最近一次被打出的牌 one-hot（没有则全 0）
 )
 
 #: 三麻只有 3 家，`opp3_*` 两个通道恒为 0。
-#: **这是有意的**：通道数固定成 16，三麻/四麻用同一套网络结构，
+#: **这是有意的**：通道数固定成 18，三麻/四麻用同一套网络结构，
 #: 免得再加一个「按人数分叉」的维度（加头/加维都会搞挂存量权重，踩过）。
 
 

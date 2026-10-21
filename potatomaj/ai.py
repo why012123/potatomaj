@@ -266,7 +266,8 @@ def rank(
     概率是**同一手牌内部的相对好坏**（softmax，和恒为 1），可以直接横向比较。
     """
     from aimodel import sanma as S
-    from aimodel.encode import action_features, action_mask, encode
+    from aimodel.encode import action_mask
+    from aimodel.feature_dispatch import action_features_for, encode_for
     from aimodel.engine import Decision
 
     n = 3 if players == 3 else 4
@@ -305,9 +306,12 @@ def rank(
             out[name] = (v - lo) / span       # 0~1，越大越好
         return out, ""
 
-    p = net(n).policy(
-        encode(view), "discard", action_mask(Decision("discard", options)),
-        action_features(view))
+    _net = net(n)
+    _dim = int(getattr(_net, "dim", 0) or 0)
+    p = _net.policy(
+        encode_for(_dim, view.rule.players, view), "discard",
+        action_mask(Decision("discard", options)),
+        action_features_for(_dim, view.rule.players, view))
 
     # 网络按 34 种牌输出，而手里可能拿着赤 5（0m/0p/0s）—— 映射回手里实际那张
     have: dict[str, str] = {}

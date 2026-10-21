@@ -6,7 +6,8 @@
     scalar (S,)      跟具体哪张牌无关的项（向听 / 巡目 / 点数 / 立直标记 …）
 
 约定（和 Mac 定死的四条约束）：
-* **不动老 `encode()`** —— 存量权重还在用 486/560 维，新旧并存
+* **不改已有块** —— 存量权重仍在用老布局；新块只追加在末尾（2026-10-21：
+  追加 match_state 17 / called_tile 34 / last_discard 34 -> 三麻 571、四麻 645）
 * **不加决策头** —— 加头把存量权重搞挂过一次
 * `view.kita` 是**每家的长度 n**，不是 34（这里会专门测这条）
 * 张量轴序 `(通道, 34)`，通道含义写进 `ENCODE_V2_CHANNELS` 的 docstring
@@ -81,9 +82,14 @@ for p in (3, 4):
           f"!= DIM {dim} —— v2 必须无重叠无遗漏地覆盖整个 encode()")
     print(f"  {p} 麻：{len(present)} 个逐张牌通道 + 标量 {ENCODE_V2_SCALAR_DIM[p]} 维"
           f" = {dim} 维 ✓")
-check(len([n for n in names if n not in ("yakuhai",)]) == 15,
-      "通道表里应有 15 个「可能真实存在」的逐张牌通道 + 1 个占位"
-      "（四麻 15 个全在；三麻少 opp3_* 两个 -> 12 个）")
+check(
+    # 2026-10-21：布局末尾追加了 match_state / called_tile / last_discard，
+    # 所以这里**不能写死 15** —— 按 feature_blocks 现算，并顺带钉住
+    # 「通道表恰好覆盖所有逐张牌块（yakuhai 占位除外）」这条不变量。
+    set(ENCODE_V2_CHANNELS) - {"yakuhai"}
+    == {n for n, w in feature_blocks(4) if w == 34 and n != "yakuhai"},
+    "通道表必须恰好覆盖所有「宽 34 且逐张牌」的块（yakuhai 是占位、不进 tile）",
+)
 
 print("\n== 逐通道等价：v2 必须能无损重建 encode() ==")
 bad_total = 0
@@ -181,9 +187,11 @@ from aimodel.encode import HEAD_SIZE  # noqa: E402
 check(set(HEAD_SIZE) == {"discard", "tsumo", "ron", "riichi", "call", "chi",
                          "kita", "kan", "kyuushu"},
       f"决策头集合不能变（加头会搞挂存量权重），得到 {sorted(HEAD_SIZE)}")
-check(encode(v4).shape == (560,), f"四麻 encode() 仍应是 560 维，得到 {encode(v4).shape}")
-check(encode(v3).shape == (486,), f"三麻 encode() 仍应是 486 维，得到 {encode(v3).shape}")
-print("  ✅ 决策头 9 个未变；老 encode() 仍是 486/560")
+check(encode(v4).shape == (layout_for(4)[1],),
+      f"四麻 encode() 维度应等于布局 {layout_for(4)[1]}，得到 {encode(v4).shape}")
+check(encode(v3).shape == (layout_for(3)[1],),
+      f"三麻 encode() 维度应等于布局 {layout_for(3)[1]}，得到 {encode(v3).shape}")
+print("  ✅ 决策头 9 个未变；encode() 维度 = layout_for(人数)")
 
 if FAILED:
     print(f"\n❌ {len(FAILED)} 条失败")

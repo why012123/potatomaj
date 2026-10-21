@@ -119,6 +119,25 @@ def main(argv: list[str] | None = None) -> None:
     r_dim, r_hid, r_steps = read_meta(ref)
     print(f"参考模型：{ref}  dim={r_dim} hidden=[{r_hid}] steps={r_steps}", flush=True)
 
+    # 数据集的维度（mmap，不真读进来）。参考模型可能是**旧布局**（例如线上
+    # mac_rl 是 560 维），而这次训的是新布局（645 维）：两者不能同架构比较，
+    # 但配对赛仍然完全可比 —— 每个 agent 按自己 net.dim 选配套 encoder。
+    try:
+        import numpy as _np
+
+        data_dim = int(_np.load(args.bc_data, mmap_mode="r")["X"].shape[1])
+    except Exception:  # noqa: BLE001
+        data_dim = r_dim
+    cross_layout = data_dim != r_dim
+    if cross_layout:
+        print(
+            f"⚠️ 参考模型是 {r_dim} 维、数据集是 {data_dim} 维（跨布局）\n"
+            f"   -> 架构一致性改为「**各种子之间**一致」；配对赛仍与 {ref.name} 对比 "
+            f"（各自用配套 encoder，可比 ✓）",
+            flush=True,
+        )
+    arch_ref: tuple[int, str] | None = None
+
     configs = [float(x) for x in args.configs.split(",") if x.strip()]
     seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
     outdir = Path(args.outdir)
@@ -151,9 +170,16 @@ def main(argv: list[str] | None = None) -> None:
                     logpath=outdir / f"{tag}.stdout",
                 )
             g_dim, g_hid, g_steps = read_meta(ckpt)
-            if (g_dim, g_hid) != (r_dim, r_hid):
-                fail(f"{tag} 架构与参考不一致：dim={g_dim} hidden=[{g_hid}] —— 不能比")
-            print(f"    ✅ 架构一致 dim={g_dim} hidden=[{g_hid}] steps={g_steps}", flush=True)
+            if cross_layout:
+                if arch_ref is None:
+                    arch_ref = (g_dim, g_hid)
+                if (g_dim, g_hid) != arch_ref:
+                    fail(f"{tag} 架构与其它种子不一致：dim={g_dim} hidden=[{g_hid}] —— 不能比")
+                print(f"    ✅ 架构一致（种子间）dim={g_dim} hidden=[{g_hid}] steps={g_steps}", flush=True)
+            else:
+                if (g_dim, g_hid) != (r_dim, r_hid):
+                    fail(f"{tag} 架构与参考不一致：dim={g_dim} hidden=[{g_hid}] —— 不能比")
+                print(f"    ✅ 架构一致 dim={g_dim} hidden=[{g_hid}] steps={g_steps}", flush=True)
 
             out = run(
                 [
