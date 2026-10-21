@@ -264,9 +264,12 @@ def main(argv: list[str] | None = None) -> int:
             problems, res = extract_kyoku(kyoku, tracker, args.players, rule)
             if problems > args.max_faithful_problems:
                 # Diverged: undo the recording for this kyoku and move on.
+                # ⚠️ 这里必须列**全部**并行列表 ✗ 漏一个就会长度错位 ✗
+                #   2026-10-21 实测：漏了 `chipats` -> 丢弃的局把它留下 ✗
+                #   于是 chipat 比 X 长 854 条、非 chi 行也带 0/1、填充率只有 8.5% ✗
                 for lst in (tracker.kinds, tracker.X, tracker.masks, tracker.actions,
                             tracker.logps, tracker.players, tracker.labels,
-                            tracker.actfeats):
+                            tracker.actfeats, tracker.chipats):
                     del lst[start_idx:]
                 n_dropped += 1
                 continue
