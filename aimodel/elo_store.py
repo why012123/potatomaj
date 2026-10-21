@@ -38,6 +38,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,7 +46,8 @@ from typing import Any, Callable, Iterable
 
 ROOT = Path(__file__).resolve().parent.parent
 #: 全部 ELO 数据的根。**已被 .gitignore 的 ``_data/`` 覆盖** ✓
-DATA_DIR = ROOT / "_data" / "elo"
+#: ``$POTATOMAJ_ELO_DIR`` 可以把它指到独立目录（小样验证绝不碰生产数据 ✓）
+DATA_DIR = Path(os.environ.get("POTATOMAJ_ELO_DIR") or (ROOT / "_data" / "elo"))
 SEASONS_DIR = DATA_DIR / "seasons"
 SCORES_DIR = DATA_DIR / "scores"
 
@@ -54,6 +56,24 @@ KEEP_DAYS = 3
 
 #: 每一局记录的字段（顺序固定，写 JSONL 时用 separators 省空间）
 MATCH_FIELDS = ("seed", "players", "group", "ranks", "scores")
+#: 含外部 AI 的局才有的**可选**标记字段（老局没有这些键，老行为不变 ✓）
+#:
+#: 为什么必须存：Mortal 不是我们引擎里的确定性模型，**回放不能靠重跑**。
+#: 标记之后 ``replay`` 会明确说「这一局不可重放」，而不是跑出一个错的对局。
+OPTIONAL_MATCH_FIELDS = (
+    "external",          #: True = 这一局有外部 AI 参战
+    "external_failed",   #: 外部进程在本局崩过/超时/非法动作 -> 该座位降级教师
+    "external_specs",    #: 外部 AI 的 spec key，如 ["mortal-akagi"]
+    "external_seats",    #: 外部位座位下标，如 [2]
+)
+
+
+class ReplayUnsupported(RuntimeError):
+    """这一局不能靠「同种子重跑」复现（含外部 AI）。"""
+
+
+class ExternalMatchNotReplayable(ReplayUnsupported):
+    """含外部参战者的局：明确拒绝回放（不静默跑错）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +387,15 @@ def list_seasons() -> list[Season]:
 
 
 def append_match(s: Season, match: dict[str, Any]) -> None:
-    """追加一局。只取 :data:`MATCH_FIELDS`，其余丢掉（省空间）。"""
+    """追加一局。老字段固定；含外部 AI 时额外带 :data:`OPTIONAL_MATCH_FIELDS`。
+
+    ⚠️ 可选字段只在**调用方给了**才写 —— 不含外部 AI 的局仍然只有 5 个键，
+    老的 ``matches.jsonl`` / 老测试全部不受影响 ✓
+    """
     rec = {k: match[k] for k in MATCH_FIELDS if k in match}
+    for k in OPTIONAL_MATCH_FIELDS:
+        if k in match:
+            rec[k] = match[k]
     if "seed" not in rec or "group" not in rec:
         raise ValueError("记录一局至少要有 seed 和 group")
     s.dir.mkdir(parents=True, exist_ok=True)
@@ -414,9 +441,25 @@ def replay(match: dict, *, on_action: Callable[[dict], None] | None = None):
     （例如 ``"maj-flashv1.2#2"``）。**顺序必须保持原样** ——
     因为每个 AI 的种子是 ``seed*players + i``，换顺序就换牌。
 
+    ⚠️ **含外部 AI 的局不能重放** ✗：Mortal 是外部进程，不是我们引擎里的
+    确定性模型，同一串事件不保证同一个动作（还可能崩）。这种局在
+    ``matches.jsonl`` 里带 ``external=true``；这里**明确抛**
+    :class:`ExternalMatchNotReplayable`，让调用方提示「不可重放」，
+    **绝不**拿重跑出来的假对局冒充存档 ✓
+
     返回 ``(actions, result)``：``actions`` 是动作列表（每项含 kind/actor/…），
     ``result`` 是引擎的 ``MatchResult``。
     """
+    if match.get("external"):
+        specs = match.get("external_specs") or []
+        seats = match.get("external_seats") or []
+        raise ExternalMatchNotReplayable(
+            "这一局含外部 AI"
+            + (f"（{', '.join(map(str, specs))}）" if specs else "")
+            + (f"，座位 {seats}" if seats else "")
+            + "，外部进程不是确定性模型，无法用「同种子重跑」回放；"
+            "请在期列表里跳过这一局（matches.jsonl 已标记 external=true）"
+        )
     from aimodel.agents import HeuristicAgent, MLAgent, RandomAgent
     from aimodel.engine import Game
     from aimodel.net import Net
@@ -464,6 +507,10 @@ def _kind_and_source(name: str) -> tuple[str, str]:
        —— 这个 bug 是 ``test_elo_store.py`` 抓出来的 ✓ 代价是含基线的对局一律回放不了 ✗
     """
     low = name.lower()
+    if low.startswith("external:") or low.startswith("external_") \
+            or low.startswith("ext:"):
+        raise ExternalMatchNotReplayable(
+            f"参战者 {name!r} 是外部 AI，无法用种子重放")
     if low.startswith("teacher"):
         return "teacher", ""
     if low.startswith("random"):

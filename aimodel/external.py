@@ -162,6 +162,11 @@ class ExternalSpec:
     #: 每一局开始都重启进程。用于不认 ``can_act`` 的 bot（manue）：上一局
     #: 迟到的动作会污染下一局的第一手（实测：它想打上一局摸到的 8s）。
     restart_each_hand: bool = False
+    #: 同一进程能否打多场：True 时 :meth:`ExternalMJaiAgent.begin_game` 会
+    #: 再发一个 ``start_game`` 重置（不杀进程）。Mortal 明确支持
+    #: 「start_game can be sent any time to reset the bot」。
+    #: 天梯用它把「每场重启一次 torch/libriichi」的 ~2s 省掉。
+    reuse_process: bool = False
     #: 给前端/文档的一句话
     note: str = ""
 
@@ -177,6 +182,7 @@ SPECS: dict[str, ExternalSpec] = {
         command=("python3", "mortal.py", "{player_id}"),
         cwd=EXTERNAL_DIR / "Mortal" / "mortal",
         needs_files=("mortal.py",),
+        reuse_process=True,
         install=(
             "git clone https://github.com/Equim-chan/Mortal && "
             "cargo build -p libriichi --lib --release && "
@@ -250,6 +256,7 @@ SPECS: dict[str, ExternalSpec] = {
         cwd=EXTERNAL_DIR / "Akagi-MjaiBot-Mortal",
         needs_files=("bot.py", "mortal.pth"),
         batch_events=True,
+        reuse_process=True,
         install=(
             "下载 Akagi-MjaiBot-Mortal 的 release zip，解压到 "
             "_data/external/Akagi-MjaiBot-Mortal；需要 Python 3.12 + torch"
@@ -799,11 +806,85 @@ class ExternalMJaiAgent(Agent):
                          name=f"ext-{self.spec.key}-err", daemon=True).start()
         self._started = True
         _LIVE.add(self)
-        start = {"type": "start_game", "id": self.player_id,
-                 "names": [f"P{i}" for i in range(self.players)]}
+        start = self._start_event()
         if self.batch_events:
             self._write_batch([start])
             # Akagi 的 bot 对 start_game 会回一行 none；等它，保证后面的读一 一对应
+            self._read_action(self.start_timeout, allow_none=True)
+        else:
+            self._write_one(start)
+
+    def _start_event(self) -> dict:
+        return {"type": "start_game", "id": self.player_id,
+                "names": [f"P{i}" for i in range(self.players)]}
+
+    def _reset_for_new_game(self) -> None:
+        """清掉「这一场」的协议状态（**不碰累计统计**、不重启进程）。"""
+        self._hand_open = False
+        self._hand_events = []
+        self._outbox = []
+        self._hand_no = 0
+        self._kyoku = 1
+        self._honba = 0
+        self._prev_dealer = None
+        self._prev_wind = None
+        self._dora_sent = 1
+        self._riichi_pending = [False] * 4
+        self._pending_action = None
+        self._discard_key = None
+        self._discard_seq = 0
+        self._discard_response = None
+        self._discard_response_key = None
+        self._last_draw = [None] * 4
+        self._last_raw_action = None
+
+    def _drain_queue(self) -> int:
+        """把 stdout 队列里上一场残留的动作丢掉（返回丢了几条）。"""
+        n = 0
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+            n += 1
+        return n
+
+    def begin_game(self, *, player_id: int | None = None,
+                   seed: int | None = None) -> None:
+        """在**同一个进程**里开始新的一场：再发一个 ``start_game`` 重置。
+
+        Mortal 的文档明确支持「start_game can be sent any time to reset the bot」，
+        因此天梯可以复用进程，省掉每场启动 torch/libriichi 的 ~2 秒。
+        只有 ``spec.reuse_process=True`` 的外部 AI 允许这样做；其它 bot
+        （比如 manue）请 ``close()`` 之后重新构造。
+
+        ``player_id`` 可以换 —— 天梯里同一个 Mortal 每场的座位不同，
+        mjai 的座位号写在 ``start_game`` 里，重发一次就等于换座。
+        """
+        if self._closed:
+            raise ExternalAIError(f"{self.name} 已经 close()")
+        if not self.spec.reuse_process:
+            raise ExternalAIError(
+                f"{self.name} 不支持在同一进程里开新的一场"
+                f"（{self.spec.key} 的 reuse_process=False）；请 close() 后重建"
+            )
+        if player_id is not None:
+            pid = int(player_id)
+            if not (0 <= pid < self.players):
+                raise ValueError(f"player_id={pid} 不在 0..{self.players - 1}")
+            self.player_id = pid
+        if seed is not None:
+            self.seed = int(seed)
+        if self._proc is None or self._proc.poll() is not None or not self._started:
+            self._start()
+            self._reset_for_new_game()
+            return
+        self._drain_queue()
+        self._reset_for_new_game()
+        start = self._start_event()
+        if self.batch_events:
+            self._write_batch([start])
+            # Akagi 的 bot 回一行 none；读掉它，否则会污染下一次决策
             self._read_action(self.start_timeout, allow_none=True)
         else:
             self._write_one(start)
@@ -1311,10 +1392,28 @@ class ExternalMJaiAgent(Agent):
         # dora/end_kyoku 之类不能算触发（否则 can_act=false 会把真正的
         # tsumo 也压掉，外部 AI 一行都不吐 -> 超时）。
         trigger = _last_trigger_index(events)
+        if trigger < 0 and expect_action:
+            # 决策来了却没有任何触发事件 —— 这是事件流没接上，不能静默发空批。
+            # 把事件放回去，让下一轮再试。
+            self._outbox = events
+            raise ExternalAIProtocolError(
+                f"{self.name} 要决策，但事件流里没有能触发的动作："
+                f"{[e.get('type') for e in events[-8:]]}；"
+                f"确认 external.attach(game) 已调用"
+            )
+        # ⚠️ **触发事件之后的事件要留到下一批** ✗
+        #    Akagi 的 Mortal bot 一行一批、**只返回最后一个事件的回应**。
+        #    如果同一批里触发事件后面还有 dora/end_kyoku，bot 对它们回 none，
+        #    最后一行就变成 none —— 真实踩过：杠后 `tsumo 7s` + `dora 7m`
+        #    一批，Mortal 本来打 7s，结果把 `none` 当成打牌 → 降级教师 ✗
+        #    （实测 seed 20261022/23/24 三个都这样，seed 20261021 没杠所以没触发）
+        tail = events[trigger + 1:] if trigger >= 0 else []
+        head = events[: trigger + 1] if trigger >= 0 else events
+        self._outbox = list(tail)
         if self.batch_events:
             # Akagi 的 Mortal bot：一行一个 JSON 数组，整批只回一行。
             payload = []
-            for i, ev in enumerate(events):
+            for i, ev in enumerate(head):
                 e = dict(ev)
                 if i != trigger:
                     e["can_act"] = False
@@ -1325,7 +1424,7 @@ class ExternalMJaiAgent(Agent):
             return self._read_action(self.timeout, allow_none=True)
         # 标准 stdio：一行一个事件。非最后事件加 can_act=false（Mortal 会遵守；
         # manue 忽略它，所以后面还要 drain 到安静、取最后一条）。
-        for i, ev in enumerate(events):
+        for i, ev in enumerate(head):
             e = dict(ev)
             if i != trigger:
                 e["can_act"] = False
@@ -1680,12 +1779,15 @@ def make(spec: str, *, seed: int = 0, player_id: int = 0, players: int = 4,
 
 
 def attach(game: Any, agents: Iterable[Any] | None = None) -> list[ExternalMJaiAgent]:
-    """把 ``game.on_action`` 接到桌上的所有 :class:`ExternalMJaiAgent`。
+    """把 ``game.on_action`` 接到桌上的所有外部 agent。
 
-    只包一层，保留原来的 ``on_action``（比如平台的广播）。返回接上的 agent 列表。
+    认两种：:class:`ExternalMJaiAgent` 本身，以及天梯用的「崩溃隔离包装」
+    （带 ``external_agent = True`` 且有 ``feed`` 的座位）。只包一层，
+    保留原来的 ``on_action``（比如平台的广播）。返回接上的 agent 列表。
     """
     pool = list(agents if agents is not None else getattr(game, "agents", []) or [])
-    ext = [a for a in pool if isinstance(a, ExternalMJaiAgent)]
+    ext = [a for a in pool
+           if isinstance(a, ExternalMJaiAgent) or getattr(a, "external_agent", False)]
     if not ext:
         return []
     prev = getattr(game, "on_action", None)
@@ -1709,7 +1811,8 @@ def close_external(agents: Iterable[Any]) -> None:
     for a in agents:
         inner = getattr(a, "agent", a)
         ext = getattr(a, "_external", None)
-        if ext is None and isinstance(inner, ExternalMJaiAgent):
+        if ext is None and (isinstance(inner, ExternalMJaiAgent)
+                            or getattr(inner, "external_agent", False)):
             ext = inner
         if ext is not None:
             try:

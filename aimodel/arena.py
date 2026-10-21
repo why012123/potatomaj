@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -37,6 +39,40 @@ STATE_FILE = Path(__file__).resolve().parent / "arena_state.json"
 
 #: 参战者的来源：版本目录里的模型 + 两个内置基线
 BUILTIN = ("teacher", "random")
+
+#: 官方天梯里加外部参战者的配置开关（**默认不设 = 关闭** ✓）
+EXTERNAL_ENV = "POTATOMAJ_ARENA_EXTERNAL"
+EXTERNAL_TIMEOUT_ENV = "POTATOMAJ_ARENA_EXTERNAL_TIMEOUT"
+EXTERNAL_REUSE_ENV = "POTATOMAJ_ARENA_REUSE_EXTERNAL"
+
+
+def externals_from_env() -> list[str]:
+    """读 ``$POTATOMAJ_ARENA_EXTERNAL``（逗号 / 分号 / 空格分隔）。
+
+    默认没设这个变量 -> 返回空列表 -> 天梯阵容和以前**一模一样** ✓
+    """
+    raw = os.environ.get(EXTERNAL_ENV, "").strip()
+    if not raw:
+        return []
+    return [x for x in re.split(r"[,;\s]+", raw) if x]
+
+
+def normalize_externals(externals: str | list[str] | tuple[str, ...] | None) -> list[str]:
+    """把外部 AI 名字归一成 spec key；不认识的名字**明确报错**。"""
+    if not externals:
+        return []
+    if isinstance(externals, str):
+        externals = [externals]
+    out: list[str] = []
+    for raw in externals:
+        key = external.normalize_key(str(raw).strip())
+        if key is None:
+            raise ValueError(
+                f"不认识的外部 AI：{raw!r}；可用：{external.spec_help()}"
+            )
+        if key not in out:
+            out.append(key)
+    return out
 
 
 @dataclass
@@ -64,6 +100,18 @@ class Participant:
     external_failures: int = 0  #: 外部 AI 超时/崩溃/降级的次数（kind="external"）
     matches: list[dict] = field(default_factory=list)  #: 逐场明细（点开看战绩用）
     history: list[float] = field(default_factory=list)  #: 分数曲线
+    #: 外部参战者（Mortal 等）：spec key（``mortal-akagi``），空 = 不是外部
+    external: str = ""
+    external_games: int = 0  #: 外部进程上过桌的场数
+    external_failed: int = 0  #: 其中「崩了 / 超时 / 非法动作」的场数
+    external_errors: int = 0
+    external_timeouts: int = 0
+    external_crashes: int = 0
+    external_bad_actions: int = 0
+    external_last_error: str = ""
+    #: 启动时 ``external.check_spec`` 的结果（不启动进程；只用于「装没装」展示）
+    external_available: bool = True
+    external_reason: str = ""
 
     @property
     def alive(self) -> bool:
@@ -98,6 +146,203 @@ LOOSE_LABELS = {
     "policy_bc4": "bc4（纯克隆基线·5000局）",
     "policy": "policy（v1 早期·带强化学习）",
 }
+
+
+class ExternalSeatAgent(Agent):
+    """天梯里的一个**外部进程座位** —— 核心是「崩了也不许炸整期」。
+
+    设计上的三道保险：
+
+    1. :class:`~aimodel.external.ExternalMJaiAgent` 自己带 ``fallback``：
+       超时 / 进程退出 / 非法动作 -> 该座位当场改用教师出牌；
+    2. 这一层再包 ``try/except Exception``：连协议桥自己写错（IndexError 之类）
+       也只会让**这一局**降级，不会把异常抛进 ``Game.play()``；
+    3. 进程死了 / 降级过 -> 本场结束后关掉，下一场重建一个干净进程；
+       没失败且 spec 支持 ``reuse_process`` -> 用 ``begin_game()`` 复用
+       （Mortal 重发 ``start_game`` 即可重置，省掉每场 ~2s 的 torch 启动）。
+
+    ``failed`` / 各类计数是**本场**的；场结束后由 :meth:`Arena.run_match`
+    累加进 :class:`Participant`，并写进 ``matches.jsonl`` 的 ``external_failed``。
+    """
+
+    #: 给 :func:`aimodel.external.attach` 认：它和 ExternalMJaiAgent 一样有 feed()
+    external_agent = True
+    name = "外部AI"
+
+    def __init__(
+        self,
+        participant: Participant,
+        *,
+        timeout: float = 8.0,
+        max_restarts: int = 1,
+        reuse: bool = True,
+    ) -> None:
+        self.participant = participant
+        self.spec_key = participant.external or participant.source or participant.key
+        self.timeout = float(timeout)
+        self.max_restarts = max(0, int(max_restarts))
+        try:
+            self.spec = external.get_spec(self.spec_key)
+        except external.ExternalAIError:
+            self.spec = None
+        self.reuse = bool(reuse and getattr(self.spec, "reuse_process", False))
+
+        self._agent: external.ExternalMJaiAgent | None = None
+        self._fallback: Agent = HeuristicAgent(0)
+        self._seed = 0
+        self._player_id = 0
+        self._seen_restarts = 0
+
+        #: 本场统计（每场 begin_match() 清零）
+        self.decisions = 0
+        self.errors = 0
+        self.timeouts = 0
+        self.crashes = 0
+        self.bad_actions = 0
+        self.failed = False
+        self.failure_reason = ""
+        self.failure_kind = ""
+
+    # -- 生命周期 -----------------------------------------------------------
+    def _make(self) -> None:
+        """建外部 agent（不启动进程；第一次 feed 时才起）。失败只降级。"""
+        try:
+            self._agent = external.ExternalMJaiAgent(
+                self.spec_key,
+                seed=self._seed,
+                player_id=self._player_id,
+                players=4,
+                timeout=self.timeout,
+                start_timeout=max(60.0, self.timeout * 3),
+                fallback=self._fallback,
+                max_restarts=self.max_restarts,
+                on_error=self._on_error,
+                allow_missing=True,
+            )
+            self._seen_restarts = int(getattr(self._agent, "_restarts", 0))
+        except Exception as exc:                       # noqa: BLE001
+            self._agent = None
+            self._record(exc)
+
+    def _on_error(self, _agent: object, exc: BaseException) -> None:
+        self._record(exc)
+
+    def _record(self, exc: BaseException) -> None:
+        if not self.failed:
+            self.failed = True
+            self.failure_reason = f"{type(exc).__name__}: {exc}"
+            self.failure_kind = type(exc).__name__
+        self.errors += 1
+        if isinstance(exc, external.ExternalAITimeout):
+            self.timeouts += 1
+        elif isinstance(exc, external.ExternalAICrashed):
+            self.crashes += 1
+        elif isinstance(exc, external.ExternalAIProtocolError):
+            self.bad_actions += 1
+
+    def _health(self) -> None:
+        """进程偷偷重启过（Mortal 自己 recover）也要从下一手起改走教师。"""
+        ag = self._agent
+        if ag is None:
+            return
+        if ag.degraded and not self.failed:
+            self._record(external.ExternalAIError(
+                ag.degrade_reason or "外部 AI 已降级"))
+            return
+        restarts = int(getattr(ag, "_restarts", 0))
+        if restarts > self._seen_restarts and not self.failed:
+            self._seen_restarts = restarts
+            self._record(external.ExternalAIError(
+                f"外部进程重启了 {restarts} 次（已重放本局事件，仍按失败计）"))
+
+    def begin_match(self, seed: int, player_id: int) -> None:
+        self._seed = int(seed)
+        self._player_id = int(player_id)
+        self._fallback = HeuristicAgent(self._seed)
+        self.decisions = 0
+        self.errors = 0
+        self.timeouts = 0
+        self.crashes = 0
+        self.bad_actions = 0
+        self.failed = False
+        self.failure_reason = ""
+        self.failure_kind = ""
+
+        if self._agent is not None:
+            if self.reuse:
+                try:
+                    self._agent.begin_game(player_id=player_id, seed=seed)
+                    self._seen_restarts = int(getattr(self._agent, "_restarts", 0))
+                except Exception as exc:               # noqa: BLE001
+                    self._record(exc)
+                    self.close()
+            else:
+                self.close()
+        if self._agent is None and not self.failed:
+            self._make()
+
+    def end_match(self) -> None:
+        """本场收尾：失败过 / 不支持复用 -> 关进程；否则留着下一场复用。"""
+        if self._agent is None:
+            return
+        if self.failed or not self.reuse or self._agent.degraded:
+            self.close()
+
+    def close(self) -> None:
+        ag, self._agent = self._agent, None
+        if ag is not None:
+            try:
+                ag.close()
+            except Exception:                          # noqa: BLE001
+                pass
+
+    def mark_failed(self, exc: BaseException) -> None:
+        """整局级异常（比如 Game.play 因外部座位炸了）——记失败并关进程。"""
+        self._record(exc)
+        self.close()
+
+    @property
+    def player_id(self) -> int:
+        return self._player_id
+
+    # -- Agent 接口 ---------------------------------------------------------
+    def decide(self, decision, view) -> int:
+        self.decisions += 1
+        if self.failed or self._agent is None:
+            return int(self._fallback.decide(decision, view))
+        try:
+            ret = int(self._agent.decide(decision, view))
+            n = len(decision.options)
+            if not (0 <= ret < n):
+                raise external.ExternalAIProtocolError(
+                    f"外部 AI 返回的下标 {ret} 越界（这一手有 {n} 个合法选项）")
+            self._health()
+            return ret
+        except Exception as exc:                       # noqa: BLE001
+            self._record(exc)
+            return int(self._fallback.decide(decision, view))
+
+    def feed(self, action: dict) -> None:
+        if self.failed or self._agent is None:
+            return
+        try:
+            self._agent.feed(action)
+            self._health()
+        except Exception as exc:                       # noqa: BLE001
+            self._record(exc)
+
+    def summary(self) -> dict:
+        return {
+            "spec": self.spec_key,
+            "decisions": self.decisions,
+            "errors": self.errors,
+            "timeouts": self.timeouts,
+            "crashes": self.crashes,
+            "bad_actions": self.bad_actions,
+            "failed": self.failed,
+            "failure_reason": self.failure_reason,
+            "reuse": self.reuse,
+        }
 
 
 def loose_participants(players: int | None = None, copies: int = 3) -> list[Participant]:
@@ -137,12 +382,15 @@ def collect(
     players: int | None = None,
     include: list[str] | None = None,
     copies: int = 3,
+    externals: str | list[str] | None = None,
 ) -> list[Participant]:
-    """把所有可用的模型（含各版本）+ 内置基线收进来。
+    """把所有可用的模型（含各版本）+ 内置基线 + **可选的外部 AI** 收进来。
 
     **每个模型版本派出 ``copies`` 个独立参赛者**，各记各的分。
     它们用的是同一份权重，但座位、牌运、对手组合都不一样 ——
     分开记才能看出「同一个模型自己的方差有多大」，而不是被平均掉。
+
+    ``externals`` 为空 = **和以前完全一样**（不碰外部进程）✓
     """
     out: list[Participant] = []
     seen: set[str] = set()
@@ -206,21 +454,30 @@ def collect(
             key=f"strong{n}", label=f"规则·强（{n}麻）",
             source="strong", players=n, kind="strong", style="规则",
         ))
-    # 外部 mjai AI（manue / Mortal / …）只支持四麻；装好了才进池子。
-    # 天梯里用 kind="external" 和 nn 模型区分，label 直接带许可证/语言。
-    if players in (None, 4):
-        for key in sorted(external.SPECS):
-            sp = external.SPECS[key]
-            if sp.protocol != "mjai-stdio" or sp.players != 4:
-                continue
-            ok, _why = external.check_spec(sp)
-            if not ok:
-                continue
-            out.append(Participant(
-                key=f"external:{key}",
-                label=f"{sp.title}（外部·{sp.license}·{sp.language}）",
-                source=key, players=4, kind="external", style="外部 AI",
-            ))
+
+    # 外部 AI（Mortal 等）：**默认不进来**；调用方显式给 externals 才加。
+    # 名字解析 / 安装检查都在这做；没装也照加（比赛时降级教师并记
+    # external_failed），这样「装坏了」不会让整期开不了，但能在页面上看见。
+    for key in normalize_externals(externals):
+        sp = external.get_spec(key)
+        if players and sp.players != players:
+            raise ValueError(
+                f"外部 AI {sp.title} 只支持 {sp.players} 麻，当前天梯是 {players} 麻；"
+                f"请用 --players {sp.players}（外部 AI 目前只有四麻）"
+            )
+        ok, why = external.check_spec(sp)
+        out.append(Participant(
+            key=f"external:{sp.key}",
+            label=sp.title,
+            players=sp.players,
+            kind="external",
+            source=sp.key,
+            version="外部",
+            style="外部 AI",
+            external=sp.key,
+            external_available=bool(ok),
+            external_reason=why,
+        ))
     return out
 
 
@@ -238,10 +495,14 @@ class Arena:
         copies: int = 3,
         divisor: float = 500.0,
         models: list[str] | None = None,
+        externals: str | list[str] | None = None,
+        external_timeout: float | None = None,
+        external_max_restarts: int | None = None,
+        external_reuse: bool | None = None,
     ) -> None:
         self.copies = copies
         #: 点数段位分的除数：``(最终点数 - 初始点数) / divisor``。
-        #: 越小点数项越强势（500 时一局能到 ±90，会把名次分完全压过去）；
+        #: 越小点数项越强势（500 时一局能到 ±90，会把名次项完全压过去）；
         #: 设 0 就是关掉点数项，只按名次算。
         self.divisor = divisor
         self.players = players
@@ -249,14 +510,41 @@ class Arena:
         self.max_gap = max_gap
         self.strict = strict
         self.seed = seed
+        #: 外部参战者（spec key）。None = 看环境变量；[] = 明确一个都不要。
+        if participants is not None and externals is None:
+            externals = [p.external for p in participants
+                         if p.kind == "external" and p.external]
+        self.externals = normalize_externals(
+            externals_from_env() if externals is None else externals)
+        if external_timeout is None:
+            raw = os.environ.get(EXTERNAL_TIMEOUT_ENV, "").strip()
+            try:
+                external_timeout = float(raw) if raw else 8.0
+            except ValueError:
+                external_timeout = 8.0
+        self.external_timeout = max(0.1, float(external_timeout))
+        if external_max_restarts is None:
+            external_max_restarts = 1
+        self.external_max_restarts = max(0, int(external_max_restarts))
+        if external_reuse is None:
+            raw = os.environ.get(EXTERNAL_REUSE_ENV, "").strip().lower()
+            external_reuse = raw not in ("0", "false", "no", "off")
+        self.external_reuse = bool(external_reuse)
         self.participants = (
             participants if participants is not None
-            else collect(players, include=models, copies=copies)
+            else collect(players, include=models, copies=copies,
+                         externals=self.externals)
         )
         self.n_matches = 0
         self.log: list[str] = []
         self._nets: dict[str, Net] = {}
         self._rng = random.Random(seed)
+        #: 每个外部参战者一个可复用座位（跨场保留进程；失败后自动重建）
+        self._external_seats: dict[str, ExternalSeatAgent] = {}
+        #: 只加不改的汇总计数（``/api/arena`` 里能看到）
+        self.external_matches = 0
+        self.external_failed = 0
+        self.external_decisions = 0
 
     # -- 持久化 -------------------------------------------------------------
     def save(self, path: Path = STATE_FILE) -> None:
@@ -264,6 +552,13 @@ class Arena:
             "players": self.players, "k": self.k, "max_gap": self.max_gap,
             "n_matches": self.n_matches, "seed": self.seed, "copies": self.copies,
             "divisor": self.divisor,
+            "externals": list(self.externals),
+            "external_timeout": self.external_timeout,
+            "external_max_restarts": self.external_max_restarts,
+            "external_reuse": self.external_reuse,
+            "external_matches": self.external_matches,
+            "external_failed": self.external_failed,
+            "external_decisions": self.external_decisions,
             "ts": time.time(),
             "participants": [asdict(p) for p in self.participants],
         }
@@ -278,56 +573,136 @@ class Arena:
         except (OSError, json.JSONDecodeError):
             return None
         parts = [Participant(**p) for p in d.get("participants", [])]
+        exts = d.get("externals")
+        if exts is None:
+            exts = [p.external for p in parts
+                    if p.kind == "external" and p.external]
         a = cls(players=d.get("players", 3), k=d.get("k", 24.0),
                 max_gap=d.get("max_gap", 200.0), participants=parts,
                 copies=d.get("copies", 3), seed=d.get("seed", 0),
-                divisor=d.get("divisor", 500.0))
+                divisor=d.get("divisor", 500.0), externals=exts,
+                external_timeout=d.get("external_timeout", 8.0),
+                external_max_restarts=d.get("external_max_restarts", 1),
+                external_reuse=d.get("external_reuse", True))
         a.n_matches = d.get("n_matches", 0)
+        a.external_matches = d.get("external_matches", 0)
+        a.external_failed = d.get("external_failed", 0)
+        a.external_decisions = d.get("external_decisions", 0)
         return a
 
+    def close_externals(self) -> None:
+        """关掉所有外部进程（重置/收尾用；幂等）。"""
+        for seat in self._external_seats.values():
+            seat.close()
+        self._external_seats.clear()
+
     # -- 匹配 ---------------------------------------------------------------
+    #: 上场数低于池内均值的这个比例 -> **强制**给它一张桌（即使超 max_gap）
+    QUOTA_MIN_FRAC = 0.5
+    #: 被 max_gap 完全排除的人（比如分数拉得太开）-> 低于均值这个比例就强制
+    #: 不能只在 50% 才救：那样长期份额会卡在均值的 50%，达不到「±20%」的验收。
+    #: 取 0.85：即使随机波动也只会在 80% 附近，留出余量。
+    ISOLATED_MIN_FRAC = 0.85
+
     def pool(self) -> list[Participant]:
         return sorted([p for p in self.participants if p.alive], key=lambda p: -p.rating)
 
+    @staticmethod
+    def _spread(group: list[Participant]) -> float:
+        return group[-1].rating - group[0].rating
+
+    def _group_around(self, alive: list[Participant], p: Participant) -> list[Participant]:
+        """包含 ``p`` 的 n 人桌里**分差最小**的那张（超 max_gap 也接受）。
+
+        用于「强制配额」和「整池没有合法桌」两种兜底 —— 保证分数拉得再开
+        也不会有人被永久饿死。
+        """
+        n = self.players
+        best: tuple[tuple[float, int], list[Participant]] | None = None
+        for i in range(len(alive) - n + 1):
+            group = alive[i : i + n]
+            if not any(x is p for x in group):
+                continue
+            key = (self._spread(group), sum(x.games for x in group))
+            if best is None or key < best[0]:
+                best = (key, group)
+        return list(best[1]) if best is not None else []
+
     def pick(self) -> list[Participant] | None:
-        """挑一桌分差不超过 ``max_gap`` 的人；严格模式下挑不出来就返回 None。"""
+        """挑一桌。
+
+        ⚠️ **2026-10-21 修掉的致命 bug**：旧逻辑先算 ``min_spread``，只从
+        「分差最小」的那批桌里挑场数少的。后果是分数拉开的人（例如
+        ``maj-pro4v1.1_mac_rl`` 1680 分，和最近的人差 178.9）只要恰好不在
+        「分差最小」的桌里，就**永远进不了候选** —— 一期 4000 局只上了 80 局
+        （别人 889），冠军被「谁先拉开谁冻结在高位」这个 bug 系统性污染。
+
+        新判据（用户定的）：
+
+        1. ``spread <= max_gap`` 只是**准入条件**，不是排序键；
+        2. 准入的桌里**只挑总场数最少的**（同总场数随机）；
+        3. 配额：上场数 < 池内均值 50% 的人 -> **强制**给一张桌（超 max_gap 也要给）；
+           被 max_gap 完全排除的人放宽到 80% 就强制 —— 否则长期份额会卡在 50%，
+           达不到验收要求的「均值 ±20%」；
+        4. 整个池子一张合法桌都没有时 -> 给场数最少的人凑一张，**天梯不许卡死**。
+        """
         alive = sorted(self.pool(), key=lambda p: p.rating)
         n = self.players
         if len(alive) < n:
             return None
-        # 在所有「分差 ≤ 上限」的组合里选。**同分差时要优先照顾上场少的**，
-        # 否则一堆人都是 500 分、分差都是 0，排序又稳定，排在列表后面的
-        # 参赛者会永远抢不到上场机会（真实踩过的坑：bc4 进池后 25 场没上过桌）。
-        cands: list[tuple[float, int, list[Participant]]] = []
+
+        # 合法桌：连续 n 人、分差 ≤ max_gap（老规则的**准入**部分保留）
+        legal: list[list[Participant]] = []
         for i in range(len(alive) - n + 1):
             group = alive[i : i + n]
-            spread = group[-1].rating - group[0].rating
-            if spread <= self.max_gap:
-                cands.append((spread, sum(p.games for p in group), group))
-        if cands:
-            min_spread = min(c[0] for c in cands)
-            near = [c for c in cands if c[0] <= min_spread + 1e-6]
-            fewest = min(c[1] for c in near)
-            pool = [c[2] for c in near if c[1] == fewest]
-            return self._rng.choice(pool) if len(pool) > 1 else pool[0]
+            if self._spread(group) <= self.max_gap + 1e-9:
+                legal.append(group)
+
+        avg_games = sum(p.games for p in alive) / len(alive)
+        in_legal: set[int] = set()
+        for group in legal:
+            in_legal.update(id(p) for p in group)
+
+        forced: list[Participant] | None = None
+        if avg_games > 0:
+            need: list[Participant] = []
+            for p in alive:
+                frac = p.games / avg_games
+                if p.games == 0 or frac < self.QUOTA_MIN_FRAC:
+                    need.append(p)
+                elif id(p) not in in_legal and frac < self.ISOLATED_MIN_FRAC:
+                    # 分数太高/太低，任何合法桌都装不下它 —— 必须定期放进来，
+                    # 否则它会一直冻结在当前分数。
+                    need.append(p)
+            if need:
+                # 最落后的人优先（同场数时低分优先，和旧行为一致）
+                p = min(need, key=lambda x: (x.games, x.rating))
+                forced = self._group_around(alive, p)
+        if forced is None and not legal:
+            # 一张合法桌都没有：不能直接返回 None（严格模式会让整期停摆）
+            p = min(alive, key=lambda x: (x.games, x.rating))
+            forced = self._group_around(alive, p)
+        if forced:
+            return forced
+
+        if legal:
+            # **只看谁上场少**；分差已经作为准入过滤过了
+            total = lambda g: sum(p.games for p in g)  # noqa: E731
+            fewest = min(total(g) for g in legal)
+            cands = [g for g in legal if total(g) == fewest]
+            return self._rng.choice(cands) if len(cands) > 1 else cands[0]
+
         if self.strict:
             return None
         # 放宽：拿分差最小的那一组，但别总是同样几个人
-        i = min(range(len(alive) - n + 1), key=lambda i: alive[i + n - 1].rating - alive[i].rating)
+        i = min(range(len(alive) - n + 1),
+                key=lambda i: alive[i + n - 1].rating - alive[i].rating)
         group = alive[i : i + n]
         self._rng.shuffle(group)
         return group
 
     # -- 出牌的人 -----------------------------------------------------------
     def _agent(self, p: Participant, seed: int, seat: int = 0) -> Agent:
-        if p.kind == "external":
-            # 单步 2s、崩一次自动重启、再崩降级教师（平台/天梯都不能卡桌）
-            return external.ExternalMJaiAgent(
-                p.source, seed=seed, player_id=seat, players=self.players,
-                # 平台默认 2s；天梯给 3s，避免 manue 的蒙特卡洛偶发 >2s 被误判
-                timeout=3.0, max_restarts=1,
-                fallback=HeuristicAgent(seed),
-            )
         if p.kind == "teacher":
             return HeuristicAgent(seed)
         if p.kind == "random":
@@ -336,6 +711,11 @@ class Arena:
             from .strong import make as make_strong
 
             return make_strong("strong", seed)
+        if p.kind == "external":
+            # 天梯的外部座位走 run_match -> ExternalSeatAgent（崩溃隔离 + 进程复用）；
+            # 这里绝不能直连裸 ExternalMJaiAgent，否则一处异常就会炸掉整期。
+            raise ValueError(
+                f"{p.label} 是外部参战者，要走 run_match 的 ExternalSeatAgent 分支")
         src = p.source or p.key          # 同一个模型派出的多个参赛者共用权重
         net = self._nets.get(src)
         if net is None:
@@ -349,40 +729,121 @@ class Arena:
         同一套参战者、同一个顺序，重跑就得到一模一样的牌。"""
         return self.seed + index * 7919
 
+    def _external_seat(self, p: Participant, seed: int, player_id: int) -> ExternalSeatAgent:
+        seat = self._external_seats.get(p.key)
+        if seat is None:
+            seat = ExternalSeatAgent(
+                p, timeout=self.external_timeout,
+                max_restarts=self.external_max_restarts,
+                reuse=self.external_reuse,
+            )
+            self._external_seats[p.key] = seat
+        seat.begin_match(seed, player_id)
+        return seat
+
+    def _agents_for(self, group: list[Participant],
+                    seed: int) -> tuple[list[Agent], list[ExternalSeatAgent]]:
+        agents: list[Agent] = []
+        seats: list[ExternalSeatAgent] = []
+        for i, p in enumerate(group):
+            aseed = seed * self.players + i
+            if p.kind == "external":
+                seat = self._external_seat(p, aseed, i)
+                agents.append(seat)
+                seats.append(seat)
+            else:
+                agents.append(self._agent(p, aseed))
+        return agents, seats
+
+    def _fallback_agents(self, group: list[Participant], seed: int) -> list[Agent]:
+        """整局级重跑用：外部座位一律换成教师（同种子，确定性）。"""
+        return [
+            HeuristicAgent(seed * self.players + i)
+            if p.kind == "external" else self._agent(p, seed * self.players + i)
+            for i, p in enumerate(group)
+        ]
+
     def run_match(self) -> dict | None:
         group = self.pick()
         if group is None:
             return None
         seed = self.seed_of(self.n_matches)
-        agents = [self._agent(p, seed * self.players + i, seat=i)
-                  for i, p in enumerate(group)]
+        agents, seats = self._agents_for(group, seed)
         game = Game(agents, seed=seed, rounds=self.players)
-        external.attach(game)
+        if seats:
+            external.attach(game)
+
+        fallback_error: Exception | None = None
         try:
-            r = game.play()
+            try:
+                r = game.play()
+            except Exception as exc:                    # noqa: BLE001
+                if not seats:
+                    raise
+                # 最后一道保险：连 ExternalSeatAgent 都没兜住（比如协议桥自己
+                # 有 bug），整局用「外部座位=教师」的确定性阵容重跑一次。
+                # **绝不把异常抛给整期调度器** —— 一期 4000 局不能因为
+                # Mortal 崩一次就全废。
+                fallback_error = exc
+                for s in seats:
+                    s.mark_failed(exc)
+                r = Game(self._fallback_agents(group, seed),
+                         seed=seed, rounds=self.players).play()
+                self.log.append(
+                    f"⚠️ 外部座位整局异常，已用教师重跑 seed={seed}："
+                    f"{type(exc).__name__}: {exc}")
+
+            failed = fallback_error is not None or any(s.failed for s in seats)
+            ranks = list(r.ranks)
+            start_score = S.rule_for(self.players).start_score
+            self._settle(group, ranks, r.scores, r, start_score)
+            self.n_matches += 1
+
+            # 外部座位的「本场计数」-> 参战者累计 + 全局累计
+            for s in seats:
+                p = group[s.player_id]
+                p.external_games += 1
+                p.external_errors += s.errors
+                p.external_timeouts += s.timeouts
+                p.external_crashes += s.crashes
+                p.external_bad_actions += s.bad_actions
+                if s.errors:
+                    p.external_failures += max(1, s.errors)
+                if s.failure_reason:
+                    p.external_last_error = s.failure_reason
+                if s.failed:
+                    p.external_failed += 1
+            if seats:
+                self.external_matches += 1
+                self.external_decisions += sum(s.decisions for s in seats)
+                if failed:
+                    self.external_failed += 1
+
+            text = "  ".join(
+                f"{p.label} {r.scores[i]}({ranks[i] + 1}位"
+                f" {(r.scores[i] - start_score) / self.divisor if self.divisor else 0:+.0f})"
+                for i, p in enumerate(group)
+            )
+            if failed:
+                text += "  ⚠️ external_failed"
+            self.log.append(f"[{self.n_matches}] 🌱{seed}  {text}")
+            del self.log[:-200]
+            res = {
+                "group": [p.key for p in group], "ranks": ranks,
+                "scores": list(r.scores), "seed": seed,
+            }
+            if seats:
+                # 只加字段：没有外部参战者的局**一个字段都不多**（老存档兼容 ✓）
+                res.update({
+                    "external": True,
+                    "external_failed": bool(failed),
+                    "external_specs": [s.spec_key for s in seats],
+                    "external_seats": [s.player_id for s in seats],
+                })
+            return res
         finally:
-            # 外部 AI 这局失败了几次（超时 / 崩溃 / 降级），天梯页要能看见
-            for p, ag in zip(group, agents):
-                if p.kind == "external":
-                    errs = int(getattr(ag, "errors", 0) or 0)
-                    if errs or getattr(ag, "degraded", False):
-                        p.external_failures += max(1, errs)
-            external.close_external(agents)
-        ranks = list(r.ranks)
-        start_score = S.rule_for(self.players).start_score
-        self._settle(group, ranks, r.scores, r, start_score)
-        self.n_matches += 1
-        text = "  ".join(
-            f"{p.label} {r.scores[i]}({ranks[i] + 1}位"
-            f" {(r.scores[i] - start_score) / self.divisor if self.divisor else 0:+.0f})"
-            for i, p in enumerate(group)
-        )
-        self.log.append(f"[{self.n_matches}] 🌱{seed}  {text}")
-        del self.log[:-200]
-        return {
-            "group": [p.key for p in group], "ranks": ranks, "scores": list(r.scores),
-            "seed": seed,
-        }
+            for s in seats:
+                s.end_match()
 
     def _settle(self, group: list[Participant], ranks: list[int], scores: list[int],
                 r=None, start_score: int = 35000) -> None:
@@ -476,6 +937,17 @@ class Arena:
                 "外部失败": p.external_failures,
                 "状态": "0分保底" if (p.at_floor and p.games) else "存活",
                 "曲线": p.history[-120:],
+                # 只加字段：老页面照常读，新页面/接口能看见外部参战者状态
+                "外部": p.external,
+                "外部场数": p.external_games,
+                "外部失败": p.external_failed,
+                "外部错误": p.external_errors,
+                "外部超时": p.external_timeouts,
+                "外部崩溃": p.external_crashes,
+                "外部非法动作": p.external_bad_actions,
+                "外部可用": p.external_available,
+                "外部原因": p.external_reason,
+                "外部最后错误": p.external_last_error,
             })
         return rows
 
@@ -499,6 +971,16 @@ class Arena:
             "状态": "0分保底" if (p.at_floor and p.games) else "存活",
             "曲线": p.history,
             "对局": list(reversed(p.matches)),     # 新的在前
+            "外部": p.external,
+            "外部场数": p.external_games,
+            "外部失败": p.external_failed,
+            "外部错误": p.external_errors,
+            "外部超时": p.external_timeouts,
+            "外部崩溃": p.external_crashes,
+            "外部非法动作": p.external_bad_actions,
+            "外部可用": p.external_available,
+            "外部原因": p.external_reason,
+            "外部最后错误": p.external_last_error,
         }
 
     def print_table(self) -> None:
@@ -527,6 +1009,14 @@ def main(argv: list[str] | None = None) -> None:
                          "例：--models maj-normal4v1.2 maj-pro4v1.1")
     ap.add_argument("--copies", type=int, default=3,
                     help="每个模型版本派几个参赛者（默认 3，各记各的分）")
+    ap.add_argument("--external", nargs="*", default=None,
+                    help="把外部 mjai AI 加进天梯（如 mortal-akagi）；"
+                         "不传 = 看 $POTATOMAJ_ARENA_EXTERNAL，再没有就关闭")
+    ap.add_argument("--external-timeout", type=float, default=None,
+                    help="外部 AI 等一手牌的超时秒数（默认 8；可用 "
+                         "$POTATOMAJ_ARENA_EXTERNAL_TIMEOUT 覆盖）")
+    ap.add_argument("--no-external-reuse", action="store_true",
+                    help="每场重启外部进程（默认 Mortal 复用进程以省 ~2s/场）")
     ap.add_argument("--reset", action="store_true",
                     help="清空战绩，全部回到 500 分（0 分保底，不出局）")
     ap.add_argument("--save", action="store_true", help="跑完把状态存下来")
@@ -536,14 +1026,30 @@ def main(argv: list[str] | None = None) -> None:
         STATE_FILE.unlink()
         print("已清空天梯")
 
+    want_ext = normalize_externals(
+        externals_from_env() if args.external is None else args.external)
     arena = None if args.reset else Arena.load()
-    if arena is None or arena.players != args.players:
+    if arena is not None:
+        have_ext = [p.external for p in arena.participants
+                    if p.kind == "external"]
+        if arena.players != args.players or (
+                (args.external is not None or externals_from_env())
+                and sorted(have_ext) != sorted(want_ext)):
+            arena = None
+    if arena is None:
         arena = Arena(players=args.players, k=args.k, max_gap=args.max_gap,
                       strict=not args.loose, seed=args.seed, copies=args.copies,
-                      divisor=args.divisor, models=args.models)
+                      divisor=args.divisor, models=args.models,
+                      externals=want_ext,
+                      external_timeout=args.external_timeout,
+                      external_reuse=not args.no_external_reuse)
         print(f"新建 {args.players} 麻池：{len(arena.participants)} 个参战者"
               f"（每个模型 {args.copies} 个），"
               f"初始 500 分，分差上限 {args.max_gap:.0f}，0 分保底（不出局）")
+        if want_ext:
+            print(f"  外部参战者：{', '.join(want_ext)}"
+                  f"（超时 {arena.external_timeout:.1f}s，"
+                  f"{'复用进程' if arena.external_reuse else '每场重启' }）")
     arena.k, arena.max_gap, arena.strict = args.k, args.max_gap, not args.loose
 
     t0 = time.perf_counter()

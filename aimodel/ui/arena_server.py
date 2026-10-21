@@ -44,13 +44,22 @@ class Session:
     def __init__(self, players: int = 3, k: float = 24.0, max_gap: float = 200.0,
                  strict: bool = True, pace: float = 0.0, copies: int = 3,
                  divisor: float = 500.0,
-                 models: list[str] | None = None) -> None:
+                 models: list[str] | None = None,
+                 externals: str | list[str] | None = None,
+                 external_timeout: float | None = None,
+                 external_reuse: bool = True) -> None:
         #: 只让这几个模型参赛（None = 全部）✓ 传给 Arena -> collect(include=...)
         self.models = models
         self.copies = copies
         self.divisor = divisor
+        self.externals = externals
+        self.external_timeout = external_timeout
+        self.external_reuse = external_reuse
         self.arena = Arena(players=players, k=k, max_gap=max_gap, strict=strict,
-                           copies=copies, divisor=divisor, models=models)
+                           copies=copies, divisor=divisor, models=models,
+                           externals=externals,
+                           external_timeout=external_timeout,
+                           external_reuse=external_reuse)
         self.lock = threading.Lock()
         self.running = False
         self.target = 0          # 还要跑多少场（0 = 无限）
@@ -178,10 +187,16 @@ class Session:
         if STATE_FILE.exists():
             STATE_FILE.unlink()
         with self.lock:
+            try:
+                self.arena.close_externals()
+            except Exception as exc:  # noqa: BLE001
+                log(f"⚠️ 关外部进程失败（继续重置）：{type(exc).__name__}: {exc}")
             self.arena = Arena(players=self.arena.players, k=self.arena.k,
                                max_gap=self.arena.max_gap, strict=self.arena.strict,
                                copies=self.copies, divisor=self.divisor,
-                               models=self.models)   # ← 重置也要保住阵容 ✗
+                               models=self.models, externals=self.externals,
+                               external_timeout=self.external_timeout,
+                               external_reuse=self.external_reuse)   # ← 重置也要保住阵容 ✗
             self.done = 0
             self.error = ""
 
@@ -278,6 +293,10 @@ class Session:
                 "target": self.target,
                 "done_total": a.n_matches,
                 "done_run": self.done,
+                #: **新增**（只加不改）：直接可读的计数（老字段全部保持原样）
+                "external_failed": a.external_failed,
+                "external_matches": a.external_matches,
+                "external_decisions": a.external_decisions,
                 "pace": self.pace,
                 "seed": a.seed,
                 "divisor": a.divisor,
@@ -292,6 +311,28 @@ class Session:
                 "summary_weighted": self._summary_weighted(a),
                 "log": a.log[-14:],
                 "copies": self.copies,
+                #: **新增**（只加不改）：外部参战者（Mortal 等）的配置与计数 ✓
+                "external": {
+                    "enabled": bool(a.externals),
+                    "specs": list(a.externals),
+                    "matches": a.external_matches,
+                    "failed": a.external_failed,
+                    "decisions": a.external_decisions,
+                    "reuse": a.external_reuse,
+                    "timeout": a.external_timeout,
+                    "seats": [
+                        {"key": p.key, "label": p.label, "spec": p.external,
+                         "games": p.external_games, "failed": p.external_failed,
+                         "errors": p.external_errors,
+                         "timeouts": p.external_timeouts,
+                         "crashes": p.external_crashes,
+                         "bad_actions": p.external_bad_actions,
+                         "available": p.external_available,
+                         "reason": p.external_reason,
+                         "last_error": p.external_last_error}
+                        for p in a.participants if p.kind == "external"
+                    ],
+                },
             }
 
     @staticmethod
@@ -489,7 +530,12 @@ class Handler(BaseHTTPRequestHandler):
                     continue          # 分页 ✓ 一期 4000 局也能逐段翻
                 matches.append({"index": i, "seed": m.get("seed"),
                                 "group": m.get("group"), "ranks": m.get("ranks"),
-                                "scores": m.get("scores")})
+                                "scores": m.get("scores"),
+                                # 含外部 AI 的局：页面据此标「不可回放」
+                                "external": bool(m.get("external")),
+                                "external_failed": bool(m.get("external_failed")),
+                                "external_specs": m.get("external_specs") or [],
+                                "replayable": not bool(m.get("external"))})
             sd = s.as_dict()
             sd["done"] = real
             if (not sd.get("champion")) or ("#" in str(sd.get("champion"))) \
@@ -522,8 +568,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": f"这一期没有第 {idx} 局"}, 404)
                 return
             # **用同一个引擎重跑** ✓ 一局约 0.5 秒 ✓
+            # ⚠️ 含外部 AI 的局**明确拒绝**（Mortal 不是确定性模型），
+            #    不能拿重跑结果冒充存档；返回 409 让页面直接显示提示。
             try:
                 actions, res = E.replay(m)
+            except E.ReplayUnsupported as exc:
+                self._json({"ok": False, "replayable": False,
+                            "season": sid, "index": idx,
+                            "external": True,
+                            "external_specs": m.get("external_specs") or [],
+                            "external_failed": bool(m.get("external_failed")),
+                            "error": f"不可回放：{exc}"}, 409)
+                return
             except Exception as exc:                     # noqa: BLE001
                 self._json({"ok": False,
                             "error": f"回放失败：{type(exc).__name__}: {exc}"}, 500)
@@ -531,6 +587,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({
                 "ok": True, "season": sid, "index": idx, "seed": m.get("seed"),
                 "players": m.get("players", 4), "group": m.get("group"),
+                "external": bool(m.get("external")),
+                "replayable": True,
                 # 存档里的原始结果 + 刚重跑出来的结果（应当一致 ✓ 不一致就是复现性坏了 ✗）
                 "archived": {"ranks": m.get("ranks"), "scores": m.get("scores")},
                 "replayed": {"ranks": list(res.ranks), "scores": list(res.scores)},
@@ -809,7 +867,10 @@ def start_official(session: "Session", *, interval: float = 45.0,
 def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
           copies: int = 3, divisor: float = 500.0,
           models: list[str] | None = None,
-          loose: bool = False, official: bool = False) -> None:
+          loose: bool = False, official: bool = False,
+          externals: str | list[str] | None = None,
+          external_timeout: float | None = None,
+          external_reuse: bool = True) -> None:
     """``loose=True`` → ``Arena(strict=False)``：分差不够就放宽 ✓
 
     为什么该开：`strict` 下只让分差 ≤ ``max_gap`` 的配对 ✓
@@ -817,10 +878,15 @@ def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
     → 早先一波运气好的被**永久冻在第一** ✓
     （实测：同一批模型跑两轮，排名完全洗牌 ✗
       第 1 名 264 场、第 15 名 162 场，而中间的第 8 名有 567 场 ✓）
+
+    ``externals``：要加进天梯的外部 mjai AI（如 ``["mortal-akagi"]``）。
+    **默认 None = 看 $POTATOMAJ_ARENA_EXTERNAL；都没有 = 关闭** ✓
     """
     _startup_audit()
     session = Session(players=players, copies=copies, divisor=divisor,
-                      models=models, strict=not loose)
+                      models=models, strict=not loose,
+                      externals=externals, external_timeout=external_timeout,
+                      external_reuse=external_reuse)
     if official:
         # ⚠️ 官方天梯的 ELO 是跨期累积的；重启不读回最近一期 arena.json
         #    会让 /api/arena 从 0 开始，下一期也和已落盘的最终表对不上。
@@ -830,6 +896,15 @@ def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
     print(f"🏟  ELO 混战池：http://{host}:{port}")
     print(f"     {players} 麻 · {len(session.arena.participants)} 个参战者"
           f"（每个模型 {copies} 个，各记各的分）· 初始 500 分 · 分差上限 200 · 0 分保底不出局")
+    exts = [p for p in session.arena.participants if p.kind == "external"]
+    if exts:
+        for p in exts:
+            mark = "✅" if p.external_available else "⚠️"
+            print(f"     {mark} 外部参战者：{p.label}（spec={p.external}）"
+                  + ("" if p.external_available else f" —— {p.external_reason}"))
+        print(f"     外部进程：超时 {session.arena.external_timeout:.1f}s · "
+              f"{'复用进程' if session.arena.external_reuse else '每场重启'} · "
+              f"失败自动降级教师，整期不中断")
     if official:
         from aimodel.ui import elo_schedule as S
         start_official(session)
@@ -841,6 +916,10 @@ def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
     except KeyboardInterrupt:
         print("\n收工")
         session.pause()
+        try:
+            session.arena.close_externals()
+        except Exception:  # noqa: BLE001
+            pass
         session.arena.save()
 
 
@@ -857,11 +936,21 @@ def main(argv: list[str] | None = None) -> None:
                          "例：--models maj-normal4v1.2 maj-pro4v1.1")
     ap.add_argument("--divisor", type=float, default=500.0,
                     help="点数段位分的除数（0 = 关掉点数项，只按名次算）")
+    ap.add_argument("--external", nargs="*", default=None,
+                    help="把外部 mjai AI 加进天梯（如 mortal-akagi）；"
+                         "不传 = 看 $POTATOMAJ_ARENA_EXTERNAL，再没有就关闭 ✓")
+    ap.add_argument("--external-timeout", type=float, default=None,
+                    help="外部 AI 等一手牌的超时秒数（默认 8；"
+                         "可用 $POTATOMAJ_ARENA_EXTERNAL_TIMEOUT 覆盖）")
+    ap.add_argument("--no-external-reuse", action="store_true",
+                    help="每场重启外部进程（默认 Mortal 复用进程，省 ~2s/场）")
     ap.add_argument("--official", action="store_true",
                     help="启用官方档位调度：每天 8/11/14/17/20 点各跑一期 4000 局")
     args = ap.parse_args(argv)
     serve(args.players, args.port, args.host, args.copies, args.divisor,
-          models=args.models, loose=args.loose, official=args.official)
+          models=args.models, loose=args.loose, official=args.official,
+          externals=args.external, external_timeout=args.external_timeout,
+          external_reuse=not args.no_external_reuse)
 
 
 if __name__ == "__main__":
