@@ -66,6 +66,42 @@ class Session:
         #: 记录开关（关掉就不落盘；默认开 ✓ 233 B/局 不心疼 ✓）
         self.record = True
 
+    def resume_latest(self) -> None:
+        """重启后把**最近一期**的 ``arena.json`` 读回来。
+
+        为什么需要：:class:`Session` 的构造函数总是从 0 分开始；而官方天梯的
+        ELO 是跨期累积的（每期收尾都会把 ``arena.json`` 落盘）。不读回来的话，
+        服务一重启 ``/api/arena`` 就变成 ``done_total=0``，页面看起来像「数据没了」；
+        更糟的是下一期会从 500 分重新开始，和已落盘的最终表对不上。
+
+        只在最新一期的参战者名单（key 集合）与当前阵容一致时续接；
+        对不上就忽略（宁可从头开始，也不要把别的池子的分数混进来）。
+        """
+        try:
+            from aimodel import elo_store as E
+
+            seasons = E.list_seasons()
+            if not seasons:
+                return
+            s = seasons[0]
+            path = s.dir / "arena.json"
+            if not path.exists():
+                return
+            loaded = Arena.load(path)
+            if loaded is None:
+                return
+            now_keys = [p.key for p in self.arena.participants]
+            old_keys = [p.key for p in loaded.participants]
+            if loaded.players != self.arena.players or old_keys != now_keys:
+                log(f"⚠️ 最近一期 {s.sid} 的 arena.json 与当前阵容不符，忽略（从 0 开始）")
+                return
+            with self.lock:
+                self.arena = loaded
+            log(f"↩️ 重启续接最近一期 {s.sid}：{loaded.n_matches} 场、"
+                f"{len(loaded.participants)} 个参战者")
+        except Exception as exc:  # noqa: BLE001 - 读不回来也不能拖垮服务
+            log(f"⚠️ 续接最近一期失败（从 0 开始）：{type(exc).__name__}: {exc}")
+
     # -- 控制 ---------------------------------------------------------------
     def start(self, matches: int = 100, pace: float | None = None,
               sid: str | None = None) -> None:
@@ -785,6 +821,10 @@ def serve(players: int = 3, port: int = 8770, host: str = "127.0.0.1",
     _startup_audit()
     session = Session(players=players, copies=copies, divisor=divisor,
                       models=models, strict=not loose)
+    if official:
+        # ⚠️ 官方天梯的 ELO 是跨期累积的；重启不读回最近一期 arena.json
+        #    会让 /api/arena 从 0 开始，下一期也和已落盘的最终表对不上。
+        session.resume_latest()
     Handler.session = session
     httpd = ThreadingHTTPServer((host, port), Handler)
     print(f"🏟  ELO 混战池：http://{host}:{port}")
