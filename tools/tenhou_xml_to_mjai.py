@@ -29,37 +29,52 @@
     end_kyoku / end_game
 
 我们自己的（P0，Mac 要用 dan>=10 筛凤凰卓）：
-    start_game  {"type":"start_game","id":<int>,"names":[...4],"dans":[...],
-                 "rates":[...],"sx":[...],"game_id":"<文件名去掉 .xml.gz>"}
+    start_game  {"type":"start_game","id":"<牌谱 id 字符串>","names":[...4],
+                 "dans":[...],"rates":[...],"sx":[...],"game_id":"<同上>"}
     dan / rate / 名字缺失一律 `null`（天凤不公开段位时就是这样），**不崩**。
+    `id` 用字符串是 riichienv 的硬要求（Rust serde：给整数会报
+    `invalid type: integer 0, expected a string`），天凤牌谱 id 本来就是文件名。
 
 牌名用**标准 MJAI**：`1m..9m / 1p..9p / 1s..9s / E S W N P F C`，
 赤五写作 `5mr / 5pr / 5sr`（`aimodel.mjlog._name_of_raw` 写的是 `0m`，
 那是本项目内部口径，不是标准 MJAI，所以这里单独出一份名字表）。
 
-## 三个自检（转换时顺带跑，结果打在报告里）
+## 自检（转换时顺带跑，结果打在报告里）
 
 1. **座位/手牌**：每次打出的牌必须在打者手里；`<INIT>` 四家各 13 张；
    每种牌全局最多 4 张（136 张牌堆的一致性）。
 2. **分数**：`start_kyoku.scores` - 1000×本局立直数 + hora/ryukyoku 的 deltas
-   == **下一局** `start_kyoku.scores`（跨局账本，等价于"每局收支清零"）。
+   == **下一局** `start_kyoku.scores`（跨局账本）。
 3. **宝牌/和了**：`<DORA>` 指示牌 == `<AGARI doraHai>`；`ba` 的立直棒数 ==
-   `seed[2] + 本局成立立直数`；`hora.deltas` 与本局立直棒的关系见
-   `deltas 的说明`。
+   `seed[2] + 本局成立立直数`；赢家 `deltas` == `ten[1]` + 300×本场 + 1000×棒；
+   立直棒守恒见下。
 
 ## deltas 的说明（重要，别被 "必须等于 0" 误导）
 
-`<AGARI sc>` 的「variation」是**已经扣过本局立直棒**之后的净变化，而赢家会把
-桌上的棒**收回去**，所以单看一条 hora：
+`<AGARI sc>` 的 variation 是**已经扣过本局立直棒**之后的净变化，而赢家会把桌上
+的棒**收回去**。所以单看一条 hora 只有在「桌上没有棒」时合计才是 0；正确的
+守恒式是**按 kyoku 汇总**（一个 kyoku 可能有两条 AGARI，即ダブロン）：
 
-    sum(hora.deltas) == 1000 × (本局成立立直数 + 局首 kyoutaku)
-                       中「赢家自己付过的那部分」… 实测更简单：
-    sum(hora.deltas) + 1000×本局成立立直数 + 1000×局首 kyoutaku == 0
+    sum(本局所有 hora.deltas) == 1000 × (本局成立立直数 + 局首 kyoutaku)
+    等价： sum(hora.deltas) - 1000×(立直数 + kyoutaku) == 0
+    另外： 赢家 deltas == ten[1] + 300×本场（只给第一个赢家） + 1000×收走的棒
 
 也就是说**跨事件**才守恒（立直时 -1000 记在 reach 上）。硬把单条 hora 的
 deltas 改成合计 0，就会和 `<AGARI sc>` 对不上、下一局分数接不上 ——
 正是 `aimodel/mjlog.py` 注释里说的「engine 多给 14000，日志只有 13000」那类 bug。
-本文件按天凤 `sc` **原样**输出，并在报告里给出守恒式的实测通过率。
+本文件按天凤 `sc` **原样**输出，并在报告里给出上面几条守恒式的实测通过率。
+
+## 实测（2026-10-21，全量 8,219 个文件）
+
+    四麻 5,717 局 / 58,476 kyoku / 5,944,477 事件 / 311.25 MB / 96 秒
+    三麻 2,502 个文件被识别并跳过（hai3=""、35000 起手、牌种无 2m..8m）
+    自检问题 0
+    立直棒守恒（kyoku 级，含ダブロン）  49,161/49,161 = 100.00%
+    赢家 deltas == 点数+本场+棒         49,459/49,459 = 100.00%
+    流局 sum(deltas)==0                 9,315/9,315
+    riichienv MjaiReplay.from_jsonl     58/58 文件、58,476 局、0 失败
+    dan  5,717/5,717 局四家都有；直方图 {16:13737, 17:6639, 18:2143, 19:329, 20:20}
+    rate n=22,868，min/max/median = 2002.19 / 2423.13 / 2159.55
 """
 
 from __future__ import annotations
