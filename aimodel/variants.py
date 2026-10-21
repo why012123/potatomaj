@@ -40,6 +40,8 @@ STYLE_CN = {
     "mountain": "防守",
     "flash": "速攻",
     "huge": "大牌",
+    # 外部引擎（没有权重文件，靠起进程问）
+    "akochan": "外部引擎",
 }
 
 
@@ -50,6 +52,9 @@ class ModelSpec:
     reward: str  #: rewards.MODES 之一
     style: str  #: 教师风格（agents.TeacherStyle 的名字）
     version: str = VERSION
+    #: **外部引擎**（没有权重文件）。平台据此走「起进程」而不是 ``load_net``；
+    #: ``audit_weights`` / 天梯也据此把它排除（它没有 npz，也不该进天梯）。
+    external: bool = False
 
     @property
     def path(self) -> Path:
@@ -147,6 +152,37 @@ def _register_pro_mac_rl() -> None:
 
 _register_pro_mac_rl()
 
+#: 外部引擎（**没有权重文件**）—— 单独一张表，**不进** ``MODELS``。
+#:
+#: 为什么不注册进 ``MODELS``：``all_specs()`` 会喂给**天梯**（``arena.collect``）、
+#: ``existing()`` / ``style_report`` / ``progress`` 也都按「有权重文件」处理。
+#: akochan 每次查询要起一个进程（~0.4 秒），跑不动 4000 局/期的天梯（用户明确
+#: 不做），塞进 ``MODELS`` 还会让 ``audit_weights`` 把它报成「注册了但没权重」✗。
+#:
+#: 平台侧（``webapp/server/agents.py``）另外读这张表：
+#: ``variants.get("akochan").external is True`` -> 走「外部引擎」那条路。
+EXTERNAL: dict[str, ModelSpec] = {}
+
+
+def _register_akochan() -> None:
+    """注册 ``akochan`` —— 外部 C++ 引擎座位（四麻）。
+
+    与 ``maj-*`` 的区别：
+      · **没有权重文件**，``spec.path`` 指向的 npz 不存在也不会去载；
+      · 只在**网页房间的可选 AI 座位**里出现，不进天梯；
+      · ``version`` 留空（它不是训练出来的一版，别让 ``_build(VERSION)`` 认领它）。
+
+    实现见 :mod:`aimodel.external_akochan`。
+    """
+    EXTERNAL["akochan"] = ModelSpec(
+        "akochan", 4, "normal", "akochan", "", external=True)
+
+
+_register_akochan()
+
+#: 外部模型的别名（不带版本号，写法宽松点）
+_EXT_ALIASES = {"akochan": "akochan", "akochan4": "akochan", "ako": "akochan"}
+
 # 注册之后要重建别名表（下面那段是按 MODELS 生成的）
 
 #: 别名（不带版本、不带 maj- 前缀、下划线等写法都认，一律指向最新版）
@@ -178,6 +214,8 @@ def versions(style: str, players: int) -> list[str]:
 def resolve(name: str) -> str:
     """把别名归一成正名。"""
     key = name.strip().lower()
+    if key in _EXT_ALIASES:
+        return _EXT_ALIASES[key]
     if key in _ALIASES:
         return _ALIASES[key]
     # 宽松匹配：majflash4 / maj_flash_4 / flash4_v1.1 这种写法都认。
@@ -188,6 +226,9 @@ def resolve(name: str) -> str:
         for form in (cand, bare):
             if squash == form.replace("-", "").replace(".", "").lower():
                 return spec.name
+    for ext_name in EXTERNAL:
+        if squash == ext_name.lower():
+            return ext_name
     raise KeyError(f"没有这个模型: {name}（可选: {', '.join(sorted(MODELS))}）")
 
 
@@ -196,14 +237,27 @@ _VERSIONED = re.compile(r"^(maj-[a-z]+4?)(v[\d.]+)$")
 
 def get(name: str) -> ModelSpec:
     """按名字取规格。**显式带版本号的写法一定认**（即使那不是当前版本），
-    这样训练 v1.2 的时候还能引用 v1.1 的模型当对手。"""
+    这样训练 v1.2 的时候还能引用 v1.1 的模型当对手。
+
+    外部引擎（``EXTERNAL``）也认 —— 平台靠 ``spec.external`` 分流。
+    """
     key = name.strip().lower()
+    if key in _EXT_ALIASES:
+        return EXTERNAL[_EXT_ALIASES[key]]
     m = _VERSIONED.match(key)
     if m and key not in MODELS:
         built = _build(m.group(2))
         if key in built:
             return built[key]
     return MODELS[resolve(name)]
+
+
+def is_external(name: str) -> bool:
+    """这个名字是不是**外部引擎**（无权重、要起进程）。认不出来返回 ``False``。"""
+    try:
+        return bool(get(name).external)
+    except KeyError:
+        return False
 
 
 def all_specs(version: str | None = None) -> list[ModelSpec]:
@@ -286,7 +340,9 @@ def audit_weights(verbose: bool = True) -> dict:
 
 
 __all__ = [
-    "audit_weights","ModelSpec", "MODELS", "STYLE_CN", "get", "resolve", "all_specs", "existing"]
+    "audit_weights", "ModelSpec", "MODELS", "STYLE_CN", "EXTERNAL",
+    "get", "resolve", "is_external", "all_specs", "existing",
+]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -303,6 +359,8 @@ def main(argv: list[str] | None = None) -> None:
     for spec in all_specs():
         mark = "✅" if spec.path.exists() else "—"
         print(f"  {mark} {spec.name:<22} {spec.players}麻  {spec.cn}")
+    for spec in EXTERNAL.values():
+        print(f"  🔌 {spec.name:<22} {spec.players}麻  {spec.cn}（外部引擎，无权重）")
 
 
 if __name__ == "__main__":

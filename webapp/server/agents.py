@@ -108,11 +108,16 @@ def probe_model(name: str, players: int | None = None) -> tuple[bool, str]:
     （三麻 486 维、四麻 560 维，因为对手的手牌/副露/牌河块数不同）。
     拿三麻的 486 维去喂四麻权重，第一层 matmul 就会炸 —— 这就是
     「四麻模型一直降级成教师」的真原因。
+
+    **外部引擎**（akochan）没有权重：走另一条探测（起一次真进程试跑），
+    见 :func:`probe_external`。
     """
     try:
         spec = variants.get(name)
     except KeyError:
         return False, "注册表里没有这个模型"
+    if getattr(spec, "external", False):
+        return probe_external(spec.name)
     n = players or spec.players
     try:
         net = load_net(spec.name)
@@ -127,6 +132,29 @@ def probe_model(name: str, players: int | None = None) -> tuple[bool, str]:
     if missing:
         return True, f"未训练 {'/'.join(missing)}（这些动作交给内置教师）"
     return True, ""
+
+
+@lru_cache(maxsize=8)
+def probe_external(name: str) -> tuple[bool, str]:
+    """**外部引擎**（无权重）能不能用：起一次真进程试跑（结果缓存）。
+
+    为什么不用「文件在不在」判断：``system.exe`` 可能是坏的 / 缺 DLL /
+    OpenMP 崩（实测 16 线程以上会随机访问越界），只有真跑一次才知道。
+    第一次 ``/api/models`` 会多花 ~0.15 秒，之后都走缓存。
+    """
+    from aimodel import external_akochan
+
+    try:
+        spec = variants.get(name)
+    except KeyError:
+        return False, "注册表里没有这个模型"
+    if not getattr(spec, "external", False):
+        return False, f"{name} 不是外部引擎"
+    try:
+        engine = external_akochan.AkochanEngine()
+        return engine.probe(live=True)
+    except Exception as exc:  # noqa: BLE001 - 探测失败不能影响开服
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 @lru_cache(maxsize=8)
@@ -216,6 +244,23 @@ def available_models(refresh: bool = False) -> list[dict]:
             spec = variants.get(name)
         except KeyError:
             return
+        if getattr(spec, "external", False):
+            # **外部引擎**：没有 npz，不去 load_net（硬去载只会 KeyError 然后
+            # 被标成「没有权重文件」-> 界面上选不了）。可用性 = 真起一次进程试跑。
+            usable, why = probe_model(spec.name, spec.players)
+            out[name] = {
+                "name": spec.name,
+                "players": spec.players,
+                "style": spec.style,
+                "style_cn": variants.STYLE_CN.get(spec.style, spec.style),
+                "cn": spec.cn,
+                "version": spec.version,
+                "usable": usable,
+                "missing_heads": [],
+                "external": True,
+                "note": (why or "外部引擎（每次决策起一次进程，~0.4s）"),
+            }
+            return
         usable, why = probe_model(spec.name, spec.players)
         net = _nets.get(spec.name)
         missing = list(net_missing_heads(net)) if net is not None else []
@@ -270,6 +315,9 @@ def available_models(refresh: bool = False) -> list[dict]:
     # 外部 mjai AI（manue / Mortal / …）也当可选模型；只是检查文件，不启动进程
     for row in external.external_models(4):
         out.setdefault(row["name"], row)
+    # 外部引擎（akochan）：无权重、要起进程；不进天梯，但网页房间里可选
+    for spec in variants.EXTERNAL.values():
+        add(spec.name)
     rows = list(out.values())
     rows.sort(key=lambda m: (m["players"], m["style"], m["version"]))
     _MODEL_CACHE = rows
@@ -521,6 +569,16 @@ class AISeat(Agent):
         # KeyError 降级路径（那会把它静默换成教师）。
         if name.startswith("strong"):
             return make_builtin_agent(name, self.seed)
+        # 外部引擎（akochan）：**必须排在** ``external.normalize_key`` 前面 ——
+        # ``aimodel/external.py`` 的 SPECS 里也有一个 "akochan"（mjai-tcp 壳），
+        # 那条路要求先起 ``system.exe mjai_client`` 连 TCP，不适合网页房间；
+        # 这里走的是「一次一问起进程」的 ``external_akochan``。
+        try:
+            _spec = variants.get(name)
+        except KeyError:
+            _spec = None
+        if _spec is not None and getattr(_spec, "external", False):
+            return self._build_external(_spec)
         # 外部 mjai AI（manue / Mortal / …）：协议桥见 aimodel/external.py
         ext_key = external.normalize_key(name)
         if ext_key is not None:
@@ -576,6 +634,40 @@ class AISeat(Agent):
             self.degrade_reason = f"{type(exc).__name__}: {exc}"
             log.warning("座位 %d 的模型 %s 载入失败，降级为内置教师：%s",
                         self.seat, name, self.degrade_reason)
+            if self.on_error is not None:
+                self.on_error(self.seat, self.degrade_reason)
+            return self.teacher
+
+    def _build_external(self, spec: Any) -> Agent:
+        """外部引擎座位（akochan）：**不载权重**，每次决策起一次进程问。
+
+        失败（没装 / 崩 / 试跑不通过）也降级成教师 —— 跟权重模型一致，
+        绝不让「选了个坏的 AI」把牌桌卡住。实现见 :mod:`aimodel.external_akochan`。
+        """
+        from aimodel import external_akochan
+
+        self._missing = ()
+        if int(getattr(self, "players", 4) or 4) != 4:
+            self.degraded = True
+            self.degrade_reason = "akochan 只支持四麻"
+            log.warning("座位 %d 选了外部引擎 %s，但这是 %d 人局，降级教师",
+                        self.seat, spec.name, getattr(self, "players", 0))
+            if self.on_error is not None:
+                self.on_error(self.seat, self.degrade_reason)
+            return self.teacher
+        try:
+            agent = external_akochan.make_agent(seed=self.seed)
+            if not getattr(agent, "engine", None) or not agent.engine.available:
+                raise RuntimeError(getattr(getattr(agent, "engine", None), "why", "")
+                                   or "akochan 不可用")
+            log.info("座位 %d 使用外部引擎 %s（无权重文件，每次决策起一次进程）",
+                     self.seat, spec.name)
+            return agent
+        except Exception as exc:  # noqa: BLE001 - 外部引擎坏了不能崩整桌
+            self.degraded = True
+            self.degrade_reason = f"{type(exc).__name__}: {exc}"
+            log.warning("座位 %d 的外部引擎 %s 不可用，降级为内置教师：%s",
+                        self.seat, spec.name, self.degrade_reason)
             if self.on_error is not None:
                 self.on_error(self.seat, self.degrade_reason)
             return self.teacher
