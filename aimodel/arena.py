@@ -719,12 +719,13 @@ class Arena:
 
         ⚠️ 内部走的就是 :meth:`_settle`（和 ``run_match()`` 同一条路径 ✓）——
            两条路径必然一致 ✓ 这是「重算 == 真打」的地基 ✓
+        ⚠️ **不涨 ``done_total``** ✗ —— 它是「真的打了多少局」的服务级进度；
+           重算/续跑重建不是新打的局 ✓ 涨了会把配额算成两倍 ✓
         """
         start = (S.rule_for(self.players).start_score
                  if start_score is None else start_score)
         self._settle(list(group), list(ranks), list(scores), None, start)
         self.n_matches += 1
-        self.done_total += 1
 
     def replay_ranks(self, records: Iterable[dict], *, fresh: bool = True,
                      before_settle=None) -> int:
