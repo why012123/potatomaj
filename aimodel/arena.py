@@ -27,7 +27,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import variants
+from . import external, variants
 from .agents import Agent, HeuristicAgent, MLAgent, RandomAgent
 from . import sanma as S
 from .engine import Game
@@ -46,7 +46,7 @@ class Participant:
     key: str  #: 唯一标识，例如 "maj-flashv1.2#2"（同一个模型的第 2 号参赛者）
     label: str  #: 显示名
     players: int  #: 3 或 4
-    kind: str  #: model / teacher / random
+    kind: str  #: model / teacher / random / strong / external
     source: str = ""  #: 权重来源（同一个模型派出的多个参赛者共用一份权重）
     version: str = ""  #: 模型版本（基线为空）
     style: str = ""  #: 风格（基线为空）
@@ -61,6 +61,7 @@ class Participant:
     deal_in: int = 0  #: 放铳次数
     ranks: list[int] = field(default_factory=list)
     floor_hits: int = 0  #: 有多少次被打到 0 分（保底触底次数）
+    external_failures: int = 0  #: 外部 AI 超时/崩溃/降级的次数（kind="external"）
     matches: list[dict] = field(default_factory=list)  #: 逐场明细（点开看战绩用）
     history: list[float] = field(default_factory=list)  #: 分数曲线
 
@@ -199,6 +200,27 @@ def collect(
                 key=f"random{n}#{i}", label=f"随机（{n}麻基线）{suffix}",
                 source=f"random{n}", players=n, kind="random",
             ))
+        # 规则型强化 agent（aimodel/strong.py）：和教师/随机一样是**基线**
+        # 而不是权重模型，所以不进 variants 注册表、也不吃 copies。
+        out.append(Participant(
+            key=f"strong{n}", label=f"规则·强（{n}麻）",
+            source="strong", players=n, kind="strong", style="规则",
+        ))
+    # 外部 mjai AI（manue / Mortal / …）只支持四麻；装好了才进池子。
+    # 天梯里用 kind="external" 和 nn 模型区分，label 直接带许可证/语言。
+    if players in (None, 4):
+        for key in sorted(external.SPECS):
+            sp = external.SPECS[key]
+            if sp.protocol != "mjai-stdio" or sp.players != 4:
+                continue
+            ok, _why = external.check_spec(sp)
+            if not ok:
+                continue
+            out.append(Participant(
+                key=f"external:{key}",
+                label=f"{sp.title}（外部·{sp.license}·{sp.language}）",
+                source=key, players=4, kind="external", style="外部 AI",
+            ))
     return out
 
 
@@ -297,11 +319,23 @@ class Arena:
         return group
 
     # -- 出牌的人 -----------------------------------------------------------
-    def _agent(self, p: Participant, seed: int) -> Agent:
+    def _agent(self, p: Participant, seed: int, seat: int = 0) -> Agent:
+        if p.kind == "external":
+            # 单步 2s、崩一次自动重启、再崩降级教师（平台/天梯都不能卡桌）
+            return external.ExternalMJaiAgent(
+                p.source, seed=seed, player_id=seat, players=self.players,
+                # 平台默认 2s；天梯给 3s，避免 manue 的蒙特卡洛偶发 >2s 被误判
+                timeout=3.0, max_restarts=1,
+                fallback=HeuristicAgent(seed),
+            )
         if p.kind == "teacher":
             return HeuristicAgent(seed)
         if p.kind == "random":
             return RandomAgent(seed)
+        if p.kind == "strong":
+            from .strong import make as make_strong
+
+            return make_strong("strong", seed)
         src = p.source or p.key          # 同一个模型派出的多个参赛者共用权重
         net = self._nets.get(src)
         if net is None:
@@ -320,8 +354,20 @@ class Arena:
         if group is None:
             return None
         seed = self.seed_of(self.n_matches)
-        agents = [self._agent(p, seed * self.players + i) for i, p in enumerate(group)]
-        r = Game(agents, seed=seed, rounds=self.players).play()
+        agents = [self._agent(p, seed * self.players + i, seat=i)
+                  for i, p in enumerate(group)]
+        game = Game(agents, seed=seed, rounds=self.players)
+        external.attach(game)
+        try:
+            r = game.play()
+        finally:
+            # 外部 AI 这局失败了几次（超时 / 崩溃 / 降级），天梯页要能看见
+            for p, ag in zip(group, agents):
+                if p.kind == "external":
+                    errs = int(getattr(ag, "errors", 0) or 0)
+                    if errs or getattr(ag, "degraded", False):
+                        p.external_failures += max(1, errs)
+            external.close_external(agents)
         ranks = list(r.ranks)
         start_score = S.rule_for(self.players).start_score
         self._settle(group, ranks, r.scores, r, start_score)
@@ -418,7 +464,8 @@ class Arena:
         rows = []
         for p in sorted(self.participants, key=lambda x: -x.rating):
             rows.append({
-                "名": p.label, "模型": p.source or p.key, "人数": p.players,
+                "名": p.label, "模型": p.source or p.key, "类型": p.kind,
+                "人数": p.players,
                 "版本": p.version, "风格": p.style,
                 "分数": round(p.rating, 1), "场数": p.games, "一位": p.wins,
                 "末位": p.last, "平均顺位": round(p.avg_rank + 1, 2) if p.ranks else 0,
@@ -426,6 +473,7 @@ class Arena:
                 "放铳率": round(p.deal_in_rate, 4), "局数": p.hands,
                 "点数分": round(p.score_term, 1), "名次分": round(p.place_term, 1),
                 "触底": p.floor_hits,
+                "外部失败": p.external_failures,
                 "状态": "0分保底" if (p.at_floor and p.games) else "存活",
                 "曲线": p.history[-120:],
             })
@@ -438,6 +486,7 @@ class Arena:
             return None
         return {
             "key": p.key, "label": p.label, "模型": p.source or p.key,
+            "类型": p.kind,
             "版本": p.version, "风格": p.style, "人数": p.players,
             "分数": round(p.rating, 1), "场数": p.games,
             "一位": p.wins, "末位": p.last,
@@ -446,6 +495,7 @@ class Arena:
             "平均顺位": round(p.avg_rank + 1, 2) if p.ranks else 0,
             "名次分": round(p.place_term, 1), "点数分": round(p.score_term, 1),
             "局数": p.hands, "触底": p.floor_hits,
+            "外部失败": p.external_failures,
             "状态": "0分保底" if (p.at_floor and p.games) else "存活",
             "曲线": p.history,
             "对局": list(reversed(p.matches)),     # 新的在前

@@ -33,6 +33,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
+from aimodel import external
 from aimodel import sanma as S
 from aimodel.engine import Game
 
@@ -330,6 +331,10 @@ class Room:
         self._between_evt.set()
         for hs in list(self.human_seats.values()):
             hs.cancel(reason)
+        try:
+            external.close_external(getattr(self, "_agents", ()) or ())
+        except Exception:  # noqa: BLE001
+            log.exception("房间 %s 关闭外部 AI 失败", self.id)
         log.info("房间 %s 关闭 %s", self.id, f"（{reason}）" if reason else "")
 
     # ------------------------------------------------------------------
@@ -365,6 +370,7 @@ class Room:
                     workers=self.cfg.ai_workers,
                     delay=self.ai_delay,
                     seed=seed0 + i * 7919,
+                    players=self.players,
                     on_error=self._on_ai_error,
                     recorder=self.recorder,
                 )
@@ -484,6 +490,11 @@ class Room:
             self._push_event(None, {"type": "error",
                                     "message": f"引擎异常：{self.error}"})
         finally:
+            # 房间结束 / 异常 / Ctrl-C：一定要把外部 AI 子进程 kill 干净
+            try:
+                external.close_external(getattr(self, "_agents", ()) or ())
+            except Exception:  # noqa: BLE001
+                log.exception("房间 %s 关闭外部 AI 失败", self.id)
             with self.lock:
                 self.phase = PHASE_FINISHED
                 self.finished_at = self.finished_at or time.time()
@@ -646,6 +657,14 @@ class Room:
            观战的人看到的就是「牌桌卡住了」。``broadcast_later`` 自带 30fps 合并。
         """
         kind = ev.get("kind")
+        # 外部 mjai AI：把完整事件流交给桥自己缓冲（feed 只排队、不推理）
+        for seat_agent in getattr(self.game, "agents", ()) or ():
+            inner = getattr(seat_agent, "agent", seat_agent)
+            if isinstance(inner, external.ExternalMJaiAgent):
+                try:
+                    inner.feed(ev)
+                except Exception:  # noqa: BLE001 - 外部 AI 不能拖垮房间
+                    log.exception("房间 %s 转发事件给外部 AI 失败", self.id)
         if os.environ.get("MAJ_DEBUG_PUSH"):
             log.info("ACT %s kind=%s conns=%d", self.id, kind, len(self.conns))
         if kind == "start_hand":
@@ -1505,6 +1524,8 @@ def _ai_label(model: str | None) -> str:
         return "AI·教师"
     if model == "random":
         return "AI·随机"
+    if model.startswith("strong"):
+        return "AI·强规则"
     try:
         spec = variants.get(model)
     except KeyError:

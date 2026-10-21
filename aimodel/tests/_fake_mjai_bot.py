@@ -91,6 +91,9 @@ def handle(ev: dict) -> dict | None:
             sys.stderr.write("fake bot: intentional crash\n")
             sys.stderr.flush()
             raise SystemExit(3)
+        if MODE == "badjson":
+            print("this is not json", flush=True)
+            return None
         if last_draw == "?":
             return {"type": "none"}
         if MODE == "illegal":
