@@ -28,6 +28,7 @@ import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Iterable
 
 from . import external, variants
 from .agents import Agent, HeuristicAgent, MLAgent, RandomAgent
@@ -75,6 +76,14 @@ def normalize_externals(externals: str | list[str] | tuple[str, ...] | None) -> 
     return out
 
 
+#: **初始分**（三麻/四麻同）。每期开局都从这里重新起算 ✓
+#: ⚠️ 回填脚本 ``tools/elo_reseason.py`` 也读这一个常量 ✗ 不许另写一份数字 ✗
+INITIAL_RATING = 500.0
+
+#: ELO 的期望分底数：``10 ** ((对手分 - 自己分) / 400)``
+ELO_SCALE = 400.0
+
+
 @dataclass
 class Participant:
     """一个参战者（某个模型的某个版本，或者教师 / 随机基线）。"""
@@ -86,7 +95,7 @@ class Participant:
     source: str = ""  #: 权重来源（同一个模型派出的多个参赛者共用一份权重）
     version: str = ""  #: 模型版本（基线为空）
     style: str = ""  #: 风格（基线为空）
-    rating: float = 500.0
+    rating: float = INITIAL_RATING
     games: int = 0
     wins: int = 0  #: 一位次数
     last: int = 0  #: 末位次数
@@ -112,6 +121,41 @@ class Participant:
     #: 启动时 ``external.check_spec`` 的结果（不启动进程；只用于「装没装」展示）
     external_available: bool = True
     external_reason: str = ""
+
+    def reset_for_season(self) -> None:
+        """**开新一期**：分数回到初始分，本期成绩清零。
+
+        为什么要单独一个方法：官方天梯改成**每期独立**了 —— 每期从
+        :data:`INITIAL_RATING` 重新起算，跨期不可比 ✓
+        （用户 2026-10-21 实测：rating 946 -> 1209 -> 1462 -> 1680 一路累积 ✗）
+
+        ⚠️ 这里只清「**本期**」的东西 ✗ —— 服务级的累计进度 ``Arena.done_total``
+           不归它管 ✓（配额/调度看那个 ✓ 两个计数器绝不能混 ✗）
+        """
+        self.rating = INITIAL_RATING
+        self.games = 0
+        self.wins = 0
+        self.last = 0
+        self.score_term = 0.0
+        self.place_term = 0.0
+        self.hands = 0
+        self.agari = 0
+        self.deal_in = 0
+        self.ranks = []
+        self.floor_hits = 0
+        self.external_failures = 0
+        self.matches = []
+        self.history = []
+        # 外部参战者（Mortal 等）的**本场/本期**统计也要归零 ✓
+        # ⚠️ ``external``（spec key）/ ``external_available`` / ``external_reason``
+        #    **不能清** ✗ —— 那是「装没装」的启动事实，不是本期成绩 ✓
+        self.external_games = 0
+        self.external_failed = 0
+        self.external_errors = 0
+        self.external_timeouts = 0
+        self.external_crashes = 0
+        self.external_bad_actions = 0
+        self.external_last_error = ""
 
     @property
     def alive(self) -> bool:
@@ -481,6 +525,50 @@ def collect(
     return out
 
 
+# ---------------------------------------------------------------------------
+# ELO 结算的**纯函数**部分（不碰 Participant，可单独回声/回填）
+# ---------------------------------------------------------------------------
+
+
+def elo_place_terms(ratings: list[float], ranks: list[int], k: float) -> list[float]:
+    """多人大逃杀 ELO 的「**额外段位分**」增量（一局，纯函数）。
+
+    桌上**每两个人之间**都算一次对局：名次靠前 = 赢 1、靠后 = 赢 0、并列 = 0.5，
+    再乘上「期望胜率」``1 / (1 + 10 ** ((对手分 - 自己分) / 400))``，最后除以
+    ``n - 1`` 摊回单人对局的量级。这就是 :meth:`Arena._settle` 里那段两重循环。
+
+    ⚠️ **抽出来是为了「两条路径必一致」** ✗ 不是为了好看 ✗
+       —— 实时跑局（``run_match`` -> ``_settle``）和回填（``tools/elo_reseason.py``
+       用 ``matches.jsonl`` 里的 ``ranks`` 重算）**必须走同一份算法** ✓
+       否则重算出来的分和真打出来的分对不上，而两边都不会报错（静默错 ✗）
+    """
+    n = len(ratings)
+    terms = [0.0] * n
+    if n < 2:
+        return terms                     # 1 个人没法两两结算（也别除 0 ✗）
+    for i in range(n):
+        acc = 0.0
+        for j in range(n):
+            if i == j:
+                continue
+            s = (1.0 if ranks[i] < ranks[j]
+                 else (0.0 if ranks[i] > ranks[j] else 0.5))
+            e = 1.0 / (1.0 + 10 ** ((ratings[j] - ratings[i]) / ELO_SCALE))
+            acc += s - e
+        terms[i] = k / (n - 1) * acc
+    return terms
+
+
+def point_terms(scores: list[int], start_score: int, divisor: float) -> list[float]:
+    """「**点数段位分**」增量：``(最终点数 - 初始点数) / divisor``。
+
+    ``divisor`` 为 0 就是关掉点数项（只按名次算）✓
+    """
+    if not divisor:
+        return [0.0] * len(scores)
+    return [(s - start_score) / divisor for s in scores]
+
+
 class Arena:
     """一张天梯榜 + 匹配 + ELO 结算。"""
 
@@ -536,6 +624,11 @@ class Arena:
                          externals=self.externals)
         )
         self.n_matches = 0
+        #: **服务级累计**场次（跨期只增不减 ✓）。与 :attr:`n_matches` 分开 ✗：
+        #:   · ``n_matches`` = **本期**场次序号（派生牌山种子 + 页面「本期进度」）
+        #:   · ``done_total`` = 这个池子从建起来到现在一共跑了多少场（配额/调度看它）
+        #:   混在一起就会出现「一期 4000 局，页面写 48000」那种口径错 ✗
+        self.done_total = 0
         self.log: list[str] = []
         self._nets: dict[str, Net] = {}
         self._rng = random.Random(seed)
@@ -552,6 +645,7 @@ class Arena:
             "players": self.players, "k": self.k, "max_gap": self.max_gap,
             "n_matches": self.n_matches, "seed": self.seed, "copies": self.copies,
             "divisor": self.divisor,
+            "done_total": self.done_total,
             "externals": list(self.externals),
             "external_timeout": self.external_timeout,
             "external_max_restarts": self.external_max_restarts,
@@ -585,6 +679,8 @@ class Arena:
                 external_max_restarts=d.get("external_max_restarts", 1),
                 external_reuse=d.get("external_reuse", True))
         a.n_matches = d.get("n_matches", 0)
+        # 老格式的 arena.json 没有 done_total（那时 n_matches 本身就是累计值）✓
+        a.done_total = int(d.get("done_total", d.get("n_matches", 0)) or 0)
         a.external_matches = d.get("external_matches", 0)
         a.external_failed = d.get("external_failed", 0)
         a.external_decisions = d.get("external_decisions", 0)
@@ -595,6 +691,81 @@ class Arena:
         for seat in self._external_seats.values():
             seat.close()
         self._external_seats.clear()
+
+
+    # -- 期次边界 -----------------------------------------------------------
+    def new_season(self) -> None:
+        """**开新一期**：rating 回到初始分、本期成绩清零、本期场次序号归零。
+
+        ⚠️ ``done_total`` **不清零** ✗ —— 它是服务级累计进度（配额/调度看它 ✓）
+        ⚠️ ``n_matches`` **要清零** ✓ —— 它是**本期**场次序号：
+           1) 派生牌山种子 ``seed_of(index)``；2) 页面「本期进度」。
+           不清零的话下一期的进度会从上一期的数字接着数 ✗（口径错 ✗）
+        """
+        for p in self.participants:
+            p.reset_for_season()
+        self.n_matches = 0
+        self.log.clear()
+
+    def keyed(self) -> dict[str, Participant]:
+        """``key -> Participant`` 的查找表（回填/续跑按 key 找人）。"""
+        return {p.key: p for p in self.participants}
+
+    def settle_ranks(self, group: list[Participant], ranks: list[int],
+                     scores: list[int], start_score: int | None = None) -> None:
+        """按**已有的名次/点数**结算一局：**不重打牌**，只跑 ELO 更新。
+
+        给「从 ``matches.jsonl`` 回算」用（``tools/elo_reseason.py``、重启续跑重建）。
+
+        ⚠️ 内部走的就是 :meth:`_settle`（和 ``run_match()`` 同一条路径 ✓）——
+           两条路径必然一致 ✓ 这是「重算 == 真打」的地基 ✓
+        """
+        start = (S.rule_for(self.players).start_score
+                 if start_score is None else start_score)
+        self._settle(list(group), list(ranks), list(scores), None, start)
+        self.n_matches += 1
+        self.done_total += 1
+
+    def replay_ranks(self, records: Iterable[dict], *, fresh: bool = True,
+                     before_settle=None) -> int:
+        """把一串 ``{group, ranks, scores}`` 逐局结算回来 —— **不重打牌**。
+
+        用途（两处共用同一条路径 ✓）：
+          · 回填历史：``tools/elo_reseason.py`` 按新口径重算各期
+          · 重启续跑：某期只落了 ``matches.jsonl``、没有 ``arena.json`` 时重建分数
+
+        ``fresh=True`` 先 :meth:`new_season`（本期从 :data:`INITIAL_RATING` 重开 ✓）。
+        ``before_settle(group, ranks, scores)``：结算**之前**回调一次 ——
+        回填脚本用它取「这一桌当时的分数」（算对手强度用 ✓），不改结算结果 ✓
+        返回真正结算了几局。
+        """
+        if fresh:
+            self.new_season()
+        by_key = self.keyed()
+        n = 0
+        for rec in records:
+            keys = [str(k) for k in (rec.get("group") or [])]
+            if not keys:
+                continue
+            group: list[Participant] = []
+            for k in keys:
+                p = by_key.get(k)
+                if p is None:
+                    # 名单对不上就**炸** ✗ —— 悄悄跳过会算出一份「少了几个人」的假表 ✗
+                    raise KeyError(f"对局里有名单外的参战者：{k!r}")
+                group.append(p)
+            ranks = list(rec.get("ranks") or [])
+            if len(ranks) != len(group):
+                raise ValueError(f"ranks 长度 {len(ranks)} != 人数 {len(group)}")
+            scores = list(rec.get("scores") or [])
+            if len(scores) != len(group):
+                # 早期存档可能没存点数 -> 点数项按 0 记（名次项照常 ✓）
+                scores = [0] * len(group)
+            if before_settle is not None:
+                before_settle(group, ranks, scores)
+            self.settle_ranks(group, ranks, scores)
+            n += 1
+        return n
 
     # -- 匹配 ---------------------------------------------------------------
     #: 上场数低于池内均值的这个比例 -> **强制**给它一张桌（即使超 max_gap）
@@ -802,6 +973,7 @@ class Arena:
             start_score = S.rule_for(self.players).start_score
             self._settle(group, ranks, r.scores, r, start_score)
             self.n_matches += 1
+            self.done_total += 1
 
             # 外部座位的「本场计数」-> 参战者累计 + 全局累计
             for s in seats:
@@ -856,22 +1028,17 @@ class Arena:
         * **额外段位分**：多人大逃杀 ELO，桌上两两结算，名次靠前算赢
         * **点数段位分**：``(最终点数 - 初始点数) / 500``，可正可负 ——
           这样「同样第 2 名，赢 2 万分」和「小输 3 千」不该是同一个分
+
+        ⚠️ 两项增量分别来自 :func:`elo_place_terms` / :func:`point_terms` ✗
+           不许在这里另写一份公式 ✗ —— 回填脚本和实时跑局必须**同一份算法** ✓
         """
         n = len(group)
-        delta = [0.0] * n
-        for i in range(n):
-            for j in range(n):
-                if i == j:
-                    continue
-                s = 1.0 if ranks[i] < ranks[j] else (0.0 if ranks[i] > ranks[j] else 0.5)
-                e = 1.0 / (1.0 + 10 ** ((group[j].rating - group[i].rating) / 400.0))
-                delta[i] += (s - e)
+        place = elo_place_terms([p.rating for p in group], ranks, self.k)
+        points = point_terms(scores, start_score, self.divisor)
         for i, p in enumerate(group):
             before = p.rating
-            place_term = self.k / (n - 1) * delta[i]          # 额外段位分
-            score_term = (
-                (scores[i] - start_score) / self.divisor if self.divisor else 0.0
-            )
+            place_term = place[i]                              # 额外段位分
+            score_term = points[i]                             # 点数段位分
             raw = p.rating + place_term + score_term
             if raw <= 0.0:                       # 0 分保底，不出局
                 p.floor_hits += 1
