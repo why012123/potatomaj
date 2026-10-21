@@ -318,10 +318,72 @@ def main() -> int:
 
     shutil.rmtree(tmp, ignore_errors=True)
 
+    # =====================================================================
+    print("\n⑦ 前瞻：当前 pick() 下 4000 局的场次分布（可比性的地基）")
+    # =====================================================================
+    # 为什么要单独模拟：历史那 7 期的 matches.jsonl 是**旧 pick()** 抽出来的，
+    # 重算只改分数口径、改不了「当时谁上过桌」✗
+    # -> 那 7 期在「同场次量级」这条上必然不达标；
+    #    新 pick() 的效果只能这样**只模拟抽人 + 结算**（不打牌，1 秒级）来验 ✓
+    fair = _sim_draws(lambda a, rng: a.pick())
+    print(f"        新 pick()：均值 {fair['mean']:.1f}  min {fair['min']}  "
+          f"max {fair['max']}  CV {fair['cv']:.4f}  ±20% 内 {fair['pct']:.1f}%")
+    check("新 pick()：4000 局后每人场次**全部**落在均值 ±20% 内",
+          fair["pct"] == 100.0, str(fair))
+    check("新 pick()：变异系数 < 0.05（不是「大致均匀」，是真均匀）",
+          fair["cv"] < 0.05, str(fair["cv"]))
+    # 负向对照：换成「永远取分最高的 4 个」这种抽法 -> 上面那条必红
+    unfair = _sim_draws(
+        lambda a, rng: sorted(a.participants, key=lambda p: -p.rating)[:4])
+    print(f"        对照（永远取分最高的 4 个）：均值 {unfair['mean']:.1f}  "
+          f"min {unfair['min']}  max {unfair['max']}  ±20% 内 {unfair['pct']:.1f}%")
+    check("负向对照：不公平抽法在**同一个判据**下不通过（说明这条判据不恒真 ✓）",
+          unfair["pct"] < 100.0 and unfair["cv"] > 0.05, str(unfair))
+
     print("\n" + "=" * 78)
     print(f"  通过 {PASS}  🔴 失败 {FAIL}")
     print("=" * 78)
     return 0 if FAIL == 0 else 1
+
+
+def _many(n_models: int = 18, copies: int = 3) -> list[Participant]:
+    """官方天梯的规模：18 个模型 × 3 份 = 54 个参战者。"""
+    return [Participant(key=f"m{m:02d}#{c}", label=f"M{m:02d} #{c}", players=4,
+                        kind="model", source=f"m{m:02d}")
+            for m in range(n_models) for c in range(1, copies + 1)]
+
+
+def _sim_draws(choose, *, matches: int = 4000, seed: int = 7) -> dict:
+    """**只模拟抽人 + ELO 结算**（不打牌），返回每人上场次数的分布。
+
+    ``choose(arena, rng)`` 返回这一桌的 4 个人（``arena.pick()`` 或任何抽法）。
+    名次随机（所有人一样强）—— 这样量到的就是**纯抽人公平性** ✓
+    """
+    import statistics
+
+    rng = random.Random(seed)
+    a = Arena(players=4, participants=_many(), seed=seed)
+    a.new_season()
+    start = 25000                                  # 四麻起始点数
+    for _ in range(matches):
+        group = choose(a, rng)
+        if not group:
+            break
+        ranks = [0, 1, 2, 3]
+        rng.shuffle(ranks)
+        # zero-sum 点数（和真四麻一样总和恒定），名次越高点数越多
+        scores = [start + int((1.5 - ranks[j]) * 8000)
+                  + rng.randrange(-3000, 3000) for j in range(4)]
+        drift = sum(scores) - 4 * start
+        scores = [s - drift // 4 for s in scores]
+        a.settle_ranks(group, ranks, scores)
+    g = [p.games for p in a.participants]
+    mean = sum(g) / len(g)
+    lo, hi = mean * 0.8, mean * 1.2
+    return {"mean": mean, "min": min(g), "max": max(g),
+            "cv": (statistics.pstdev(g) / mean) if mean else 0.0,
+            "pct": 100.0 * sum(1 for x in g if lo <= x <= hi) / len(g),
+            "matches": a.n_matches}
 
 
 def _session_with(parts: list[Participant]) -> SRV.Session:
