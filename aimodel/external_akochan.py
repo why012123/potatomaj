@@ -121,9 +121,10 @@ SUPPORTED_KINDS = frozenset({
     "discard", "tsumo", "ron", "riichi", "call", "chi", "kan", "kyuushu",
 })
 
-#: 子进程超时（秒）。正常决策点实测 0.34~1.4 秒；写错成非决策点会 ~10 秒后崩，
-#: 所以超时是**防线**而不是常态。
-DEFAULT_TIMEOUT = 6.0
+#: 子进程超时（秒）。正常决策点实测 0.34~1.4 秒（机器忙的时候见过 5.4 秒），
+#: 写错成非决策点会 ~10 秒后崩 —— 所以超时是**防线**而不是常态。
+#: 上限受平台 ``AISeat`` 的 20 秒约束，10 秒给「忙 + 兜底」留够余量。
+DEFAULT_TIMEOUT = 10.0
 
 #: OpenMP 线程数。16+ 会随机崩（见模块文档），8 稳定。
 DEFAULT_OMP_THREADS = 8
@@ -820,20 +821,25 @@ class _Serializer:
         for q in range(4):
             melds = self.melds_all[q]
             for j, m in enumerate(melds):
-                if not _is_call(m):
+                kind = str(getattr(m, "kind", ""))
+                is_kakan = kind == "kakan"
+                if not _is_call(m) and not is_kakan:
                     continue
                 target = int(getattr(m, "from_player", -1))
                 if target < 0 or target >= 4 or target == q:
                     continue
                 called = int(getattr(m, "called", -1))
-                tile = called if (str(m.kind) == "chi" and called >= 0) else int(m.tile)
+                tile = called if (kind == "chi" and called >= 0) else int(m.tile)
                 if id(m) in force_end:
                     pos = len(queues[target])
                 else:
                     frac = (j + 0.5) / max(1, len(melds))
                     pos = int(round(frac * len(queues[target])))
                 pos = max(0, min(len(queues[target]), pos))
-                queues[target].insert(pos, _Discard(tile, -1, call=(q, m)))
+                # 加杠：被「碰」走的那张也要留在打牌者的牌河里（可见牌要算它），
+                # 但**不要**在这里触发副露事件（碰+加杠在杠的那一回合一起发）
+                queues[target].insert(
+                    pos, _Discard(tile, -1, None if is_kakan else (q, m)))
         # 立直宣言牌
         for q in range(4):
             if not view.riichi[q]:
@@ -886,9 +892,10 @@ class _Serializer:
         view, seat = self.view, self.seat
         queues = self._queues()
         pending, pending_from = self._take_pending(queues)
-        pending_meld: Any = None
+        pending_meld: tuple[int, Any] | None = None
         if pending is None and self.kind == "ron" and self.tile is not None:
-            # 抢杠：最后一条应该是「对家的加杠」
+            # 抢杠：最后一条应该是「对家的加杠」（actor 是**杠的那家**，
+            # 不是 from_player —— from_player 是当初被碰的那家）
             for who in range(4):
                 if who == seat:
                     continue
@@ -896,7 +903,7 @@ class _Serializer:
                 for i, m in enumerate(ms):
                     if str(getattr(m, "kind", "")) == "kakan" \
                             and int(getattr(m, "tile", -1)) == self.tile:
-                        pending_meld = m
+                        pending_meld = (who, m)
                         self.melds_all[who] = ms[:i] + ms[i + 1:]
                         break
                 if pending_meld is not None:
@@ -905,6 +912,12 @@ class _Serializer:
         events: list[dict] = []
         actor = self.dealer
         need_draw = True
+        # 加杠在真实牌谱里是「先碰（那张打牌后面紧跟自己的打牌，**没有摸牌**），
+        # 之后自己回合再加杠」。这里为了简单把「碰 + 加杠」两条一起发在加杠回合，
+        # 于是那次「碰后打牌」的摸牌就凭空多出来了 -> 反推手牌会少一张（实测 12）。
+        # 补法：把自己的前 k 张普通打牌改成「没摸牌直接打」（k = 加杠组数）。
+        no_draw_left = sum(1 for m in self.melds_all[seat]
+                           if str(getattr(m, "kind", "")) == "kakan")
         guard = 0
         while True:
             guard += 1
@@ -920,8 +933,14 @@ class _Serializer:
                 actor, need_draw = nxt, True
                 continue
             d = queues[q].pop(0)
-            kan = self._next_self_kan(q, ptr)
+            # 自家的杠只能挂在**摸牌回合**（碰/吃之后那个回合没摸牌，
+            # 杠完的岭上补牌会跟着丢，反推手牌就对不上）
+            kan = self._next_self_kan(q, ptr) if need_draw else None
             drew = bool(need_draw)
+            if (drew and kan is None and q == seat and no_draw_left > 0):
+                # 见上：给「碰后那张打牌」补一个「没摸牌」的回合
+                drew = False
+                no_draw_left -= 1
             if drew:
                 events.append({"type": "tsumo", "actor": q,
                                "pai": _tile_name(int(kan.tile) if kan is not None
@@ -971,8 +990,8 @@ class _Serializer:
                 events.extend(_meld_events(q, ms[ptr[q]]))
                 ptr[q] += 1
         if pending_meld is not None:
-            who = int(getattr(pending_meld, "from_player", -1))
-            events.extend(_meld_events(who if who >= 0 else 0, pending_meld))
+            who, m = pending_meld
+            events.extend(_meld_events(who, m))
         if pending is not None:
             events.append({"type": "dahai", "actor": pending_from,
                            "pai": _tile_name(pending.tile),

@@ -167,12 +167,14 @@ def _compare(view: View, events: list[dict]) -> list:
             if pid == q or pid >= len(view.melds_all):
                 continue
             for m in view.melds_all[pid]:
-                if not A._is_call(m):
+                kind = str(m.kind)
+                # 加杠也「叫」过一张（原来的碰），那张同样进了牌河又被拿走
+                if not A._is_call(m) and kind != "kakan":
                     continue
                 if int(getattr(m, "from_player", -1)) != q:
                     continue
                 called_t = int(getattr(m, "called", -1))
-                if str(m.kind) == "chi" and called_t >= 0:
+                if kind == "chi" and called_t >= 0:
                     called.append(_akname(called_t))
                 else:
                     called.append(_akname(int(m.tile)))
@@ -184,6 +186,12 @@ def _compare(view: View, events: list[dict]) -> list:
         if not all(any(x == y for y in it) for x in pond_order):
             bad.append((f"pond_order{q}", ev_kawa, pond_order))
     # 4) 副露
+    #
+    # ⚠️ **不比顺序**：``View.melds`` 是「副露槽位的创建顺序」，而加杠是
+    # **原地升级**（``engine._do_kan`` 把那个 pon 换成 kakan）—— 加杠这个
+    # *动作* 发生在最后，但它在列表里的位置还是当初碰的位置。抢杠（别人加杠、
+    # 我们荣和）时最后一条事件必须是那个 kakan，所以重建出来的顺序跟 View 的
+    # 槽位顺序可能不同。akochan 的 ``fuuro`` 顺序不影响任何判断（它只按牌找）。
     for q in range(4):
         want_m = []
         for m in (view.melds_all[q] if q < len(view.melds_all) else []):
@@ -195,8 +203,8 @@ def _compare(view: View, events: list[dict]) -> list:
             want_m.append((A._CALL_TYPE[kind], _akname(tile), target))
         got_m = [(kind, pai, -1 if kind == "ankan" else int(target))
                  for (kind, pai, target) in st["melds"][q]]
-        if want_m != got_m:
-            bad.append((f"melds{q}", got_m, want_m))
+        if sorted(want_m) != sorted(got_m):
+            bad.append((f"melds{q}", sorted(got_m), sorted(want_m)))
     # 5) 宝牌指示牌
     want_d = sorted(_akname(int(x)) for x in view.dora_indicators)
     if sorted(st["dora"]) != want_d:
@@ -390,6 +398,86 @@ def test_three_player_rejected():
     assert 0 <= idx < len(dec.options)
     assert agent.fallbacks == 1, agent.fallbacks
     print("  ✅ 三麻直接被拒绝（抛 UnsupportedView / 座位走兜底）")
+
+
+class _KanHappy(Agent):
+    """教师，但**见杠就杠、见碰就碰** —— 专门逼出杠 / 岭上补牌这些路径。"""
+
+    def __init__(self, seed: int) -> None:
+        self.inner = HeuristicAgent(seed)
+
+    def decide(self, decision: Decision, view: View) -> int:
+        if decision.kind == "kan":
+            return 1
+        if decision.kind == "call" and "pon" in decision.options:
+            return decision.options.index("pon")
+        if decision.kind == "chi":
+            return 1
+        return int(self.inner.decide(decision, view))
+
+
+def test_kans_roundtrip():
+    """杠（暗杠 / 加杠）的往返一致性。
+
+    杠有两处特别容易错：
+
+    1. **加杠要拆成两条事件**（先 ``pon`` 再 ``kakan``）：akochan 的
+       ``replace_pon_to_kakan`` 只在已有的 ``fuuro`` 里找碰去替换，找不到就
+       什么都不做 —— 只发 ``kakan`` 的话这组杠在它眼里根本不存在。
+    2. **岭上补牌**：杠之后那张摸牌是岭上牌，如果既发「杠的两张摸牌」又发
+       「当前摸牌」，反推的初始手牌会多一张（实测 14 张）。
+    """
+    n_points = n_kan_state = n_rinshan = 0
+    for seed in (8, 20, 23):
+        spy = _Spy(_KanHappy(seed))
+        game = Game([spy] + [HeuristicAgent(seed + 1 + i) for i in range(3)],
+                    seed=seed, rule=S.rule_for(4), rounds=1, max_hands=2)
+        game.play()
+        tracker = A._HandTracker()
+        rinshan_key: tuple | None = None
+        armed = False
+        for dec, view, idx in spy.recs:
+            fp = A._HandTracker.fingerprint(view, view.player)
+            if dec.kind not in A.SUPPORTED_KINDS:
+                continue
+            if dec.kind == "discard" and view.drawn is None:
+                tracker.observe(view, view.player)
+                continue
+            # 「杠完的下一批决策」= 岭上补牌（跟座位里的 _rinshan_key 同一套规则）
+            if armed:
+                rinshan_key = fp
+                armed = False
+            held = bool(rinshan_key is not None and fp == rinshan_key)
+            if rinshan_key is not None and fp != rinshan_key:
+                rinshan_key = None
+                held = False
+            events = A.build_events(view, view.player, tracker, kind=dec.kind,
+                                    tile=dec.tile, held_is_rinshan=held)
+            bad = _compare(view, events)
+            assert not bad, f"seed={seed} kind={dec.kind}: 杠相关往返不一致 {bad}"
+            n_points += 1
+            if any(m.kind in ("ankan", "kakan") for m in view.melds):
+                n_kan_state += 1
+            if held:
+                n_rinshan += 1
+            # 加杠必须是 pon + kakan 两条，且紧挨着
+            for i, e in enumerate(events):
+                if e.get("type") != "kakan":
+                    continue
+                assert i > 0 and events[i - 1].get("type") == "pon", \
+                    f"seed={seed}: kakan 前面没有 pon"
+                assert events[i - 1].get("pai") == e.get("pai")
+            made_kan = ((dec.kind == "kan" and idx == 1)
+                        or (dec.kind == "call"
+                            and str(dec.options[idx]) == "kan"))
+            if made_kan:
+                armed = True
+                rinshan_key = None
+    assert n_points > 30, n_points
+    assert n_kan_state > 0, "没逼出杠，这个测试没意义"
+    assert n_rinshan > 0, "没走到岭上补牌的决策点"
+    print(f"  ✅ {n_points} 个决策点（含杠局面 {n_kan_state} / 岭上补牌 {n_rinshan}）"
+          f"往返一致；加杠都拆成了 pon+kakan")
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +694,7 @@ def main() -> int:
         test_tile_index_roundtrip,
         test_move_to_index,
         test_serialize_roundtrip,
+        test_kans_roundtrip,
         test_three_player_rejected,
         test_negative_no_moves,
         test_negative_timeout,
