@@ -1477,10 +1477,12 @@ class ExternalMJaiAgent(Agent):
             if typ in ("ankan", "kakan", "daiminkan"):
                 tile = _action_kan_tile(action)
                 if decision.tile is not None and tile is not None and tile != int(decision.tile):
-                    raise ExternalAIProtocolError(
-                        f"{self.name} 想杠 {_tile_name(tile)}，但引擎这一手只提供 "
-                        f"{_tile_name(int(decision.tile))}；拒绝静默改动作"
-                    )
+                    # 引擎对「每一种可杠的牌」**分别问一次**（engine.py 的抽牌阶段
+                    # 循环），而外部 AI 一个回合只给**一个**动作 —— 这不是协议错 ✗
+                    # 对这一张答"不杠"，把动作留在 _pending_action 里，
+                    # 等引擎问到它想杠的那张时再答"杠" ✓
+                    # （之前这里抛错 -> Mortal 一遇到多张可杠就整局崩 ✗）
+                    return _index_of(decision, "pass")
                 return _index_of(decision, "kan")
             return _index_of(decision, "pass")
 
