@@ -49,6 +49,7 @@ DOCS = {
     "test_external.py":    "外部 mjai AI 协议桥：正常/超时/崩溃/非法动作/确定性",
     "test_strong.py":      "规则强 agent：无役不鸣 / 有役该鸣 / 弃和安全 / 确定性 / 四三麻整局",
     "test_arena_external.py": "天梯接外部 AI（崩溃隔离）+ 抽人公平性（含 3 条负向）",
+    "test_season_independent.py": "天梯每期独立：两条路径一致 / 每期重置 / done_total 不混 / 两条负向验证",
 }
 
 #: 明确不跑的（目前没有）。放这里而不是「不写进列表」✗ —— 那样会变成静默跳过 ✓
