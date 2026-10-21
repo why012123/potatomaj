@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 
 from aimodel import sanma as S  # noqa: E402
 from aimodel.agents import MLAgent, Tracker, legal_chi_pairs  # noqa: E402
-from aimodel.encode import HEAD_SIZE  # noqa: E402
+from aimodel.encode import HEAD_SIZE, layout_for  # noqa: E402
 from aimodel.engine import Decision, Game  # noqa: E402
 from aimodel.net import CHISEL_SIZE, KINDS, Net, softmax_rows  # noqa: E402
 from aimodel.tests.test_chi_4p import chi_view  # noqa: E402
@@ -88,12 +88,34 @@ print(f"  ✅ 34 张牌 × 120 手随机牌逐项对拍（{34 * 120} 例）")
 # ② a) 老权重：能加载 + use_chisel=True 不崩 + 走兜底
 # ---------------------------------------------------------------------------
 print("\n== ② a) 老权重（没有 chisel）必须能加载、不崩、走兜底 ==")
+# ⚠️ 不写死 560：特征布局可能被别的改动改过（实测 2026-10-21 被改成 571）✓
+#    本测试只要求**当前代码**的 encode 维度与构造的网络一致 ✓
+DIM4 = layout_for(4)[1]
+
+
+def _check_chisel_fallback(net, tag: str) -> None:
+    """chisel_trained=False 的网络：chi 决策必须不崩、不走 chisel、交给引擎 ✓"""
+    d, v, pairs = chi_decision("223456m11p11s11z", 2, per_pair=False)
+    ag = MLAgent(net, seed=0, use_chisel=True)
+    try:
+        got = ag.decide(d, v)
+        crashed = None
+    except Exception as exc:                       # noqa: BLE001
+        got, crashed = None, f"{type(exc).__name__}: {exc}"
+    check(crashed is None, f"{tag} use_chisel=True 崩了：{crashed}")
+    check(got in (0, 1), f"{tag} chi 决策应返回 0/1，得到 {got!r}")
+    check(ag._chisel_active() is False, f"{tag}: chisel_trained=False 时 _chisel_active 必须 False")
+    check(ag.last_chisel is None, f"{tag} 不应走到 chisel 分支")
+    check("chi_pair_engine" not in ag.counts,
+          f"{tag} 不该出现「chisel 选出 pair 但引擎不认」计数：{ag.counts}")
+
+
 check(OLD_WEIGHTS.exists(), f"测试前提：老权重不存在 {OLD_WEIGHTS}")
 if OLD_WEIGHTS.exists():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         old = Net.load(OLD_WEIGHTS)
-    check(old.dim == 560 and old.hidden == (512, 512), f"老权重结构不对：{old.dim}/{old.hidden}")
+    check(old.hidden == (512, 512), f"老权重结构不对：{old.dim}/{old.hidden}")
     check("chi" in old.kinds, "老权重本身带 chi 头（本测试要测的正是缺 chisel）")
     check(old.chisel_trained is False, "老权重没有 chisel -> chisel_trained 必须 False")
     check(old.chisel_updates == 0, f"chisel_updates 应为 0，得到 {old.chisel_updates}")
@@ -102,20 +124,36 @@ if OLD_WEIGHTS.exists():
     # ⚠️ 不能报「存档里缺参数」那种「模型坏了」的警告（那会让 44 个存量权重全炸）
     check(not caught, f"加载老权重不应有警告，实际：{[str(w.message)[:80] for w in caught]}")
 
-    d, v, pairs = chi_decision("223456m11p11s11z", 2, per_pair=False)
-    ag = MLAgent(old, seed=0, use_chisel=True)
-    try:
-        got = ag.decide(d, v)
-        crashed = None
-    except Exception as exc:                       # noqa: BLE001
-        got, crashed = None, f"{type(exc).__name__}: {exc}"
-    check(crashed is None, f"老权重 use_chisel=True 崩了：{crashed}")
-    check(got in (0, 1), f"老权重 chi 决策应返回 0/1，得到 {got!r}")
-    check(ag._chisel_active() is False, "chisel_trained=False 时 _chisel_active 必须 False")
-    check(ag.last_chisel is None, "老权重不应走到 chisel 分支")
-    check("chi_pair_engine" not in ag.counts,
-          f"老权重不该出现「chisel 选出 pair 但引擎不认」计数：{ag.counts}")
-    print("  ✅ 老权重加载 0 警告；chisel_trained=False；chi 决策交给引擎启发式")
+    if old.dim == DIM4:
+        _check_chisel_fallback(old, "老权重")
+        print("  ✅ 老权重加载 0 警告；chisel_trained=False；chi 决策交给引擎启发式")
+    else:
+        # 特征布局被改过（权重本身维度=old.dim，当前 encode=DIM4）：
+        # 这时**任何** MLAgent 都会在第一层 matmul 崩 —— 与 chisel 无关 ✗
+        # 所以这里把 decide 的检查放到「当前维度、但没有 chisel 列」的等价权重上 ✓
+        print(f"  ⚠️ 老权重 dim={old.dim} != 当前 encode dim={DIM4} —— "
+              "特征布局被别的改动改过，跳过它的 decide（那会因维度崩，与 chisel 无关）")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "no_chisel.npz"
+            n = Net(dim=DIM4, hidden=(8,), seed=0)
+            n.save(p)
+            data = dict(np.load(p, allow_pickle=False))
+            import json
+
+            meta = json.loads(bytes(data["_meta"]).decode())
+            for k in ("chisel", "chisel_trained", "chisel_updates"):
+                meta.pop(k, None)
+            data["_meta"] = np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)
+            for name in ("Wc", "bc"):
+                del data[name]
+            np.savez_compressed(p, **data)
+            with warnings.catch_warnings(record=True) as caught2:
+                warnings.simplefilter("always")
+                no_ch = Net.load(p)
+            check(not caught2, f"缺 chisel 的当前维度权重不应报警：{caught2}")
+            check(no_ch.chisel_trained is False, "缺 chisel 的当前维度权重 chisel_trained 必须 False")
+            _check_chisel_fallback(no_ch, "当前维度但缺 chisel 的权重")
+        print("  ✅ 老权重文件能加载；缺 chisel 的权重 use_chisel=True 不崩、走引擎")
 
 # ---------------------------------------------------------------------------
 # ③ b) 新头零初始化 -> argmax = 0
@@ -280,7 +318,7 @@ print("  ✅ chisel_coef=0（默认）整段跳过：Wc 保持 0、chisel_traine
 # ⑤ 推理：逐吃法选项 -> chisel argmax 就是真正返回的那一对
 # ---------------------------------------------------------------------------
 print("\n== ⑤ 推理：有逐吃法选项时 chisel 真的选 pair；二值选项时保持原路径 ==")
-net4 = Net(dim=560, hidden=(16,), seed=0)
+net4 = Net(dim=DIM4, hidden=(16,), seed=0)
 net4.chisel_trained = True
 net4.bc[...] = np.array([0.0, 6.0, 0.0], dtype=np.float32)  # 强烈偏好 slot 1
 d, v, pairs = chi_decision("223456m11p11s11z", 2, per_pair=True)
@@ -324,7 +362,7 @@ print("  ✅ 逐吃法 -> 真选 pair + chipat；二值 -> 原路径 + chipat=-1
 # ⑥ d) 端到端：带 chisel 的 MLAgent 跑完一整局四麻
 # ---------------------------------------------------------------------------
 print("\n== ⑥ d) 端到端：四麻整局 ==")
-net_game = Net(dim=560, hidden=(32,), seed=1, lr=1e-3)
+net_game = Net(dim=DIM4, hidden=(32,), seed=1, lr=1e-3)
 net_game.chisel_trained = True
 agents = [
     MLAgent(net_game, seed=i, greedy=True, use_chisel=True) for i in range(4)

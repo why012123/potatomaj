@@ -60,11 +60,17 @@ def make_third(spec: str, seed: int, *, seat: int = 0, players: int = 3):
     if key is not None:
         return external.ExternalMJaiAgent(
             key, seed=seed, player_id=seat, players=players,
+            timeout=20.0, max_restarts=2,
         )
     if spec == "random":
         return RandomAgent(seed)
     if spec == "teacher":
         return HeuristicAgent(seed)
+    # 规则型强化 agent（见 aimodel/strong.py）：--third strong / strong:attack
+    if spec == "strong" or spec.startswith("strong:"):
+        from .strong import make as _make_strong
+
+        return _make_strong(spec, seed)
     # 打法风格陪练（见 aimodel/styles.py）：--third style:speed / style:defense / ...
     if spec.startswith("style:") or spec in _style_names():
         from .styles import make as _make_style

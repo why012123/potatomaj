@@ -100,8 +100,17 @@ def main() -> int:
     # --- 2. 人数/维度校验 --------------------------------------------
     O4, D4 = encode.layout_for(4)
     O3, D3 = encode.layout_for(3)
-    check("四麻布局是 560 维", D4 == 560, f"D4={D4}")
-    check("三麻布局是 486 维", D3 == 486, f"D3={D3}")
+    # 2026-10-21：末尾追加 match_state 17 / called_tile 34 / last_discard 34
+    # -> 3p 571、4p 645。这里**不写死新 DIM**，改成跟随布局；
+    # 同时钉住「只追加、老块一个都没挪」：老最后一块 tenpai 的 offset 不变。
+    check("四麻布局与 feature_blocks 求和一致",
+          D4 == sum(w for _, w in encode.feature_blocks(4)), f"D4={D4}")
+    check("三麻布局与 feature_blocks 求和一致",
+          D3 == sum(w for _, w in encode.feature_blocks(3)), f"D3={D3}")
+    check("四麻老块 offset 未变（tenpai 仍是 559）", O4.get("tenpai") == 559,
+          f"tenpai@{O4.get('tenpai')}")
+    check("三麻老块 offset 未变（tenpai 仍是 485）", O3.get("tenpai") == 485,
+          f"tenpai@{O3.get('tenpai')}")
 
     path4 = _dummy_model(D4, 4)
     try:

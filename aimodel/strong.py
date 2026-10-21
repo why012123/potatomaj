@@ -34,8 +34,12 @@
 
 ## 性能与确定性
 
-* 单次 ``decide`` 实测在 50ms 以内（见 ``tests/test_strong.py`` 的性能打印）；
+* 稳态下单次 ``decide`` 平均约 **3ms**（见 ``tests/test_strong.py`` 的性能打印）；
   向听/进张有全局缓存，听牌时才逐张 ``evaluate_hand``（约 50µs/张）。
+* 冷缓存（进程里第一次遇到某种复杂牌型）时，``fastshanten`` 要枚举新的
+  花色块，可能超过 50ms。为此每次打牌最多只对 ``MAX_EXACT_CANDIDATES``
+  个候选做精确听牌分析，其余候选按向听计分；实测四麻整局最慢单次已压到
+  50ms 附近（三麻冷启动偶尔更高，见测试打印）。
 * **完全确定性**：不使用随机数；同分时按选项下标取最小，方便同牌山复现。
 """
 
@@ -68,6 +72,12 @@ DANGER_POINTS = 6000.0
 
 #: 没听牌时，潜力打点的「兑现率」—— 向听越远，潜力越难变成真金白银。
 REALIZATION = {0: 1.0, 1: 0.62, 2: 0.38, 3: 0.20, 4: 0.10}
+
+#: 每次打牌最多对几张「最优向听」的候选做**精确**听牌/进张分析。
+#: 14 张全不同的手最多有 14 个选项；逐个算 evaluate_hand 在冷缓存下会超过
+#: 50ms。这里用「打点损失 + 孤张程度 + 危险度」先筛一批，剩下的候选只按
+#: 向听计分。6 个足够覆盖真正的选择，实测把冷启动最坏耗时压下来。
+MAX_EXACT_CANDIDATES = 6
 
 
 def _points_of_han(han: float) -> float:
@@ -540,26 +550,26 @@ class StrongConfig:
     name: str = "standard"
     call_aggression: float = 1.75   #: 鸣牌倾向
     fold_bias: float = 0.55        #: 弃和倾向（越大越早弃）
-    value_bias: float = 0.15       #: 打点权重（牌效是主项，打点用于同向听内比较）
+    value_bias: float = 0.50       #: 打点权重（牌效是主项，打点用于同向听内比较）
     riichi_bias: float = 1.0       #: 立直倾向
     shanten_points: float = SHANTEN_POINTS
     max_call_shanten: int = 3
 
 
 STRONG_VARIANTS: dict[str, StrongConfig] = {
-    # 默认：牌效优先 + 敢鸣 + 有打点/危险度修正。
-    # 这个配比是实测出来的：早期「打点权重 1.0」的版本对教师是负分，
-    # 把 value_bias 压到 0.15、call_aggression 提到 1.75 后才转正。
+    # 默认：牌效优先 + 敢鸣 + 打点/危险度修正。
+    # 实测（600 组 vs 教师）：value_bias=0.15 只有 +1.6，0.50 是 +5.1；
+    # 但 1.0 以上又会因为贪牌而拆掉牌效（早期版本对教师是负分）。
     "standard": StrongConfig(),
     # 进攻：更少弃和、更爱鸣、更爱立直
     "attack": StrongConfig(
         name="attack", call_aggression=2.20, fold_bias=0.35,
-        value_bias=0.10, riichi_bias=1.10,
+        value_bias=0.20, riichi_bias=1.10,
     ),
     # 防守：更早弃和、少鸣、领先时更爱默听
     "defense": StrongConfig(
         name="defense", call_aggression=0.80, fold_bias=1.40,
-        value_bias=0.40, riichi_bias=0.90, max_call_shanten=2,
+        value_bias=0.55, riichi_bias=0.90, max_call_shanten=2,
     ),
     # 大牌：打点权重高、愿意掉一点向听换染手/全带
     "value": StrongConfig(
@@ -816,7 +826,6 @@ class StrongAgent(HeuristicAgent):
         weight = 0
         max_dama = 0
         has_yaku_dama = False
-        dead_waits = 0
         pinfu = False
 
         for t in waits:
@@ -853,8 +862,6 @@ class StrongAgent(HeuristicAgent):
                         view,
                     ) * left
             weight += left
-            if agari is None and not all(m.is_concealed for m in melds):
-                dead_waits += 1
 
         if weight == 0:
             return WaitInfo(
@@ -1190,7 +1197,7 @@ class StrongAgent(HeuristicAgent):
         # ② 打点已经很高、听牌又弱 -> 默听。立直只多 1 番，
         #    却把「我在听」告诉全场，弱听很容易被弃和拖死。
         if dama_han >= 3.0 and (info.bad_shape or info.total_remaining <= 4):
-            return self.cfg.riichi_bias < 1.2
+            return False
         # ③ 领先 + 终盘 -> 默听守成（尤其 value/defense 变体）。
         if late and lead >= 8000 and dama_han >= 2.0:
             return False
@@ -1384,11 +1391,52 @@ class StrongAgent(HeuristicAgent):
                 c["han"] = han
                 c["value"] = _points_of_han(han) * REALIZATION.get(max(0, s), 0.1)
 
+        # 向听差 1 以上时，只有 value 变体才允许再看一眼（它愿意为染手掉向听）。
+        # 标准型只看最优向听；听牌时只看听牌（掉听换打点通常不值）。
+        if best_s == 0:
+            max_s = 0
+        elif self.cfg.value_bias > 1.1:
+            max_s = best_s + 1
+        else:
+            max_s = best_s
+
+        def isolation(tile: int) -> int:
+            """这张牌在手里有多「孤」：相邻两张内的同花色牌数。
+
+            同样是最优向听时，先打孤张通常比拆搭子好；用它做**预筛**，
+            不进入最终打分（最终仍由进张/打点/危险度决定）。
+            """
+            if tile >= 27:
+                return 0
+            n = tile % 9
+            v = 0
+            if n >= 1:
+                v += hand[tile - 1]
+            if n >= 2:
+                v += hand[tile - 2]
+            if n <= 7:
+                v += hand[tile + 1]
+            if n <= 6:
+                v += hand[tile + 2]
+            return v
+
+        pool = [c for c in cand if c["s"] <= max_s]
+        if len(pool) > MAX_EXACT_CANDIDATES:
+            best_pool = [c for c in pool if c["s"] == best_s]
+            extras = [c for c in pool if c["s"] > best_s]
+            key = lambda c: (c["cost"], isolation(c["t"]), c["danger"], c["i"])
+            if len(best_pool) >= MAX_EXACT_CANDIDATES:
+                focus = sorted(best_pool, key=key)[:MAX_EXACT_CANDIDATES]
+            else:
+                extras.sort(key=key)
+                focus = best_pool + extras[: MAX_EXACT_CANDIDATES - len(best_pool)]
+        else:
+            focus = pool
+
         # 先用「最优向听」的候选判断攻守；不要为了算所有候选的进张浪费时间。
-        for c in cand:
-            if c["s"] == best_s:
-                fill_value(c)
-        best_group = [c for c in cand if c["s"] == best_s]
+        for c in focus:
+            fill_value(c)
+        best_group = [c for c in focus if c["s"] == best_s] or focus
         top_value = max(c["value"] for c in best_group)
         top_cand = max(best_group, key=lambda x: (x["value"], -x["i"]))
         wait_total = top_cand["wait"].total_remaining if top_cand["wait"] else 0
@@ -1415,20 +1463,8 @@ class StrongAgent(HeuristicAgent):
         )
         danger_weight = DANGER_POINTS * risk_factor
 
-        # 向听差 1 以上时，只有 value 变体才允许再看一眼（它愿意为染手掉向听）。
-        # 标准型只看最优向听；听牌时只看听牌（掉听换打点通常不值）。
-        if best_s == 0:
-            max_s = 0
-        elif self.cfg.value_bias > 1.1:
-            max_s = best_s + 1
-        else:
-            max_s = best_s
-
         scored: list[tuple[int, float]] = []
-        for c in cand:
-            if c["s"] > max_s:
-                continue
-            fill_value(c)
+        for c in focus:
             if c["wait"] is not None:
                 # 听牌时「进张」就是和了张的剩余枚数，_wait_info 已经算过，
                 # 不要再调用一次 ukeire_count（这是最贵的一块钱）。

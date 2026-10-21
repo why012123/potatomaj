@@ -94,6 +94,27 @@ class View:
     last_discard: tuple[int, int] | None  # (打牌者, 牌型)
     rule: S.Rule
 
+    # -- 整场状态（2026-10-21 追加；**全部带默认值**，老构造点不用改）------
+    #: 自己是否振听（①自己打过的牌是自己的听牌张 ②立直后漏和 ③同巡漏和）
+    furiten: bool = False
+    #: 当前第几局：东1=1..东4=4，南入后接着数（三麻默认东风战只到 3）
+    kyoku: int = 1
+    #: 本场数（连庄 +1，换庄清零）
+    honba: int = 0
+    #: 供托（与 ``Game.sticks`` 同步）
+    kyotaku: int = 0
+    #: 本局是否由连庄而来（``play()`` 里的 renchan 驱动）
+    dealer_repeat: bool = False
+    #: 本场还剩几局要打（含本局；= ``rounds - 已换庄次数``，不低于 0）
+    hands_left: int = 0
+    #: 每人当前顺位 **1..n**（1 = 一位；注意 ``Sanma.ranks_of`` 返回的是 0 起）
+    ranks: tuple = ()
+    #: 每家牌河逐张是否摸切：``tuple[tuple[bool, ...], ...]``，与 ``discards`` 等长
+    tsumogiri: tuple = ()
+    #: 当前决策「被叫 / 被和」的那张牌（牌型下标）；非鸣牌/荣和决策为 ``None``。
+    #: 由 ``Game._ask_choice`` 填（仅 ron / call / chi），供 ``encode`` 编 one-hot。
+    called_tile: int | None = None
+
     @property
     def hand_size(self) -> int:
         return sum(self.hand)
@@ -132,6 +153,14 @@ class Player:
     discards: list[int] = field(default_factory=list)
     #: 牌河：被碰走的牌会被拿走，所以这里和 discards 不完全一样
     pond: list[int] = field(default_factory=list)
+    #: 与 ``pond`` **逐张平行**的摸切标记（打的是刚摸的那张 = True）。
+    #: 被碰/杠拿走时和 pond 一起删，长度必须始终相等。
+    pond_tsumogiri: list[bool] = field(default_factory=list)
+    #: 本巡「错过可和之张」的巡目（``Game.turn`` 原值）；-1 = 没有。
+    #: 自己打牌后清掉 —— 这就是同巡振听（临时振听）。
+    missed_ron_turn: int = -1
+    #: 立直后错过可和之张 -> **立直振听（永久）**，本局内不再清。
+    missed_ron_riichi: bool = False
     riichi: bool = False
     double_riichi: bool = False
     #: 立直宣言牌（宣布立直之后打出的那一张）。前端要横放标「立直」，
@@ -306,6 +335,17 @@ class Game:
         )
         self.scores = list(self.start_scores)
         self.dealer = dealer
+        # -- 整场状态（View 里那 8 个字段的真值都在这里跟踪）----------------
+        #: 当前第几局。换庄 +1（东1 起，南入后接着数）。
+        #: 三麻默认东风战 rounds=3 -> 东1..东3；四麻 -> 东1..东4。
+        self.kyoku = 1 if round_wind == S.EAST else 5
+        #: 本场数。连庄 +1；换庄清零。
+        self.honba = 0
+        #: 本局是否由连庄而来。由 ``play()`` 里已有的 renchan 判断驱动，
+        #: 换庄时 False；``play_hand`` 被单独调用时保持 False。
+        self.dealer_repeat = False
+        #: 本场还剩几局（含本局）= rounds - 已换庄次数，不低于 0。
+        self.hands_left = max(0, self.rounds)
         self.max_hands = max_hands
         self.on_event = on_event
         #: 结构化动作钩子（导出牌谱 / 回放 / 对拍用；见 :meth:`_act`）
@@ -352,6 +392,11 @@ class Game:
         dealer = self.dealer
         seat_rounds = 0
         while len(self.hands) < self.max_hands:
+            # 本局还剩几局（含本局）—— 连庄不减少，换庄才 -1
+            self.hands_left = max(0, self.rounds - seat_rounds)
+            # 当前第几局：东1..东4 = 1..4；南入从 **5** 起（三麻只有东1..东3，
+            # 南1 也是 5 —— 不能让它落在 4，否则 one-hot 会被当成「东4」）。
+            self.kyoku = (4 if self.round_wind == S.SOUTH else 0) + seat_rounds + 1
             # 局间钩子：可以在这里挂住等玩家点「下一局」（传进去的是已打完的局数）
             if self.on_between is not None and self.hands:
                 self.on_between(len(self.hands))
@@ -373,6 +418,14 @@ class Game:
                 or res.kind in ("kyuushu", "abort")
                 or (res.kind == "draw" and res.tenpai[dealer])
             )
+            # 下一局是否是「连庄」。honba 连庄 +1、换庄清零（供托 sticks 另算）。
+            self.dealer_repeat = bool(renchan)
+            if renchan:
+                self.honba += 1
+            else:
+                self.honba = 0
+                # kyoku 不在这里自增：下一轮开头按 round_wind + seat_rounds 重算，
+                # 南入后会直接跳到 5（而不是把「南1」算成「东4」）。
             if not renchan:
                 dealer = (dealer + 1) % self.n
                 seat_rounds += 1
@@ -736,6 +789,10 @@ class Game:
 
     def _finish_discard(self, p: int, tile: int, turn: int) -> None:
         pl = self.players[p]
+        # 摸切 = 打出的正是刚摸进来的那张。**必须在清 drawn 之前算**：
+        # 老代码先 `pl.drawn = None` 再 `_act(..., tsumogiri=(pl.drawn is None))`
+        # -> 永远 True（external.py:1089 还专门为这个 bug 写了绕行）。
+        tsumogiri = pl.drawn is not None and pl.drawn == tile
         # 刚宣布立直后的第一张打牌 = 立直宣言牌
         if pl.riichi and pl.riichi_tile is None:
             pl.riichi_tile = tile
@@ -744,13 +801,16 @@ class Game:
             pl.red[tile] -= 1
         pl.discards.append(tile)
         pl.pond.append(tile)
+        pl.pond_tsumogiri.append(tsumogiri)
         pl.drawn = None
         pl.kuikae_tile = -1
+        # 自己打牌 -> 同巡漏和（临时振听）清掉
+        pl.missed_ron_turn = -1
         self.last_discard = (p, tile)
         if pl.riichi and pl.ippatsu and len(pl.discards) > pl.riichi_discards + 1:
             pl.ippatsu = False
         self._log(f"  [{self._seat_name(p)}] 打 {S.tile_cn(tile)}")
-        self._act("discard", player=p, tile=tile, tsumogiri=(pl.drawn is None),
+        self._act("discard", player=p, tile=tile, tsumogiri=tsumogiri,
                   riichi=pl.riichi)
 
     def _after_discard(
@@ -775,6 +835,13 @@ class Game:
                 continue
             if self._ask_choice(q, "ron", ["yes", "no"], tile=tile) == 1:
                 pl.passed_ron = True
+                # 同巡漏和（临时振听）/ 立直后漏和（立直振听，永久）。
+                # 只在**真的能和**（有役）时记 —— 「可和之张」是按能成立的和牌算的。
+                ctx0 = self._win_context(q, tile, tsumo=False, turn=turn)
+                if S.evaluate_hand(c, pl.melds, ctx0) is not None:
+                    pl.missed_ron_turn = turn
+                    if pl.riichi:
+                        pl.missed_ron_riichi = True
                 continue
             ctx = self._win_context(q, tile, tsumo=False, turn=turn)
             ctx.is_houtei = (not from_kita) and self.wall_left() == 0
@@ -792,9 +859,29 @@ class Game:
             return self._settle_ron(q, p, tile, agari, turn)
         return self._settle_multi_ron(winners, p, tile, turn)
 
-    def _is_furiten(self, p: int) -> bool:
+    def _is_furiten(self, p: int, *, tenpai_only: bool = False) -> bool:
+        """振听判定（和 :meth:`view_for` 里的 ``View.furiten`` 同一套规则）。
+
+        * ①自己打过的牌是自己的听牌张（永久）
+        * ②立直后漏和（立直振听，永久；以前只靠 ``passed_ron`` 管一巡，是 bug）
+        * ③同巡漏和（临时；``missed_ron_turn`` 与当前巡目相同）
+
+        ``tenpai_only=True``：给 ``view_for`` 用。引擎内部的调用点（荣和询问）
+        本来就只对听牌家调用，不需要额外判向听；而 ``view_for`` 对**任何**决策
+        都会算，非听牌手的 ``useful_tiles`` 返回的是「进张」不是「和牌张」，
+        不加这道门槛会把「打过一张进张」误报成振听。
+        """
         pl = self.players[p]
-        waits = set(useful_tiles(pl.hand, len(pl.melds)))
+        if pl.missed_ron_turn == self.turn:
+            return True
+        if pl.riichi and pl.missed_ron_riichi:
+            return True
+        base: int | None = None
+        if tenpai_only:
+            base = shanten(pl.hand, len(pl.melds))
+            if base != 0:
+                return False
+        waits = set(useful_tiles(pl.hand, len(pl.melds), base=base))
         return any(t in waits for t in pl.discards)
 
     def _check_call(self, tile: int, from_p: int) -> tuple[int | None, bool]:
@@ -866,11 +953,18 @@ class Game:
                   from_player=from_p, consumed=[a, b])
 
     def _take_from_pond(self, p: int, tile: int) -> None:
-        """被碰/杠走的牌从牌河里拿掉（但打牌历史保留，振听照算）。"""
-        pond = self.players[p].pond
+        """被碰/杠走的牌从牌河里拿掉（但打牌历史保留，振听照算）。
+
+        ``pond_tsumogiri`` 与 ``pond`` **逐张平行** —— 删 pond 时必须删同一
+        下标，否则之后所有摸切标记都会错位。
+        """
+        pl = self.players[p]
+        pond = pl.pond
         for i in range(len(pond) - 1, -1, -1):
             if pond[i] == tile:
                 del pond[i]
+                if i < len(pl.pond_tsumogiri):
+                    del pl.pond_tsumogiri[i]
                 return
 
     def _do_pon(self, p: int, tile: int, from_p: int) -> None:
@@ -912,6 +1006,14 @@ class Game:
             if sum(c) != (4 - len(pl.melds)) * 3 + 2 or shanten(c, len(pl.melds)) >= 0:
                 continue
             if self._ask_choice(p, "ron", ["yes", "no"], tile=tile) == 1:
+                # 抢杠也按「漏和」算：同巡 / 立直后漏和都要留在状态里
+                ctx0 = self._win_context(p, tile, tsumo=False, turn=turn)
+                ctx0.is_chankan = True
+                ctx0.is_houtei = False
+                if S.evaluate_hand(c, pl.melds, ctx0) is not None:
+                    pl.missed_ron_turn = turn
+                    if pl.riichi:
+                        pl.missed_ron_riichi = True
                 continue
             ctx = self._win_context(p, tile, tsumo=False, turn=turn)
             ctx.is_chankan = True
@@ -1072,7 +1174,13 @@ class Game:
         return HandResult(kind="draw", deltas=tuple(deltas), tenpai=tuple(tenpai), turns=turn)
 
     # -- 与 agent 的接口 -----------------------------------------------------
-    def view_for(self, p: int) -> View:
+    def view_for(self, p: int, called_tile: int | None = None) -> View:
+        """构造 ``p`` 这个决策点能看到的 View。
+
+        ``called_tile`` 是**当前决策**「被叫 / 被和」的那张牌（吃碰杠/荣和时由
+        :meth:`_ask_choice` 传进来）；普通摸打/立直决策为 ``None``。
+        它是 agent 本来就能看到的公开信息（别人打出来的那张），不是泄漏。
+        """
         pl = self.players[p]
         return View(
             player=p,
@@ -1094,10 +1202,25 @@ class Game:
             is_dealer=(p == self.dealer),
             last_discard=self.last_discard,
             rule=self.rule,
+            # -- 整场状态 ---------------------------------------------------
+            # 与引擎的 _is_furiten 用**同一个判据**，免得 View 和实际可和性打架
+            furiten=self._is_furiten(p, tenpai_only=True),
+            kyoku=self.kyoku,
+            honba=self.honba,
+            kyotaku=self.sticks,
+            dealer_repeat=self.dealer_repeat,
+            hands_left=self.hands_left,
+            # S.ranks_of 返回 **0 起**（0 = 一位）；View 按文档统一成 1..n
+            ranks=tuple(r + 1 for r in S.ranks_of(self.scores)),
+            tsumogiri=tuple(tuple(q.pond_tsumogiri) for q in self.players),
+            called_tile=called_tile,
         )
 
     def _ask_choice(self, p: int, kind: str, options: list, tile: int | None = None) -> int:
-        view = self.view_for(p)
+        # 只有「吃 / 碰杠 / 荣和」才是叫牌 —— 自己摸打/立直/拔北/暗杠的 tile
+        # 不是「被别人叫出来的那张」，不能进 called_tile 特征。
+        called = tile if kind in ("ron", "call", "chi") else None
+        view = self.view_for(p, called_tile=called)
         i = self.agents[p].decide(Decision(kind, options, tile), view)
         if not isinstance(i, int) or not (0 <= i < len(options)):
             i = 0

@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
-from aimodel import variants
+from aimodel import external, variants
 from aimodel.agents import Agent, HeuristicAgent, MLAgent, RandomAgent
 from aimodel.engine import Decision, View
 
@@ -119,14 +119,26 @@ def probe_model(name: str, players: int | None = None) -> tuple[bool, str]:
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
     want = int(getattr(net, "dim", 0) or 0)
-    got = _encode_dim(n)
-    if want and want != got:
-        return False, (f"特征维度对不上：权重 {want} 维，当前 encode({n}人) "
-                       f"{got} 维 —— 表示改过了，必须重训")
+    allowed = _allowed_dims(n)
+    if want and want not in allowed:
+        return False, (f"特征维度对不上：权重 {want} 维，当前支持 {sorted(allowed)} 维"
+                       f"（老布局用冻结 encoder 跑，不需要重训）")
     missing = net_missing_heads(net)
     if missing:
         return True, f"未训练 {'/'.join(missing)}（这些动作交给内置教师）"
     return True, ""
+
+
+@lru_cache(maxsize=8)
+def _allowed_dims(players: int) -> tuple[int, ...]:
+    """当前可用的特征维度：**新布局 + 冻结老布局**都算合法。
+
+    老布局（四麻 560 / 三麻 486）继续用 :mod:`aimodel.encode_legacy` 跑，
+    所以存量权重（含线上 ``mac_rl`` 与 ELO 历史）不需要重训。
+    """
+    from aimodel.feature_dispatch import known_dims
+
+    return tuple(sorted(known_dims(players)))
 
 
 @lru_cache(maxsize=8)
@@ -237,6 +249,27 @@ def available_models(refresh: bool = False) -> list[dict]:
                 "missing": True,
                 "note": "没有权重文件",
             }
+    # 规则型强化 agent（aimodel/strong.py）—— **没有权重文件**，
+    # 但也要作为可选模型出现在下拉里。四麻用 ``strong``、三麻用 ``strong3``；
+    # 名字前缀会被 AISeat / make_builtin_agent 识别，不会去 variants 查权重。
+    for n, name, cn in (
+        (4, "strong", "四麻·规则强（无权重）"),
+        (3, "strong3", "三麻·规则强（无权重）"),
+    ):
+        out[name] = {
+            "name": name,
+            "players": n,
+            "style": "strong",
+            "style_cn": "强规则",
+            "cn": cn,
+            "version": "rule",
+            "usable": True,
+            "missing_heads": [],
+            "note": "纯规则 agent，不加载任何权重",
+        }
+    # 外部 mjai AI（manue / Mortal / …）也当可选模型；只是检查文件，不启动进程
+    for row in external.external_models(4):
+        out.setdefault(row["name"], row)
     rows = list(out.values())
     rows.sort(key=lambda m: (m["players"], m["style"], m["version"]))
     _MODEL_CACHE = rows
@@ -244,10 +277,17 @@ def available_models(refresh: bool = False) -> list[dict]:
 
 
 def make_builtin_agent(spec: str, seed: int) -> Agent:
-    """内置座位：``teacher`` / ``random`` / ``policy``。"""
+    """内置座位：``teacher`` / ``random`` / ``policy`` / ``strong[:变体]``。"""
     s = (spec or "teacher").strip().lower()
     if s in ("random", "r"):
         return RandomAgent(seed)
+    # 纯规则强化 agent：不读权重，支持 strong / strong:attack / strong3 / strong4
+    if s.startswith("strong"):
+        from aimodel.strong import make as make_strong
+
+        if s in ("strong3", "strong4"):
+            s = "strong"
+        return make_strong(s, seed)
     if s in ("policy", "ml", "net"):
         try:
             return MLAgent(load_net("policy"), seed=seed, greedy=True)
@@ -449,11 +489,13 @@ class AISeat(Agent):
         workers: int,
         delay: float = 0.0,
         seed: int = 0,
+        players: int = 4,
         on_error=None,
         recorder: Any = None,
     ) -> None:
         self.seat = seat
         self.model = model
+        self.players = int(players)
         self.workers = workers
         self.delay = delay
         self.seed = seed
@@ -464,6 +506,7 @@ class AISeat(Agent):
         self.errors = 0
         self.decisions = 0
         self._missing: tuple[str, ...] = ()
+        self._external: external.ExternalMJaiAgent | None = None
         self.teacher = HeuristicAgent(seed)
         self.agent: Agent = self._build(model)
         #: 这个模型缺哪些决策头（缺的那些动作直接交给教师）
@@ -474,6 +517,42 @@ class AISeat(Agent):
         name = (model or "").strip().lower()
         if not name or name in ("teacher", "random"):
             return make_builtin_agent(name or "teacher", self.seed)
+        # 纯规则 agent 没有权重、也不需要 probe；直接返回，别掉进 variants 的
+        # KeyError 降级路径（那会把它静默换成教师）。
+        if name.startswith("strong"):
+            return make_builtin_agent(name, self.seed)
+        # 外部 mjai AI（manue / Mortal / …）：协议桥见 aimodel/external.py
+        ext_key = external.normalize_key(name)
+        if ext_key is not None:
+            if self.players != 4:
+                self.degraded = True
+                self.degrade_reason = "外部 AI 只支持四麻"
+                log.warning("座位 %d 选了外部 AI %s，但这是 %d 人局，降级教师",
+                            self.seat, name, self.players)
+                if self.on_error is not None:
+                    self.on_error(self.seat, self.degrade_reason)
+                return self.teacher
+            try:
+                self._external = external.ExternalMJaiAgent(
+                    ext_key, seed=self.seed, player_id=self.seat,
+                    players=4,
+                    timeout=2.0,        # 单步 2s，超时走教师兜底
+                    max_restarts=1,     # 崩一次自动重启；再崩降级
+                    fallback=self.teacher,
+                )
+                log.info("座位 %d 使用外部 AI：%s（%s/%s）", self.seat,
+                         self._external.spec.title,
+                         self._external.spec.license,
+                         self._external.spec.language)
+                return self._external
+            except Exception as exc:  # noqa: BLE001 - 没装不能崩整桌
+                self.degraded = True
+                self.degrade_reason = f"{type(exc).__name__}: {exc}"
+                log.warning("座位 %d 的外部 AI %s 不可用，降级教师：%s",
+                            self.seat, name, self.degrade_reason)
+                if self.on_error is not None:
+                    self.on_error(self.seat, self.degrade_reason)
+                return self.teacher
         try:
             spec = variants.get(name)
             net = load_net(spec.name)
@@ -514,11 +593,11 @@ class AISeat(Agent):
            「四麻模型一直静默降级」的真原因。
         """
         want = int(getattr(net, "dim", 0) or 0)
-        got = _encode_dim(players)
-        if want and want != got:
+        allowed = _allowed_dims(players)
+        if want and want not in allowed:
             raise ValueError(
-                f"特征维度对不上：这个权重是 {want} 维，当前代码在 {players} 人局下"
-                f"编出 {got} 维 —— 表示改过了，该权重必须重训"
+                f"特征维度对不上：这个权重是 {want} 维，当前支持 {sorted(allowed)} 维"
+                f"（{players} 人局；老布局走 aimodel.encode_legacy，不需要重训）"
             )
 
     def _degrade(self, exc: BaseException) -> None:
@@ -560,6 +639,14 @@ class AISeat(Agent):
                 self._degrade(exc)
                 index = int(self.teacher.decide(decision, view))
                 source = "teacher_fallback"
+        if (not self.degraded and self._external is not None
+                and self._external.degraded):
+            self.degraded = True
+            self.degrade_reason = self._external.degrade_reason
+            log.warning("座位 %d 的外部 AI 运行中降级：%s", self.seat,
+                        self.degrade_reason)
+            if self.on_error is not None:
+                self.on_error(self.seat, self.degrade_reason)
         if self.recorder is not None:
             try:
                 self.recorder.record_decision(
@@ -577,6 +664,8 @@ class AISeat(Agent):
             "degraded": self.degraded,
             "degrade_reason": self.degrade_reason,
             "errors": self.errors,
+            "external": (self._external.summary()
+                         if self._external is not None else None),
         }
 
 

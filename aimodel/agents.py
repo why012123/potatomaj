@@ -17,6 +17,8 @@ from typing import Sequence
 import numpy as np
 
 from . import sanma as S
+from .feature_dispatch import action_features_for as _action_features_for
+from .feature_dispatch import encode_for as _encode_for
 from .encode import (
     ACTION_DIM,
     HEAD_SIZE,
@@ -557,6 +559,18 @@ class MLAgent(Agent):
         #: ``{"pair": (a,b), "slot": k, "legal": [...], "logits": [...]}``
         self.last_chisel: dict | None = None
 
+    @property
+    def dim(self) -> int:
+        """这个权重需要的特征维度（560 老布局 / 645 新布局）。"""
+        return int(getattr(self.net, "dim", 0) or 0)
+
+    def encode_view(self, view: View) -> np.ndarray:
+        """按**权重维度**选 encoder —— 老权重继续用旧特征（生产不停摆）。"""
+        return _encode_for(self.dim, view.rule.players, view)
+
+    def action_features_of(self, view: View) -> np.ndarray:
+        return _action_features_for(self.dim, view.rule.players, view)
+
     def _chisel_active(self) -> bool:
         """chisel 头**可不可用**：开关开着 + 权重真的训过 + 有接口 ✓
 
@@ -651,10 +665,10 @@ class MLAgent(Agent):
         kind = decision.kind
         if kind not in HEAD_SIZE or kind not in getattr(self.net, "kinds", []):
             return self.fallback.decide(decision, view)
-        x = encode(view)
+        x = self.encode_view(view)
         mask = action_mask(decision)
         size = HEAD_SIZE[kind]
-        actfeat = action_features(view) if kind == "discard" else None
+        actfeat = self.action_features_of(view) if kind == "discard" else None
         if self.temperature != 1.0:
             head, logp, _ = self._sample_tempered(x, kind, mask[:size], actfeat)
         else:
@@ -666,6 +680,10 @@ class MLAgent(Agent):
         # 拿不到逐吃法选项时保持 -1 ✗ 不能把「心想的 pair」当成实际标签 ✗
         chipat = -1
         choice = None
+        if kind == "chi":
+            # 每一手 chi 决策都先清掉上一手的诊断信息 ✓
+            # 否则「这一手 chisel 没跑（过 / 无合法吃法）」会读到**上一手**的 pair ✗
+            self.last_chisel = None
         if kind == "chi" and head == 1 and self._chisel_active():
             got = self._chisel_pick(x, decision, view)
             if got is not None:
