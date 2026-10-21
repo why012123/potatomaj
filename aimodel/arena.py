@@ -83,6 +83,27 @@ INITIAL_RATING = 500.0
 #: ELO 的期望分底数：``10 ** ((对手分 - 自己分) / 400)``
 ELO_SCALE = 400.0
 
+#: 每期牌山种子的**步长**取值范围（含两端）。2026-10-21 用户定。
+SEED_STEP_MIN = 8000
+SEED_STEP_MAX = 160000
+
+
+def new_seed_pair(rng: random.Random | None = None) -> tuple[int, int]:
+    """生成一期的 ``(base_seed, seed_step)``，两个都随机。
+
+    为什么不能写死：原来 ``seed=0`` + 步长 7919，任何一期的第 n 局牌山都一样 ✗
+    —— 不同期的同种子对局会重复，等于白打。
+
+    结算：第 ``n`` 局的种子 = ``base + n * step``。两个数都存进 ``arena.json``，
+    所以同一期内仍然可复现（回放用 ``matches.jsonl`` 里每局的 seed，不受影响）✓
+    """
+    import secrets
+
+    r = rng or random.Random(secrets.randbits(63))
+    base = r.randrange(1, 2 ** 31 - 1)
+    step = r.randrange(SEED_STEP_MIN, SEED_STEP_MAX + 1)
+    return base, step
+
 
 @dataclass
 class Participant:
@@ -493,11 +514,17 @@ def collect(
                 source=f"random{n}", players=n, kind="random",
             ))
         # 规则型强化 agent（aimodel/strong.py）：和教师/随机一样是**基线**
-        # 而不是权重模型，所以不进 variants 注册表、也不吃 copies。
-        out.append(Participant(
-            key=f"strong{n}", label=f"规则·强（{n}麻）",
-            source="strong", players=n, kind="strong", style="规则",
-        ))
+        # 而不是权重模型，所以不进 variants 注册表。
+        # ⚠️ 但它**要派 copies 个实例**（2026-10-21 用户定）✗ —— 单实例的话
+        #    它上场次数只有 3 副本模型的 1/3，ELO 标准误约 1.7 倍，
+        #    实测出现过「一位率 27.4% 却比一位率 27.5% 的人高 258 分」的怪象 ✗
+        for i in range(1, max(1, copies) + 1):
+            suffix = f" #{i}" if copies > 1 else ""
+            out.append(Participant(
+                key=f"strong{n}#{i}" if copies > 1 else f"strong{n}",
+                label=f"规则·强（{n}麻）{suffix}",
+                source="strong", players=n, kind="strong", style="规则",
+            ))
 
     # 外部 AI（Mortal 等）：**默认不进来**；调用方显式给 externals 才加。
     # 名字解析 / 安装检查都在这做；没装也照加（比赛时降级教师并记
@@ -510,18 +537,23 @@ def collect(
                 f"请用 --players {sp.players}（外部 AI 目前只有四麻）"
             )
         ok, why = external.check_spec(sp)
-        out.append(Participant(
-            key=f"external:{sp.key}",
-            label=sp.title,
-            players=sp.players,
-            kind="external",
-            source=sp.key,
-            version="外部",
-            style="外部 AI",
-            external=sp.key,
-            external_available=bool(ok),
-            external_reason=why,
-        ))
+        # ⚠️ 外部 AI 也派 copies 个实例（2026-10-21 用户定）✓
+        #    participant 只带 spec key；真正起进程的是 ExternalSeatAgent（每局按座位），
+        #    所以 3 个实例 = 3 个独立座位、各自进程/缓存，不会串味 ✓
+        for i in range(1, max(1, copies) + 1):
+            suffix = f" #{i}" if copies > 1 else ""
+            out.append(Participant(
+                key=f"external:{sp.key}#{i}" if copies > 1 else f"external:{sp.key}",
+                label=f"{sp.title}{suffix}",
+                players=sp.players,
+                kind="external",
+                source=sp.key,
+                version="外部",
+                style="外部 AI",
+                external=sp.key,
+                external_available=bool(ok),
+                external_reason=why,
+            ))
     return out
 
 
@@ -578,10 +610,10 @@ class Arena:
         k: float = 24.0,
         max_gap: float = 200.0,
         strict: bool = True,
-        seed: int = 0,
+        seed: int | None = None,
         participants: list[Participant] | None = None,
         copies: int = 3,
-        divisor: float = 500.0,
+        divisor: float = 1000.0,
         models: list[str] | None = None,
         externals: str | list[str] | None = None,
         external_timeout: float | None = None,
@@ -598,6 +630,10 @@ class Arena:
         self.max_gap = max_gap
         self.strict = strict
         self.seed = seed
+        #: 每期牌山种子的**步长**。第 n 局种子 = seed + n * seed_step。
+        #: 2026-10-21 用户定：base seed 与步长都要随机（步长 [8000, 160000]），
+        #: 否则每期牌山序列完全一样 ✗（原来步长写死 7919）
+        self.seed_step = 7919
         #: 外部参战者（spec key）。None = 看环境变量；[] = 明确一个都不要。
         if participants is not None and externals is None:
             externals = [p.external for p in participants
@@ -644,6 +680,7 @@ class Arena:
         data = {
             "players": self.players, "k": self.k, "max_gap": self.max_gap,
             "n_matches": self.n_matches, "seed": self.seed, "copies": self.copies,
+            "seed_step": self.seed_step,
             "divisor": self.divisor,
             "done_total": self.done_total,
             "externals": list(self.externals),
@@ -674,11 +711,13 @@ class Arena:
         a = cls(players=d.get("players", 3), k=d.get("k", 24.0),
                 max_gap=d.get("max_gap", 200.0), participants=parts,
                 copies=d.get("copies", 3), seed=d.get("seed", 0),
-                divisor=d.get("divisor", 500.0), externals=exts,
+                divisor=d.get("divisor", 1000.0), externals=exts,
                 external_timeout=d.get("external_timeout", 8.0),
                 external_max_restarts=d.get("external_max_restarts", 1),
                 external_reuse=d.get("external_reuse", True))
         a.n_matches = d.get("n_matches", 0)
+        # 老格式没有 seed_step -> 回退到旧的写死值 7919，读回来才能复现老档 ✓
+        a.seed_step = int(d.get("seed_step", 7919) or 7919)
         # 老格式的 arena.json 没有 done_total（那时 n_matches 本身就是累计值）✓
         a.done_total = int(d.get("done_total", d.get("n_matches", 0)) or 0)
         a.external_matches = d.get("external_matches", 0)
@@ -706,6 +745,8 @@ class Arena:
             p.reset_for_season()
         self.n_matches = 0
         self.log.clear()
+        # 每期换一套牌山：base seed 与步长都重新随机（2026-10-21 用户定）
+        self.seed, self.seed_step = new_seed_pair()
 
     def keyed(self) -> dict[str, Participant]:
         """``key -> Participant`` 的查找表（回填/续跑按 key 找人）。"""
@@ -903,7 +944,7 @@ class Arena:
     def seed_of(self, index: int) -> int:
         """第 ``index`` 场的随机种子。**只跟种子基数和场次序号有关** ——
         同一套参战者、同一个顺序，重跑就得到一模一样的牌。"""
-        return self.seed + index * 7919
+        return self.seed + index * self.seed_step
 
     def _external_seat(self, p: Participant, seed: int, player_id: int) -> ExternalSeatAgent:
         seat = self._external_seats.get(p.key)
