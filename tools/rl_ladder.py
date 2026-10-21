@@ -109,8 +109,15 @@ def read_meta(path: Path) -> tuple[int, str, int]:
 
 
 def parse_paired(text: str) -> tuple[float, float]:
-    """从 arena_test 的输出里取「配对差值」与「单侧 p」。取不到就抛。"""
-    d = re.search(r"配对差值（A−B）\s+(-?\d+(?:\.\d+)?)", text)
+    """从 arena_test 的输出里取「配对差值」与「单侧 p」。取不到就抛。
+
+    ⚠️ 差值**必须带符号**（`[-+]?`）✗
+       原来写的是 `-?` ✗ -> 只认负数 ✗
+       而 2026-10-21 09:1x 实测：种子 0 的配对赛输出是 `配对差值（A−B）  +1.781`
+       -> **正数匹配不上** ✗ -> 整个种子被判失败 ✗
+       （那次结果本身是好的 ✓ 只是被我的正则拦掉了 ✗）
+    """
+    d = re.search(r"配对差值（A−B）\s+([-+]?\d+(?:\.\d+)?)", text)
     p = re.search(r"单侧 p ≈ (\d+(?:\.\d+)?)", text)
     if not d or not p:
         raise ValueError("配对赛结果解析不出「配对差值 / 单侧 p」—— 判据不明，不能继续")
