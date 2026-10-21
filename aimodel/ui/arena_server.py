@@ -1,4 +1,4 @@
-"""ELO 混战池的网页界面：一个后台线程一直打，页面实时看天梯 + 图表。
+﻿"""ELO 混战池的网页界面：一个后台线程一直打，页面实时看天梯 + 图表。
 
 跑法::
 
@@ -998,7 +998,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--models", nargs="*", default=None,
                     help="只让这几个模型参赛（默认全部）✓ 要写带版本号的正名，"
                          "例：--models maj-normal4v1.2 maj-pro4v1.1")
-    ap.add_argument("--divisor", type=float, default=500.0,
+    ap.add_argument("--divisor", type=float, default=1000.0,
                     help="点数段位分的除数（0 = 关掉点数项，只按名次算）")
     ap.add_argument("--external", nargs="*", default=None,
                     help="把外部 mjai AI 加进天梯（如 mortal-akagi）；"
