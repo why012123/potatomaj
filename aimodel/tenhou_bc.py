@@ -72,6 +72,26 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MODEL = "maj-normal4v1.3"
 
 
+def _legal_chi_pairs(hand, tile: int) -> list[tuple[int, int]]:
+    """给定被吃的那张，返回**手里真有**的 (a,b) 组合，按 (a,b) 升序 ✓
+
+    例：吃 4s、手里有 2s3s 与 5s6s -> [(2s,3s), (5s,6s)] ✓
+    这个顺序就是 chipat 的编码基准 ✓ 推理端必须用同一个顺序 ✗
+    """
+    if tile >= 27:
+        return []
+    suit0 = (tile // 9) * 9
+    out: list[tuple[int, int]] = []
+    for lo in (tile - 2, tile - 1, tile):
+        hi = lo + 2
+        if lo < suit0 or hi >= suit0 + 9:
+            continue
+        others = [x for x in (lo, lo + 1, hi) if x != tile]
+        if all(hand[x] > 0 for x in others):
+            out.append((others[0], others[1]))
+    return sorted(out)
+
+
 class RecordingLogAgent(LC.LogAgent):
     """Replays the log exactly like `LogAgent`, and records each decision.
 
@@ -83,8 +103,33 @@ class RecordingLogAgent(LC.LogAgent):
         super().__init__(seat, script, problems)
         self.tracker = tracker
 
+    def backfill_chi(self, ev) -> None:
+        """吃牌事件到达后，把「第几种吃法」回填到那一行 ✓
+
+        engine 的事件里 `tile` = 顺子起点 ✓ `called` = 被吃的那张 ✓
+        所以「另外两张」= (start, start+1, start+2) 去掉 called ✓
+        """
+        pairs = getattr(self, "_chi_pairs", None)
+        row = getattr(self, "_chi_row", None)
+        if not pairs or row is None or row >= len(self.tracker):
+            return
+        start, called = ev.get("tile"), ev.get("called")
+        if start is None or called is None:
+            return
+        others = tuple(x for x in (start, start + 1, start + 2) if x != called)
+        try:
+            self.tracker.chipats[row] = pairs.index(others)
+        except ValueError:
+            pass
+
     def decide(self, decision, view) -> int:
         choice = super().decide(decision, view)
+        # 吃：记下该局面**合法吃法**（按 (a,b) 升序）✓ 供「吃成什么样」标签用 ✓
+        if decision.kind == "chi" and decision.tile is not None:
+            self._chi_pairs = _legal_chi_pairs(view.hand, decision.tile)
+            self._chi_row = len(self.tracker)
+        else:
+            self._chi_pairs, self._chi_row = [], None
         kind = decision.kind
         # Only record decisions that actually follow the log. When the replay
         # has diverged, `super().decide` returns 0 as a fallback and the move is
@@ -115,6 +160,11 @@ def extract_kyoku(kyoku, tracker, n: int, rule):
     def dispatch(a, agents=agents):
         for ag in agents:
             ag.on_action(a)
+        # 吃牌：回填「第几种吃法」✓
+        if isinstance(a, dict) and a.get("call") == "chi":
+            p = a.get("player")
+            if isinstance(p, int) and 0 <= p < len(agents):
+                agents[p].backfill_chi(a)
 
     game.on_action = dispatch
     res = game.play_hand(int(start.get("oya", 0)))

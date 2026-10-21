@@ -404,10 +404,13 @@ class Tracker:
     players: list[int] = field(default_factory=list)
     labels: list[str] = field(default_factory=list)
     actfeats: list[np.ndarray | None] = field(default_factory=list)
+    #: 「吃成什么样」：值 = 该局面合法吃法按 (a,b) 升序的序号；-1 = 无关/没吃
+    chipats: list[int] = field(default_factory=list)
 
     def record(
         self, kind: str, x: np.ndarray, mask: np.ndarray, action: int, logp: float,
         player: int, label: str = "", actfeat: np.ndarray | None = None,
+        chipat: int = -1,
     ) -> None:
         self.kinds.append(kind)
         self.X.append(x)
@@ -417,6 +420,7 @@ class Tracker:
         self.players.append(int(player))
         self.labels.append(label)
         self.actfeats.append(actfeat)
+        self.chipats.append(int(chipat))
 
     def __len__(self) -> int:
         return len(self.X)
@@ -430,6 +434,31 @@ class Tracker:
         self.players.clear()
         self.labels.clear()
         self.actfeats.clear()
+        self.chipats.clear()
+
+    def _chipat_aligned(self) -> "np.ndarray":
+        """把 chipats 对齐到 len(X) —— 并**大声报**不一致 ✗
+
+        2026-10-21 实测：chipat 有 89,142 条而 X 只有 86,327 条 ✗
+        原因还没定 ✗ 但**绝不能让错长的列进数据集** ✗
+        -> 截断/补齐，并且在 stderr 报一次 ✓（不静默 ✗）
+        """
+        import sys
+
+        import numpy as np
+
+        n = len(self.X)
+        arr = np.full(n, -1, dtype=np.int8)
+        m = min(n, len(self.chipats))
+        if m:
+            arr[:m] = np.asarray(self.chipats[:m], dtype=np.int8)
+        if len(self.chipats) != n:
+            print(
+                f"  ⚠️ chipats 与 X 长度不一致 ✗：{len(self.chipats)} vs {n} "
+                f"-> 已按 {n} 对齐（多出的丢掉、缺的补 -1）",
+                file=sys.stderr,
+            )
+        return arr
 
     def arrays(self) -> dict:
         import numpy as np
@@ -451,6 +480,8 @@ class Tracker:
             "logp": np.asarray(self.logps, dtype=np.float32),
             "kind": np.asarray(self.kinds),
             "player": np.asarray(self.players, dtype=np.int64),
+            #: 「吃成什么样」的标签（-1 = 不是吃/没吃）✓ 独立一列，不动 action ✓
+            "chipat": self._chipat_aligned(),
         }
 
 
